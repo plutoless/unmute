@@ -24,7 +24,7 @@ func reasonParamsArtifact(t *testing.T, provider ir.Provider) Artifact {
 	def.Params = map[string]any{"reasoning_effort": "none"}
 	pkg.Agent.Models.Think["fast_reasoning"] = def
 
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,14 +44,14 @@ func reasonParamsArtifact(t *testing.T, provider ir.Provider) Artifact {
 // (temperature and friends) stay plain Settings fields; everything else rides
 // the entry's overflow field, which OpenAILLMService merges into the body.
 func TestReasonParamsOverflowIntoPipecatSettingsExtra(t *testing.T) {
-	bot := artifactFile(t, reasonParamsArtifact(t, ir.ProviderPipecat), "bot.py")
+	bot := artifactFile(t, reasonParamsArtifact(t, ir.ProviderPipecat), agentSource)
 
 	start := strings.Index(bot, "def build_intake_llm(")
 	if start < 0 {
 		t.Fatal("bot.py has no build_intake_llm; fixture drifted")
 	}
 	block := bot[start:]
-	if end := strings.Index(block, "\n\n"); end > 0 {
+	if end := strings.Index(block, "\n\n\n"); end > 0 {
 		block = block[:end]
 	}
 
@@ -77,7 +77,7 @@ func TestReasonParamsOverflowIntoPipecatSettingsExtra(t *testing.T) {
 // row forwards params as plain constructor kwargs, so reasoning_effort must
 // land flat on openai.LLM(...) and no extra={...} may appear.
 func TestReasonParamsStayFlatKwargsOnLiveKit(t *testing.T) {
-	agentpy := artifactFile(t, reasonParamsArtifact(t, ir.ProviderLiveKit), "agent.py")
+	agentpy := artifactFile(t, reasonParamsArtifact(t, ir.ProviderLiveKit), agentSource)
 
 	var call string
 	for _, line := range strings.Split(agentpy, "\n") {
@@ -134,7 +134,7 @@ func TestReasonParamsNeverInventsSampling(t *testing.T) {
 		def.TopP = nil
 		pkg.Agent.Models.Think[name] = def
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -80,7 +80,7 @@ The event feed reconnects separately from audio. Retained events can replay;
 a gap stays marked until the next call. Switching Conversation and Logs keeps
 the same microphone connection.
 
-The generated `dev_metrics.py` is inert unless `UNMUTE_DEV_METRICS` is enabled,
+The generated `utils/dev_metrics.py` is inert unless `UNMUTE_DEV_METRICS` is enabled,
 as `unmute dev` does. Its identified v2 snapshots use `UNMUTE_METRIC ` framing.
 Raw values use seconds. To inspect measurements:
 
@@ -122,7 +122,7 @@ model receives one safe failure result. It must not claim success from either.
 
 ## What the caller cannot talk over
 
-`bot.py` passes `user_mute_strategies=[{{range $i, $s := .UserMuteStrategies}}{{if $i}}, {{end}}{{$s}}(){{end}}]` to the context aggregator.
+`call.py` passes `user_mute_strategies=[{{range $i, $s := .UserMuteStrategies}}{{if $i}}, {{end}}{{$s}}(){{end}}]` to the context aggregator.
 {{if .GreetingProtectedByRoute}}
 The greeting is protected because this is a phone route, and a phone leg has no
 echo cancellation. A caller on speakerphone sends your agent's own greeting back
@@ -153,7 +153,7 @@ answer no later than they would without the line. The argument check runs
 first, so a call the model got wrong stays silent. If the caller speaks over
 the line, the tool's `interruption:` value decides what happens.
 
-You will see the line in two shapes in `bot.py`, because a tool listed on an
+You will see the line in two shapes in `agents.py`, because a tool listed on an
 agent and the same tool listed on a task are emitted differently. An agent tool
 holds `FunctionCallParams` and pushes the frame through `params.llm`; a task tool
 is a flows handler and queues it through `flow_manager.worker`. Same frame, same
@@ -177,7 +177,7 @@ rather than reads out, so expect the sense of the line and not its letters.
 model's `backend:` names, on OpenAI's Responses API inside the same live session:
 the live model hands the request over and keeps talking, the backend calls this
 project's tools, and the answer comes back as something the live model says.
-Every tool in `bot.py` is registered exactly as it is for a cascaded pipeline.
+Every tool in `agents.py` is registered exactly as it is for a cascaded pipeline.
 {{else}}
 **No backend is named**, so the live model runs alone and declines any
 request that would need a tool. Add `backend: <a models.think entry>` to the
@@ -277,7 +277,7 @@ The wait does not adapt to the caller on this target. Unlike the LiveKit driver,
 which has a `dynamic` endpointing mode, the ceiling is the same on every turn.
 {{else}}
 Two numbers decide how long a caller waits. **Both are spelled `stop_secs` in
-`bot.py` and they are different fields**, so grep finds two and only this tells
+`call.py` and they are different fields**, so grep finds two and only this tells
 you which is which.
 
 **The floor is {{.Pace.Floor}}s**, in `VADParams(stop_secs={{.Pace.Floor}})`. The VAD waits that
@@ -484,8 +484,8 @@ just to inspect it — a type checker, an editor, a script — reaches the embed
 service too. Give it a valid key, or stub `knowledge._embed_<base>` before the
 import.
 
-Both `knowledge.py` and `knowledge/` have explicit `COPY` lines in the Dockerfile.
-That is not decoration: this image copies named files only, because `/app` belongs
+Both `utils/` and `knowledge/` have explicit `COPY` lines in the Dockerfile.
+That is not decoration: this image copies named paths only, because `/app` belongs
 to the base image, and leaving either one out gives a container that starts,
 raises, and never reaches ready while its own log looks healthy.
 
@@ -527,6 +527,10 @@ This agent expects values supplied when the call starts:
 
 {{range .CallStartVars}}- `{{.Name}}` ({{.Type}}){{if .Required}} — required{{end}}
 {{end}}
+Each value is checked against its field's type in `state.py` before the greeting.
+A value that does not fit stops the call start, and the error names the field.
+A model or a list is passed as JSON.
+
 Locally, pass them with `unmute dev` on the source package:
 
 ```sh
@@ -540,32 +544,39 @@ environment variable when the payload carries none.
 {{if .TypedState}}
 ## Declared state
 
-Variables declare types once. A task's `assign` derives its finish fields and
-saves validated values. A failed or unserved finish saves nothing.
+The call's state is the `State` class you wrote in `state.py`, copied here as
+you wrote it. `call_state.py` is generated. Its `CallState` subclasses your
+`State` and is the one way a value is saved. It also tracks which values still
+await a confirmation and renders a value for a prompt. Each task step gets its
+own result model, built from your field types when the module loads.
 
-A prompt reads only its own `{{"{{variable}}"}}` or `{{"{{variable.field}}"}}`
-references. Missing values render as `{{.TypedState.Empty}}`; false, zero and
-empty lists keep their values. Referencing an object shares the whole object.
-History is a separate choice and does not clear saved values.
+A task's `assign` derives its finish fields from the fields it saves into. A
+step must return every whole value it assigns, except one its `assign` marks
+with `?`. A failed or unserved finish saves nothing.
 
-Each declared shape is a generated Pydantic class in this module. A step's
-result is validated against it before anything is recorded, so a value outside a
-declared set never enters the state: the previous contents stay as they were and
-the model is told which field and what was allowed, which is what lets it
-correct itself on the next turn.
+A prompt reads only its own `{{"{{state.variable}}"}}` or
+`{{"{{state.variable.field}}"}}` references. Missing values render as
+`{{.TypedState.Empty}}`; false, zero and empty lists keep their values.
+Referencing an object shares the whole object. History is a separate choice and
+does not clear saved values.
 
-A text type with a validated shape (`Phone`, `Date`, `Time`, `Id`, `EmailStr`)
-is a `str` in the schema the model is sent, with its shape checked by a
-validator. That is deliberate: a `pattern` in the schema survives the strict
-tool-schema converter and the provider rejects it, so the shape is checked here
-instead.
+A field's type is the check every save goes through: a step's result, a
+pre-fetched value, a dispatched one and a carrier fact. The values one save
+brings are checked together, and nothing is recorded unless all of them fit.
+The previous contents then stay as they were, and the model is told which field
+and what was allowed, which is what lets it correct itself on the next turn.
+
+A format or pattern rule in your types reaches the model as words in the field's
+description. The schema carries no `pattern` or `format` keyword, because a
+strict provider rejects one. The rule is still checked where the value is saved.
 {{if .TypedState.NeedsEmailValidator}}
-`EmailStr` and `NameEmail` are checked by `email-validator`, which is why this
-project depends on it. The check never asks DNS: it runs while the caller is on
-the line, so it reads the address and stops there rather than looking up whether
-the domain accepts mail. `NameEmail` holds a name and an address as two fields
-and also reads a single string, either `Fred Bloggs <fred@example.com>` or the
-address on its own, in which case the name is the part before the at sign.
+An email type is checked by `email-validator`, which is why this project depends
+on it. The check never asks DNS: it runs while the caller is on the line, so it
+reads the address and stops there rather than looking up whether the domain
+accepts mail.
+{{end}}{{if .TypedState.ExtraTypes}}
+`state.py` imports from `pydantic_extra_types`, so this project depends on it
+with the extras those types need.
 {{end}}{{end}}
 ## Required environment
 
@@ -725,8 +736,8 @@ appends:
 
 It reaches every agent's prompt, and every task's prompt on that binding's profile,
 which on this target travels through its owning agent's model service. You can read
-it in the `*_PROMPT` constants in the module beside this file, which is the point of
-putting it there: a directive you cannot see is a directive you cannot check.
+it in the files under `prompts/`, which is the point of putting it there: a
+directive you cannot see is a directive you cannot check.
 
 It is literal text and the compiler attaches no meaning to it. It exists because
 some models take instructions no parameter carries.
@@ -1747,6 +1758,37 @@ Traces can contain caller speech, model input and output, and tool arguments and
 Use only fake identities and fake customer data for release tests, and do not
 send real customer data until your Coval project's access and retention rules
 are approved.
+
+{{else if eq .TracingProvider "logfire"}}
+## Trace with Logfire
+
+Tracing is configured. Set `LOGFIRE_TOKEN` in `.env` to a Logfire write token.
+That is the only value it needs. The token names its region (`pylf_v1_eu_...`
+goes to `logfire-eu.pydantic.dev`), and a token with no region goes to the US
+region, the way the Logfire SDK reads it.
+
+The service name is `{{.EntryAgent}}-{{.AgentName}}`. The Pipecat runner
+session ID is the `session.id` on every span.
+Tracing owns the process OpenTelemetry provider, and startup fails if another
+SDK provider is installed first.
+
+Starting the worker proves nothing on its own. Complete at least one user turn
+before you look for the trace. One call is one trace. Its root span holds the
+whole conversation in `input.value`, and each exchange is a `turn` span with
+what the caller said and what the agent replied. Each tool call is its own span,
+with the tool's name in `gen_ai.tool.name`.
+
+The call also shows on Logfire's **Agents** page, one run per agent turn, with
+its model calls, tokens, messages and tool calls. Every row is labelled, such as
+`chat <model>` or `tool <name>`.
+
+Spans go to Logfire as plain OpenTelemetry over HTTP. The project does not use
+the Logfire SDK, so `logfire.configure()` is not needed.
+
+Traces can contain caller speech, model input and output, and tool arguments and results.
+Use only fake identities and fake customer data for release tests. Use a separate
+Logfire project for those tests, and do not send real customer data until its
+access and retention rules are approved.
 
 {{else if .Tracing}}
 ## Trace with Langfuse

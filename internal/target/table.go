@@ -6,7 +6,11 @@ const (
 	LiveKit Provider = "livekit"
 	Pipecat Provider = "pipecat"
 	Slng    Provider = "slng"
-	Agora   Provider = "agora"
+	// Twilio emits a standalone Python web app that Twilio ConversationRelay
+	// calls. ConversationRelay listens and speaks; the app thinks and runs
+	// tools. Its rows live in twilio_target.go.
+	Twilio Provider = "twilio"
+	Agora  Provider = "agora"
 )
 
 // Providers is every target a package may name. A provider earns a place here by
@@ -19,7 +23,7 @@ const (
 // runnable project; slng emits a deployment body for a platform that runs the
 // agent, which is a complete output of a different shape (constitution 6.0.0).
 // What is still forbidden is a provider that validates and produces nothing.
-var Providers = []Provider{LiveKit, Pipecat, Slng, Agora}
+var Providers = []Provider{LiveKit, Pipecat, Slng, Twilio, Agora}
 
 // Retired names a provider this repository used to accept as a target. The
 // value is what to tell the author, because "unknown provider" is true and
@@ -33,18 +37,21 @@ var Retired = map[Provider]string{
 	"deepgram": "the deepgram target never emitted a runnable project and was retired on 2026-08-24; deepgram remains available as a model vendor, for example slng/deepgram/nova:3-en",
 }
 
+// IsCode reports whether a provider is a framework code target: a project built
+// on LiveKit Agents or Pipecat, with a framework version to pin and one worker
+// per session. The twilio target emits a project too, but on no framework, so it
+// is EmitsProject and not IsCode.
 func IsCode(provider Provider) bool {
 	return provider == LiveKit || provider == Pipecat
 }
 
 // EmitsProject reports whether a provider's driver writes a runnable project.
-// It stopped agreeing with Providers in constitution 6.0.0: slng is a target and
-// emits no project, so this is now the question "is there something to run, pin
-// and version here", which is what every caller was really asking. It is what
-// separates a target that has a `dev`, a framework version and dependency pins
-// from one that has none of the three.
+// SLNG emits a deployment body. LiveKit and Pipecat run local pipelines;
+// Twilio and Agora emit services for hosted speech or conversations. This says
+// nothing about dev/deploy support or a framework version: those are separate
+// target contracts.
 func EmitsProject(provider Provider) bool {
-	return provider == LiveKit || provider == Pipecat || provider == Agora
+	return provider == LiveKit || provider == Pipecat || provider == Twilio || provider == Agora
 }
 
 type Tag string
@@ -116,6 +123,7 @@ const (
 	FieldWarmInstances         Field = "warm_instances"
 	FieldTracingLangfuse       Field = "tracing.provider.langfuse"
 	FieldTracingCoval          Field = "tracing.provider.coval"
+	FieldTracingLogfire        Field = "tracing.provider.logfire"
 	FieldPrefetch              Field = "prefetch"
 	FieldVariableConfirm       Field = "variables.confirm"
 	FieldVariableConversation  Field = "variables.source.conversation"
@@ -125,7 +133,6 @@ const (
 	FieldToolDependencies      Field = "tools.local.dependencies"
 	FieldTemplates             Field = "templates.session_start"
 	FieldTypedState            Field = "variables.type.shape"
-	FieldShapedText            Field = "variables.type.shaped"
 )
 
 type Capability struct {
@@ -258,7 +265,7 @@ func (t Table) Control(control TelephonyControl, provider Provider, transport, c
 // so nothing is fixed. SLNG has no per-tool setting at all and denies the field
 // outright, which is a different answer and stays in its own row.
 func FixedToolInterruption(provider Provider) string {
-	if provider == LiveKit {
+	if provider == LiveKit || provider == Twilio {
 		return "continue"
 	}
 	return ""
@@ -420,27 +427,32 @@ func Default() Table {
 				deny(Pipecat, "the Pipecat driver does not emit listen fallback yet"),
 				allow(Slng),
 			),
-			FieldTask: field(deny(Slng, slngNoTasks("a task"))),
+			// SLNG managed agents run tasks and task groups since 2026-09-29: the
+			// backend's agent_tasks.py contract, written from this package's own
+			// tasks: and task_groups:. What it refuses is refused below and in
+			// ir.validateSlngTasks, never narrowed in silence.
+			FieldTask: field(allow(Slng)),
 			// Verified 2026-07-16: an LLMSwitcher inside an LLMWorker pipeline
 			// stalls all flow frames on pipecat-ai 1.5.0, so per-task model has
 			// no working lowering there yet (driver-pipecat B7 spike).
 			FieldTaskModel: field(
 				deny(Pipecat, "the Pipecat driver does not emit per-task model yet (LLMSwitcher stalls inside an LLMWorker)"),
-				deny(Slng, slngNoTasks("a per-task model")),
+				deny(Slng, "slng target runs every task on the agent's one model, and SLNG refuses think: on a task: remove it, or compile to livekit which switches the model per task"),
 			),
-			FieldTaskNestedResult: field(deny(Slng, slngNoTasks("a nested task result"))),
-			FieldTaskFinish:       field(deny(Slng, slngNoTasks("a step that ends on its tool"))),
-			FieldTaskOpening:      field(deny(Slng, slngNoTasks("a step opening"))),
-			FieldTaskGroup: field(
-				deny(Slng, slngNoTasks("a task group")),
-			),
-			FieldTaskGroupReturn:  field(deny(Slng, slngNoTasks("a task group return step"))),
-			FieldGroupSkip:        field(deny(Slng, slngNoTasks("a skippable group step"))),
-			FieldContextIsolated:  field(deny(Slng, slngNoTasks("an isolated task context"))),
+			FieldTaskNestedResult: field(allow(Slng)),
+			// SLNG runs finish rules, but unmute cannot write one for it: a
+			// success rule names a field of the tool's output: schema, and on this
+			// target output: is refused because SLNG takes a tool's result shape
+			// from the tool it hosts. Reading that shape from the hosted tool is
+			// the way to open this row.
+			FieldTaskFinish:       field(deny(Slng, "slng target cannot check a step's tool result: a finish: rule names a field of the tool's output:, which SLNG takes from the tool it hosts and not from the package: end the step with its finish call, or compile to livekit or pipecat")),
+			FieldTaskOpening:      field(allow(Slng)),
+			FieldTaskGroup:        field(allow(Slng)),
+			FieldTaskGroupReturn:  field(allow(Slng)),
+			FieldGroupSkip:        field(allow(Slng)),
+			FieldContextIsolated:  field(allow(Slng)),
 			FieldTransferAnnounce: field(deny(Slng, slngNoHandoff("a transfer announcement"))),
-			// A step announcement is refused for the task reason too: with one
-			// agent and no steps there is no entry to speak over.
-			FieldDelegateAnnounce: field(deny(Slng, slngNoTasks("a step announcement"))),
+			FieldDelegateAnnounce: field(allow(Slng)),
 			// Prefetch needs a seam between the call arriving and the agent
 			// greeting, and both code drivers have one: LiveKit between hydration
 			// and session.start, Pipecat between build_state and the agent
@@ -453,9 +465,9 @@ func Default() Table {
 			// it, because the package would compile and behave differently.
 			FieldPrefetch: field(deny(Slng, "slng target compiles no session-start hook of its own, so a prefetch has no seam to run in: "+
 				"fold the value into the agent's instructions, or compile to livekit or pipecat which emit the block")),
-			// Confirmation holds a value back from a gate, and the gate is the
-			// prerequisite guard on a step. No steps, no guard, nothing to hold.
-			FieldVariableConfirm: field(deny(Slng, slngNoTasks("a value awaiting confirmation"))),
+			// SLNG stores `confirm:` on the runtime variable and holds the value
+			// back the same way the code targets do.
+			FieldVariableConfirm: field(allow(Slng)),
 			// A value the model records mid-call. SLNG has a place for it: a
 			// runtime variable, filled by the platform's own set_runtime_variables
 			// tool and returned on the call record. The code drivers have no such
@@ -466,15 +478,13 @@ func Default() Table {
 				deny(LiveKit, codeNoConversationVariable("livekit")),
 				deny(Pipecat, codeNoConversationVariable("pipecat")),
 			),
-			// Declared state is a generated Pydantic class in a module the two
-			// code drivers write. The slng target writes a spec and emits no
-			// module, so there is nowhere for the class, the validator or the
-			// composed state block to be.
-			FieldTypedState: field(deny(Slng, slngNoModule("a value with a declared shape"))),
-			FieldShapedText: field(deny(Slng, slngNoModule("a value whose text has a validated shape"))),
+			// SLNG checks a typed runtime variable against the same type grammar,
+			// written as a string with named shapes. The types it has no word for
+			// are refused by ir.validateSlngTasks.
+			FieldTypedState: field(allow(Slng)),
 			FieldContextNoToolCalls: field(
 				deny(Pipecat, "the Pipecat driver does not shape transfer context (include_tool_calls) yet"),
-				deny(Slng, slngNoHandoff("include_tool_calls: false")),
+				deny(Slng, "slng target has no switch that drops tool calls from a task's history: remove include_tool_calls: false and use history: messages, which already leaves them out, or compile to livekit which drops them"),
 			),
 			// SCHEMA N25: `briefing` is free text, so there is no per-value row
 			// to resolve. It rides the warm_transfer control row, which already
@@ -698,6 +708,9 @@ func Default() Table {
 			FieldTracingLangfuse: field(
 				deny(Slng, "slng target instruments no process of yours, so it cannot install a Langfuse exporter: read the traces in the SLNG dashboard, or compile to livekit or pipecat which emit the exporter"),
 			),
+			FieldTracingLogfire: field(
+				deny(Slng, "slng target instruments no process of yours, so it cannot install a Logfire exporter: read the traces in the SLNG dashboard, or compile to livekit or pipecat which emit the exporter"),
+			),
 			FieldTracingCoval: field(
 				deny(Slng, "slng target instruments no process of yours and sees no inbound call, so it can neither install the Coval exporter nor read a simulation ID: run the evaluation against the SLNG agent from Coval, or compile to livekit or pipecat which emit the exporter"),
 			),
@@ -803,14 +816,13 @@ func Default() Table {
 			// The Pipecat driver shapes four of the five. `summary` needs an awaited
 			// model turn and a summarizer prompt of its own, which is its own change
 			// with its own verification; LiveKit's lives as a literal in the LiveKit
-			// template. Every slng value fails, because a context history shapes a
-			// crossing and slng writes one agent; both notes live in history()
-			// rather than five times over.
-			HistoryFull:     history(HistoryOK, HistoryOK, HistoryFail),
-			HistoryMessages: history(HistoryOK, HistoryOK, HistoryFail),
-			HistoryLastN:    history(HistoryOK, HistoryOK, HistoryFail),
+			// template. SLNG refuses summary for the same reason. Both notes live
+			// in history() rather than at each call site.
+			HistoryFull:     history(HistoryOK, HistoryOK, HistoryOK),
+			HistoryMessages: history(HistoryOK, HistoryOK, HistoryOK),
+			HistoryLastN:    history(HistoryOK, HistoryOK, HistoryOK),
 			HistorySummary:  history(HistoryGenerated, HistoryFail, HistoryFail),
-			HistoryReset:    history(HistoryOK, HistoryOK, HistoryFail),
+			HistoryReset:    history(HistoryOK, HistoryOK, HistoryOK),
 		},
 		// Read unconditionally at the top of every target validation
 		// (ir.validateFallbacks), so a missing key breaks every package on that
@@ -832,10 +844,10 @@ func Default() Table {
 		table.Roles[role][Agora] = Open
 	}
 	table.FallbackSlots[Agora] = FallbackComponent
-	return table
+	return addTwilio(table)
 }
 
-// slngNoPlacement, slngNoTasks and slngNoHandoff each carry one reason shared by
+// slngNoPlacement and slngNoHandoff each carry one reason shared by
 // several rows. They are here rather than inline because the rows deny for
 // exactly the same reason, and three copies of a sentence drift into three
 // slightly different sentences.
@@ -844,14 +856,10 @@ func slngNoPlacement(role string) string {
 	return "slng target runs the whole pipeline on SLNG's own infrastructure, so a locally placed " + role + " model has no machine to run on: drop the placement and let SLNG host the model, or compile to livekit or pipecat and run it yourself"
 }
 
-func slngNoTasks(what string) string {
-	return "slng target writes one agent with one prompt, so " + what + " has nowhere to go: fold the step into the agent's instructions, or compile to livekit or pipecat which emit multi-task agents"
-}
-
 // slngNoKnowledge is why the slng target refuses a knowledge base.
 //
-// The two code drivers emit knowledge.py and copy the documents beside it, so the
-// index is built inside the image they produce. The slng target emits a README and
+// The two code drivers emit utils/knowledge.py and copy the documents into the
+// project, so the index is built inside the image they produce. The slng target emits a README and
 // pushes a spec: there is no image, nothing to copy the folder into, and no process
 // of ours to build an index in.
 func slngNoKnowledge(what string) string {
@@ -859,18 +867,6 @@ func slngNoKnowledge(what string) string {
 		" has nowhere to be read or searched: drop the knowledge: tool and put the " +
 		"facts in the agent's instructions, or compile to livekit or pipecat which " +
 		"emit the search module and carry the documents in the image"
-}
-
-// slngNoModule is why the slng target refuses a declared shape.
-//
-// Not the tasks reason and not the knowledge reason, though it rhymes with
-// both: what is missing here is the emitted Python module. A shape is a
-// generated class with a validator, and the validation has to run where the
-// value enters the state, which is inside a module this target never writes.
-func slngNoModule(what string) string {
-	return "slng target pushes a spec and emits no module of its own, so " + what +
-		" has nowhere to be declared or checked: declare the value as one of the primitive types, " +
-		"or compile to livekit or pipecat, which generate the class and validate the value where it enters"
 }
 
 // codeNoConversationVariable is the one reason both code targets refuse
@@ -945,6 +941,10 @@ func allow(provider Provider) override {
 // Leaving hosted targets out makes TestDefaultTableIsCompleteAndTyped, which already
 // existed, fail once per undecided row until a person writes an answer. No new
 // test buys 48 forced decisions.
+//
+// Twilio is left out the same way, and it is why this seeds IsCode and not
+// EmitsProject: twilio emits a project, and seeding it would grant it every row.
+// Its answers live in one block, twilioFields in twilio_target.go.
 func field(overrides ...override) map[Provider]Capability {
 	values := make(map[Provider]Capability, len(Providers))
 	for _, provider := range Providers {
@@ -976,13 +976,9 @@ func history(livekit, pipecat, slng HistoryKind) map[Provider]HistorySupport {
 		value.Note = "the Pipecat driver does not summarize a context yet: it supports history: full, messages, last_n and reset"
 		values[Pipecat] = value
 	}
-	// Every slng history value fails, and for one reason rather than five, so the
-	// note is written once here instead of five times at the call sites. A context
-	// history shapes what a task or a transfer carries across, and the slng target
-	// writes one agent with one prompt, so there is no crossing to shape.
 	if slng == HistoryFail {
 		value := values[Slng]
-		value.Note = "slng target writes one agent with one prompt, so no task or transfer exists for a context history to shape: fold the step into the agent's instructions, or compile to livekit or pipecat which carry context across a handoff"
+		value.Note = "slng target does not summarize a context: SLNG refuses history: summary, so use full, messages, last_n or reset, or compile to livekit which writes the summary"
 		values[Slng] = value
 	}
 	return values

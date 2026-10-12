@@ -30,6 +30,8 @@ import (
 // calls, and nothing dispatches values into an inbound one: a call_start
 // variable with no default is refused on an inbound package.
 func addReminderVariables(agent *ir.Agent) {
+	addStateFields(agent,
+		`name: str = ""`, `appointment_time: str = ""`, `dialed_number: str | None = None`, `reschedule_to: str | None = None`)
 	agent.Variables["name"] = ir.Variable{
 		Type:        ir.PrimitiveString,
 		Default:     "",
@@ -55,6 +57,22 @@ func addReminderVariables(agent *ir.Agent) {
 	}
 }
 
+// addStateFields appends fields to the package's state.py as it will be copied
+// into the project, and puts each in the variable order. The smokes mutate the
+// IR after it is built, and a variable the IR names but State does not declare
+// is a field the emitted class would not have, so the source has to move with
+// it. Each line is one `name: annotation = default` of the State class, which is
+// the last class in every package these fixtures use.
+func addStateFields(agent *ir.Agent, lines ...string) {
+	agent.StateSource = strings.TrimRight(agent.StateSource, "\n")
+	for _, line := range lines {
+		agent.StateSource += "\n    " + line
+		name, _, _ := strings.Cut(line, ":")
+		agent.VariableOrder = append(agent.VariableOrder, name)
+	}
+	agent.StateSource += "\n"
+}
+
 // useWebhookTools builds its two tools here rather than borrowing them from the
 // example: it used to rewrite tools by name, and when the example stopped having
 // those names the map miss handed it a zero-value ir.Tool, so every webhook
@@ -65,6 +83,7 @@ func useWebhookTools(agent *ir.Agent) {
 	// The path segment is a plain string, not the salon's E.164 Phone: the smoke
 	// seeds it with a slash and a space to prove the segment is URL-encoded, and
 	// _save_result would refuse that shape on a Phone.
+	addStateFields(agent, `customer_id: str = ""`)
 	agent.Variables["customer_id"] = ir.Variable{
 		Type:        ir.PrimitiveString,
 		Default:     "",
@@ -136,8 +155,8 @@ func TestSmokeFixturesGenerateAndKeepTheirPythonSurface(t *testing.T) {
 		// script constructs by name.
 		entry string
 	}{
-		{ir.ProviderPipecat, "bot.py", "class ConciergeAgent("},
-		{ir.ProviderLiveKit, "agent.py", "class Concierge("},
+		{ir.ProviderPipecat, agentSource, "class ConciergeAgent("},
+		{ir.ProviderLiveKit, agentSource, "class Concierge("},
 	}
 	for _, fixture := range fixtures {
 		for _, driver := range drivers {
@@ -146,7 +165,7 @@ func TestSmokeFixturesGenerateAndKeepTheirPythonSurface(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				agent, err := ir.Build(pkg)
+				agent, err := buildWithState(t, pkg)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -202,7 +221,7 @@ func TestKnowledgeSmokeKeepsItsPythonSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +234,7 @@ func TestKnowledgeSmokeKeepsItsPythonSurface(t *testing.T) {
 			if err != nil {
 				t.Fatalf("the knowledge smoke fixture no longer generates: %v", err)
 			}
-			emitted := artifactFile(t, artifact, "knowledge.py")
+			emitted := artifactFile(t, artifact, "utils/knowledge.py")
 			for _, symbol := range []string{
 				"def build_indexes(", "async def look_up(", "def _merge(", "def _index(",
 				"def _nodes(", "_INDEXES", "SETTINGS", "_embed_refunds(",
@@ -277,7 +296,7 @@ func TestSalonJourneySmokeKeepsItsPythonSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,8 +305,8 @@ func TestSalonJourneySmokeKeepsItsPythonSurface(t *testing.T) {
 		file     string
 		symbols  []string
 	}{
-		{ir.ProviderLiveKit, "agent.py", []string{
-			"class Userdata:", "class ManageBooking(", "class VerifyCustomer(",
+		{ir.ProviderLiveKit, agentSource, []string{
+			"class CallState(State):", "class ManageBooking(", "class VerifyCustomer(",
 			"class ComplaintSpecialist(", "class _TaskTransfer(",
 			"async def record_complaint(", "async def to_complaints(",
 			// The smoke scripts drive the pre-fetch directly, because that is the
@@ -295,8 +314,8 @@ func TestSalonJourneySmokeKeepsItsPythonSurface(t *testing.T) {
 			// exactly like an entry that ran, from outside.
 			"async def _prefetch(",
 		}},
-		{ir.ProviderPipecat, "bot.py", []string{
-			"class State:", "class ConciergeAgent(", "class ComplaintSpecialistAgent(",
+		{ir.ProviderPipecat, agentSource, []string{
+			"class CallState(State):", "class ConciergeAgent(", "class ComplaintSpecialistAgent(",
 			// One read and one write, since the five narrower booking tools were
 			// merged: find_slots answers "what do they hold" and "what is free"
 			// in one call, and save_booking is the only tool that changes a
@@ -328,7 +347,7 @@ func TestSalonJourneySmokeKeepsItsPythonSurface(t *testing.T) {
 		})
 	}
 
-	// The smokes construct Userdata and State with the caller identifier by
+	// The smokes construct CallState with the caller identifier by
 	// keyword, so a rename has to fail here rather than at runtime.
 	if _, ok := agent.Variables["customer_phone"]; !ok {
 		t.Error("the salon package no longer declares customer_phone; the journey smokes pass it by keyword")
@@ -355,7 +374,7 @@ func TestSmokeStubbedNamesExistInTheEmittedModule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +382,7 @@ func TestSmokeStubbedNamesExistInTheEmittedModule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	emitted := artifactFile(t, artifact, "bot.py")
+	emitted := artifactFile(t, artifact, agentSource)
 
 	// name -> whether the emitted module calls it with keyword arguments. A
 	// stub written `lambda: None` breaks the moment the generator starts passing
@@ -405,7 +424,7 @@ func TestSmokeStubbedNamesExistInTheEmittedModule(t *testing.T) {
 	v3 := emittedPipecatFor(t, "salon-concierge-v3")
 	for _, want := range []string{
 		"handler = tools.look_up_customer.look_up_customer",
-		"await asyncio.to_thread(handler, phone=state.customer_phone)",
+		`await asyncio.to_thread(handler, phone=state.plain("customer_phone"))`,
 	} {
 		if !strings.Contains(v3, want) {
 			t.Errorf("salon-concierge-v3 bot.py no longer emits %q, so the prefetch smoke stub is not exercised", want)
@@ -421,7 +440,7 @@ func emittedPipecatFor(t *testing.T, name string) string {
 	if err != nil {
 		t.Fatalf("%s no longer generates for pipecat: %v", name, err)
 	}
-	return artifactFile(t, artifact, "bot.py")
+	return artifactFile(t, artifact, agentSource)
 }
 
 // TestSmokeStubbedNamesExistInTheListenerModule is the same contract for the
@@ -431,7 +450,7 @@ func emittedPipecatFor(t *testing.T, name string) string {
 // read for its Settings; and the aggregator's VAD has to be constructed with no
 // arguments, because the shared stub for it takes only keywords.
 func TestSmokeStubbedNamesExistInTheListenerModule(t *testing.T) {
-	emitted := artifactFile(t, generateFor(t, "turn_listener", ir.ProviderPipecat), "bot.py")
+	emitted := artifactFile(t, generateFor(t, "turn_listener", ir.ProviderPipecat), agentSource)
 	for _, want := range []string{
 		"return DeepgramFluxSTTService(\n",
 		"settings=DeepgramFluxSTTService.Settings(",
@@ -478,7 +497,7 @@ func TestSmokeStubbedNamesExistInTheListenerModule(t *testing.T) {
 // with no arguments, and send the nudge as the commentary event the script waits
 // for.
 func TestSmokeStubbedNamesExistInTheLiveModelModule(t *testing.T) {
-	emitted := artifactFile(t, generateFor(t, "live_model", ir.ProviderPipecat), "bot.py")
+	emitted := artifactFile(t, generateFor(t, "live_model", ir.ProviderPipecat), agentSource)
 	for _, want := range []string{
 		"from pipecat.services.openai.live.llm import OpenAILiveLLMService",
 		"live = dev.observe_live(build_desk_live())",
@@ -527,7 +546,7 @@ func TestSmokeStubbedNamesExistInTheLiveModelModule(t *testing.T) {
 // emitted 20 on the way past, and the greeting and the nudge are pinned because
 // the script waits for each by its words.
 func TestSmokeStubbedNamesExistInTheLiveKitLiveModelModule(t *testing.T) {
-	emitted := artifactFile(t, generateFor(t, "live_model", ir.ProviderLiveKit), "agent.py")
+	emitted := artifactFile(t, generateFor(t, "live_model", ir.ProviderLiveKit), agentSource)
 	for _, want := range []string{
 		"from livekit.plugins.openai.realtime import GPTLiveModel",
 		"async def entrypoint(ctx: JobContext) -> None:",
@@ -594,7 +613,7 @@ func TestSmokeStubbedNamesExistInTheLiveKitLiveModelModule(t *testing.T) {
 // The greeting is pinned because the script waits for it by its words, and the
 // tool call is pinned because the script answers that one handler by name.
 func TestSmokeStubbedNamesExistInTheLiveKitRealtimeModule(t *testing.T) {
-	emitted := artifactFile(t, generateFor(t, "realtime_model", ir.ProviderLiveKit), "agent.py")
+	emitted := artifactFile(t, generateFor(t, "realtime_model", ir.ProviderLiveKit), agentSource)
 	for _, want := range []string{
 		"from livekit.plugins.openai.realtime import RealtimeModel",
 		"def prewarm(proc: JobProcess) -> None:",
@@ -716,7 +735,7 @@ func TestSmokeLiveKitRunContextStandInCarriesEveryAttributeRead(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			agent, err := ir.Build(pkg)
+			agent, err := buildWithState(t, pkg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -726,7 +745,7 @@ func TestSmokeLiveKitRunContextStandInCarriesEveryAttributeRead(t *testing.T) {
 			}
 			// dev_metrics.py is where the read that broke the smokes lives, and
 			// agent.py is where the tool bodies the smokes call live.
-			for _, file := range []string{"agent.py", "dev_metrics.py"} {
+			for _, file := range []string{agentSource, "utils/dev_metrics.py"} {
 				for _, match := range livekitCtxReadPattern.FindAllStringSubmatch(artifactFile(t, artifact, file), -1) {
 					attr := match[2]
 					if livekitJobContextReads[attr] {

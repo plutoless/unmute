@@ -92,8 +92,10 @@ func TestEveryVoiceaiCommandNamedExists(t *testing.T) {
 		// and nothing runs without --confirm-side-effects. It is what an author
 		// iterates a code tool with between pushes, so the runbook names it and
 		// this must know it. Arrived in 0.1.16; the `tool` group had list and get
-		// only at 0.1.15.
-		"tool": {"list": true, "get": true, "run": true},
+		// only at 0.1.15. `create`, `update`, `build` and `publish` arrived in
+		// 0.1.20: they take a code tool from a Python file to a published version.
+		"tool": {"list": true, "get": true, "run": true,
+			"create": true, "update": true, "build": true, "publish": true},
 		// `run` connects to the server and refreshes its stored capability
 		// snapshot. It is the fix unmute points at when a push refuses a snapshot
 		// as stale, so it is a command the surfaces name and this must know.
@@ -118,7 +120,7 @@ func TestEveryVoiceaiCommandNamedExists(t *testing.T) {
 	// every surface at once. This is not circular: the two maps above come from
 	// `voiceai --help`, not from these values.
 	for _, command := range []SlngCommand{
-		SlngWhoami, SlngSecretList, SlngSecretCreate, SlngToolList, SlngToolGet,
+		SlngSecretList, SlngSecretCreate, SlngToolList, SlngToolGet,
 		SlngMCPList, SlngMCPTools, SlngTrunksList, SlngCallDispatch,
 	} {
 		sub := ""
@@ -142,7 +144,7 @@ func TestEveryVoiceaiCommandNamedExists(t *testing.T) {
 		filepath.Join(root, "internal", "skill", "assets", "deploy-skill", "references", "slng-push.md"),
 	}
 	// A word, then optionally a second, skipping any leading root flag so that
-	// `voiceai --profile work whoami` is read as `whoami`.
+	// `voiceai --profile work agents push` is read as `agents push`.
 	mention := regexp.MustCompile(`voiceai (?:--[a-z-]+ \S+ )*([a-z][a-z0-9-]*)(?: ([a-z][a-z0-9-]*))?`)
 	for _, path := range surfaces {
 		raw, err := os.ReadFile(path)

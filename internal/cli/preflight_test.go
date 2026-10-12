@@ -25,7 +25,6 @@ import (
 // holding one of each kind, one healthy MCP server and one whose probe failed.
 func account() slngResources {
 	return slngResources{
-		Account: slngAccount{OK: true, Profile: "default"},
 		Tools: []slngAccountTool{
 			{Name: "end_call", ToolType: "end_call"},
 			{Name: "transfer_call", ToolType: "transfer_call"},
@@ -503,7 +502,7 @@ func TestPreflightSaysWhenAPackageNeedsNothing(t *testing.T) {
 func slngToolsRequirements(t *testing.T) generate.Requirements {
 	t.Helper()
 	dir := filepath.Join("..", "testdata", "slng_tools")
-	agent, selected, err := loadPackage(dir, nil)
+	agent, selected, err := loadPackage(recordedCtx(t), dir, nil)
 	if err != nil {
 		t.Fatalf("load %s: %v", dir, err)
 	}
@@ -726,9 +725,8 @@ func TestDeployWritesNothingButSecrets(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "calls.log")
 	stub := `printf '%s\n' "$*" >> ` + log + `
 case "$*" in
-  *whoami*) printf '{"ok":true,"profile":"default","account":{"org_id":"o","org_name":"n"}}' ;;
-  *"agents push"*"--dry-run"*) printf '{"ok":true,"dry_run":true,"resolution_contract":1,"organisation":{"id":"o","name":"n"},"agent":{"id":"a1","action":"create"}}' ;;
-  *"agents push"*) printf '{"ok":true,"resolution_contract":1,"organisation":{"id":"o","name":"n"},"agent":{"id":"a1","name":"a","action":"create"},"version":"unchanged"}' ;;
+  *"agents push"*"--dry-run"*) printf '{"ok":true,"dry_run":true,"resolution_contract":1,"org_optional":1,"organisation":{"id":"o","name":"n"},"agent":{"id":"a1","action":"create"}}' ;;
+  *"agents push"*) printf '{"ok":true,"resolution_contract":1,"org_optional":1,"organisation":{"id":"o","name":"n"},"agent":{"id":"a1","name":"a","action":"create"},"version":"unchanged"}' ;;
 ` + provisionedCatalogue + `
 ` + provisionedContract("o") + `
 ` + provisionedAgent + `
@@ -947,6 +945,26 @@ func TestEligibleToolsPrefersTheOrganisationsOwnOverTheCurated(t *testing.T) {
 	// `current_datetime` exists at global scope and nowhere else.
 	if got := eligibleTools("user_phone_number", catalogue); len(got) != 1 || got[0].Scope == "organisation" {
 		t.Errorf("a curated-only name resolves to %+v, want the global record", got)
+	}
+}
+
+// TestScopeNotesNameOnlyTwoOrganisationTools. An organisation `end_call` beside
+// the global one is the normal case and nobody can rename the global one, so it
+// gets no note. Two organisation tools of one name is a choice the author can
+// fix, and that note names the other one.
+func TestScopeNotesNameOnlyTwoOrganisationTools(t *testing.T) {
+	var catalogue []slngAccountTool
+	fixture(t, "tool_list_scoped.json", &catalogue)
+	attached := func(name, id string) resolvedTool {
+		return resolvedTool{Requirement: need(name), ToolID: id}
+	}
+
+	if got := scopeNotes([]resolvedTool{attached("end_call", "44444444-4444-4444-4444-444444444444")}, catalogue); len(got) != 0 {
+		t.Errorf("an organisation end_call beside the global one got a note: %q", got)
+	}
+	got := scopeNotes([]resolvedTool{attached("ambiguous_tool", "55555555-5555-5555-5555-555555555555")}, catalogue)
+	if len(got) != 1 || !strings.Contains(got[0], "66666666-6666-6666-6666-666666666666 was not") {
+		t.Errorf("two organisation tools of one name, want one note naming the other: %q", got)
 	}
 }
 

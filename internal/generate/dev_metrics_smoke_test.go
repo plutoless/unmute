@@ -94,8 +94,8 @@ from types import SimpleNamespace
 # asked for.
 _report = json.load(open("compile-report.json"))
 
-import agent
-import dev_metrics
+agent = _project("agent")
+from utils import dev_metrics
 from livekit import rtc
 from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
@@ -318,7 +318,7 @@ class QuietGreeter(agent.Greeter):
 
 def make_session(model, speaker, *, recognizer=None, turn_detection="manual"):
     session = AgentSession(
-        userdata=agent.Userdata(),
+        userdata=agent.CallState(),
         stt=recognizer,
         llm=model,
         tts=speaker,
@@ -516,7 +516,7 @@ async def collect_early_metrics(capture):
     response = Response(["An early answer."])
     model, speaker, recognizer = Model([response]), Speaker(), Recognizer()
     session = AgentSession(
-        userdata=agent.Userdata(), stt=recognizer, llm=model, tts=speaker,
+        userdata=agent.CallState(), stt=recognizer, llm=model, tts=speaker,
         turn_handling={"turn_detection": "stt", "interruption": {"enabled": False}},
     )
     session.output.audio = AudioOutput()
@@ -924,7 +924,7 @@ async def collect_cancel_and_error(capture):
     response = Response(["An unfinished answer."], held=True, request_id="repeated-request")
     model, speaker = Model([response]), Speaker()
     session = AgentSession(
-        userdata=agent.Userdata(), llm=model, tts=speaker,
+        userdata=agent.CallState(), llm=model, tts=speaker,
         conn_options=SessionConnectOptions(max_unrecoverable_errors=0),
         turn_handling={"turn_detection": "manual", "interruption": {"enabled": False}},
     )
@@ -1067,7 +1067,7 @@ async def collect_accepted_speculation(capture):
         async def on_user_turn_completed(self, chat_ctx, new_message):
             temporary_ids.append(new_message.id)
 
-    session = AgentSession(userdata=agent.Userdata(), stt=recognizer, llm=model, tts=speaker,
+    session = AgentSession(userdata=agent.CallState(), stt=recognizer, llm=model, tts=speaker,
         turn_handling={"turn_detection": "stt", "preemptive_generation": {"enabled": True},
                        "interruption": {"enabled": False}})
     session.input.audio, session.output.audio = AudioInput(), AudioOutput()
@@ -1219,7 +1219,7 @@ from contextlib import redirect_stdout
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import bot  # noqa: E402
+bot = _project("bot")
 from pipecat.frames.frames import (  # noqa: E402
     Frame,
     InterimTranscriptionFrame,
@@ -1817,7 +1817,7 @@ async def exercise_live_metrics(call_id="pipecat-live-metrics"):
             print(line + "\n", end="")
 
 
-import dev_metrics
+from utils import dev_metrics
 from pipecat.frames.frames import ErrorFrame, TTSSpeakFrame
 
 

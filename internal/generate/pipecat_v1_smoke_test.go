@@ -26,11 +26,11 @@ import os
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import bot  # noqa: E402
+bot = _project("bot")
 from pipecat.adapters.schemas.direct_function import DirectFunctionWrapper  # noqa: E402
 from pipecat.processors.aggregators.llm_context import LLMContext  # noqa: E402
 
-src = open("bot.py").read()
+src = _project_source()
 assert "BusBridgeProcessor" not in src, "inline bot must not build the bus"
 assert "activate_worker(" not in src, "inline bot must not activate workers"
 
@@ -111,7 +111,7 @@ import os
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import bot  # noqa: E402
+bot = _project("bot")
 
 
 async def fake_create_transport(*_args, **_kwargs):
@@ -155,7 +155,7 @@ from types import SimpleNamespace
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import bot  # noqa: E402
+bot = _project("bot")
 from loguru import logger  # noqa: E402
 from pipecat.processors.frame_processor import FrameProcessor  # noqa: E402
 
@@ -257,7 +257,7 @@ import os
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import bot  # noqa: E402
+bot = _project("bot")
 from pipecat.frames.frames import (  # noqa: E402
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -385,37 +385,35 @@ from pathlib import Path
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import bot  # noqa: E402
+bot = _project("bot")
 
-if Path("tracing.py").exists():
-    import tracing
+if Path("utils/tracing.py").exists():
+    from utils import tracing
     from opentelemetry import trace
     from opentelemetry.sdk.trace import TracerProvider
 
-    if hasattr(tracing, "setup_langfuse_tracing"):
-        for name in ("LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_BASE_URL"):
+    from utils import telemetry as emitted_telemetry
+
+    backend_name = emitted_telemetry.BACKEND.__name__
+    if backend_name in ("Langfuse", "Logfire"):
+        for name in ("LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_BASE_URL", "LOGFIRE_TOKEN"):
             os.environ.pop(name, None)
         try:
-            tracing.setup_langfuse_tracing()
+            tracing.setup_tracing()
         except ValueError:
             pass
         else:
-            raise AssertionError("configured Langfuse tracing requires all credentials")
-    elif hasattr(tracing, "setup_coval_tracing"):
-        # Unlike Langfuse, a missing COVAL_API_KEY is not fatal here (an
-        # evaluation credential must never gate a live call), so this exercises
-        # real construction and the cached-provider idempotence guard instead
-        # of a raise.
-        os.environ.pop("COVAL_API_KEY", None)
-        provider = tracing.setup_coval_tracing()
-        assert isinstance(provider, TracerProvider), provider
-        assert trace.get_tracer_provider() is provider, "setup did not install the global tracer provider"
-        assert tracing.setup_coval_tracing() is provider, "second call must reuse the cached provider"
+            raise AssertionError(f"configured {backend_name} tracing requires its credentials")
     else:
-        raise AssertionError(
-            "tracing.py exposes neither setup_langfuse_tracing nor setup_coval_tracing: "
-            + repr(sorted(n for n in vars(tracing) if not n.startswith("_")))
-        )
+        # Unlike Langfuse and Logfire, a missing COVAL_API_KEY is not fatal here
+        # (an evaluation credential must never gate a live call), so this
+        # exercises real construction and the cached-telemetry idempotence
+        # guard instead of a raise.
+        os.environ.pop("COVAL_API_KEY", None)
+        telemetry = tracing.setup_tracing()
+        assert isinstance(telemetry.provider, TracerProvider), telemetry.provider
+        assert trace.get_tracer_provider() is telemetry.provider, "setup did not install the global tracer provider"
+        assert tracing.setup_tracing() is telemetry, "second call must reuse the cached telemetry"
 
 builders = sorted(n for n in vars(bot) if n.startswith("build_") and callable(getattr(bot, n)))
 assert builders, "no service builders found in bot.py"
@@ -447,7 +445,7 @@ import subprocess
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import bot  # noqa: E402
+bot = _project("bot")
 from pipecat.bus import AsyncQueueBus, BusActivateWorkerMessage  # noqa: E402
 from pipecat.flows import FlowManager, NO_RESPONSE  # noqa: E402
 from pipecat.frames.frames import LLMSetToolsFrame  # noqa: E402
@@ -460,7 +458,7 @@ from pipecat.utils.asyncio.task_manager import TaskManager  # noqa: E402
 async def main() -> None:
     context = LLMContext()
     owner = bot.IntakeAgent(
-        state=bot.State(customer_id=None, verified=False),
+        state=bot.CallState(customer_id=None, verified=False),
         context=context,
         call_context=None,
     )
@@ -695,7 +693,8 @@ async def main() -> None:
     assert callbacks[-1][0] == {"status": "completed"}
     assert callbacks[-1][1].run_llm is False, "next task must own the next LLM turn"
     assert callbacks[-1][1].on_context_updated is not None
-    assert owner._run_verify_results["verify"] == exact_result
+    # The saved result is the step's own values, and nothing was reported unserved.
+    assert owner._run_verify_results["verify"] == {**exact_result, "unserved_request": ""}
     assert owner._run_verify_active_step == "complete"
 
     callbacks.clear()
@@ -738,7 +737,7 @@ async def main() -> None:
     else:
         raise AssertionError("final completion failure was swallowed")
     assert owner._run_verify_active_step is None
-    assert owner._run_verify_results["complete"] == {"complete": True}
+    assert owner._run_verify_results["complete"] == {"complete": True, "unserved_request": ""}
     assert context.get_messages() == before_final_messages
     assert context.tools is before_final_tools
     assert prompt_restores[0].endswith("Current customer: cus-smoke.")
@@ -752,7 +751,7 @@ async def main() -> None:
     assert next_node is NO_RESPONSE
     owner.queue_frame = original_queue_frame
     owner.flush_pipeline = original_flush_pipeline
-    subprocess.run(["ruff", "check", "bot.py"], check=True)
+    subprocess.run(["ruff", "check", "--extend-exclude", "smoke_check.py", "."], check=True)
     print("task transfer smoke ok")
 
 
@@ -768,7 +767,7 @@ import subprocess
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import bot  # noqa: E402
+bot = _project("bot")
 from pipecat.processors.aggregators.llm_context import LLMContext  # noqa: E402
 
 
@@ -798,10 +797,10 @@ async def main() -> None:
     first_context = {"_phone_call": {"call_id": "call-a"}}
     second_context = {"_phone_call": {"call_id": "call-b"}}
     first = bot.BillingAgent(
-        state=bot.State(), context=LLMContext(), call_context=first_context,
+        state=bot.CallState(), context=LLMContext(), call_context=first_context,
     )
     second = bot.BillingAgent(
-        state=bot.State(), context=LLMContext(), call_context=second_context,
+        state=bot.CallState(), context=LLMContext(), call_context=second_context,
     )
 
     first_attempt = Params()
@@ -835,7 +834,7 @@ async def main() -> None:
     assert second_context["_phone_call"]["call_id"] == "call-b"
     assert first.call_context is first_context
     assert second.call_context is second_context
-    subprocess.run(["ruff", "check", "bot.py"], check=True)
+    subprocess.run(["ruff", "check", "--extend-exclude", "smoke_check.py", "."], check=True)
     print("pipecat session isolation smoke ok")
 
 
@@ -853,7 +852,7 @@ for name in json.load(open("compile-report.json"))["required_env"]:
 os.environ["UNMUTE_PUBLIC_URL"] = "https://voice.example"
 os.environ["TWILIO_AUTH_TOKEN"] = "smoke-auth-token"
 
-import bot  # noqa: E402
+bot = _project("bot")
 import telephony_helper as helper  # noqa: E402
 from pipecat.processors.aggregators.llm_context import LLMContext  # noqa: E402
 from pipecat.transports.daily.transport import DailyTransportClient  # noqa: E402
@@ -1060,7 +1059,9 @@ asyncio.run(main())
 const pipecatStaticCheckScript = `"""Smoke check: the generated project passes Ruff and ty."""
 import subprocess
 
-subprocess.run(["ruff", "check", "."], check=True)
+# The project, not this script: the emitted pyproject's rules are for
+# generated code, and smoke_check.py is the harness.
+subprocess.run(["ruff", "check", "--extend-exclude", "smoke_check.py", "."], check=True)
 # smoke_check.py is this harness, not generated output, and the knowledge stub
 # spliced into it imports knowledge and llama_index, which a package with no
 # knowledge base does not install. Ruff still reads it; ty resolves imports.
@@ -1076,6 +1077,7 @@ import base64
 import json
 import os
 import threading
+import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
@@ -1100,8 +1102,9 @@ os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-smoke"
 os.environ["LANGFUSE_SECRET_KEY"] = "sk-smoke"
 os.environ["LANGFUSE_BASE_URL"] = f"http://127.0.0.1:{receiver.server_port}"
 
-import bot  # noqa: E402
-import tracing as tracing_config  # noqa: E402
+bot = _project("bot")
+from utils import telemetry as emitted_telemetry  # noqa: E402
+from utils import tracing as tracing_config  # noqa: E402
 from loguru import logger  # noqa: E402
 from opentelemetry import trace  # noqa: E402
 from opentelemetry.sdk.trace import TracerProvider  # noqa: E402
@@ -1256,7 +1259,7 @@ class SlowProvider:
         self.release = release
         self.released_while_flushing = False
 
-    def force_flush(self) -> None:
+    def flush(self) -> None:
         self.started.set()
         self.released_while_flushing = self.release.wait(timeout=1)
 
@@ -1321,7 +1324,7 @@ async def assert_concurrent_calls_keep_their_own_session(memory) -> None:
     both_named = asyncio.Barrier(2)
 
     async def call(session: str) -> None:
-        tracing_config.start_call({"langfuse.session.id": session})
+        tracing_config.CALL.start_call({"langfuse.session.id": session}, tracing_config._TELEMETRY)
         await both_named.wait()
         with tracer.start_as_current_span(tracing_config.CALL_SPAN):
             await asyncio.sleep(0)
@@ -1345,16 +1348,16 @@ async def assert_concurrent_calls_keep_their_own_session(memory) -> None:
 async def main() -> None:
     await assert_worker_start_failure_stops_runner()
 
-    original_get_provider = tracing_config.trace.get_tracer_provider
-    tracing_config.trace.get_tracer_provider = lambda: TracerProvider()
+    original_get_provider = emitted_telemetry.trace.get_tracer_provider
+    emitted_telemetry.trace.get_tracer_provider = lambda: TracerProvider()
     try:
-        tracing_config.setup_langfuse_tracing()
+        tracing_config.setup_tracing()
     except RuntimeError as exc:
         assert "OpenTelemetry already has a TracerProvider" in str(exc)
     else:
         raise AssertionError("preinstalled provider was silently replaced")
     finally:
-        tracing_config.trace.get_tracer_provider = original_get_provider
+        emitted_telemetry.trace.get_tracer_provider = original_get_provider
 
     flush_started = threading.Event()
     release_flush = threading.Event()
@@ -1366,13 +1369,14 @@ async def main() -> None:
         release_flush.set()
 
     concurrent_task = asyncio.create_task(run_alongside_flush())
-    await asyncio.to_thread(tracing_config.flush_tracing, slow_provider)
+    await asyncio.to_thread(tracing_config.flush_tracing, slow_provider, "")
     await concurrent_task
     assert slow_provider.released_while_flushing
 
     memory = InMemorySpanExporter()
-    provider = tracing_config.setup_langfuse_tracing()
-    assert provider is tracing_config.setup_langfuse_tracing()
+    telemetry = tracing_config.setup_tracing()
+    assert telemetry is tracing_config.setup_tracing()
+    provider = telemetry.provider
     assert provider is trace.get_tracer_provider()
     provider.add_span_processor(SimpleSpanProcessor(memory))
     await assert_concurrent_calls_keep_their_own_session(memory)
@@ -1391,12 +1395,11 @@ async def main() -> None:
     session_id = "session-smoke"
     # bot.py names the call before the worker exists, so the conversation span
     # and everything under it carry the same correlating attributes.
-    tracing_config.start_call(
-        {
-            "langfuse.trace.name": tracing_config.TRACE_NAME,
-            "langfuse.session.id": session_id,
-        }
-    )
+    trace_attributes = tracing_config.start_call(telemetry, types.SimpleNamespace(session_id=session_id))
+    assert trace_attributes == {
+        "langfuse.trace.name": emitted_telemetry.TRACE_NAME,
+        "langfuse.session.id": session_id,
+    }, trace_attributes
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
     main_worker = PipelineWorker(
@@ -1413,7 +1416,7 @@ async def main() -> None:
         conversation_id=session_id,
         enable_tracing=True,
         additional_span_attributes={
-            "langfuse.trace.name": tracing_config.TRACE_NAME,
+            "langfuse.trace.name": emitted_telemetry.TRACE_NAME,
             "langfuse.session.id": session_id,
         },
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
@@ -1427,7 +1430,7 @@ async def main() -> None:
         for value in vars(bot).values()
         if isinstance(value, type)
         and issubclass(value, LLMWorker)
-        and value.__module__ == "bot"
+        and value.__module__ == "agents"
     ]
     assert len(agent_types) == 1, agent_types
     request_agent = agent_types[0]()
@@ -1580,7 +1583,7 @@ async def main() -> None:
     finally:
         request_agent._tracing_context = original_context
         cancel_parent.end()
-    tracing_config.flush_tracing(provider)
+    tracing_config.flush_tracing(telemetry)
 
     spans = memory.get_finished_spans()
     conversation = next(span for span in spans if span.name == "conversation")
@@ -1636,7 +1639,7 @@ async def main() -> None:
     assert json.loads(requests["tts"].attributes["langfuse.observation.usage_details"]) == {
         "characters": len("traced.")
     }
-    assert conversation.attributes["langfuse.trace.name"] == tracing_config.TRACE_NAME
+    assert conversation.attributes["langfuse.trace.name"] == emitted_telemetry.TRACE_NAME
     assert conversation.attributes["conversation.id"] == session_id
     assert conversation.attributes["langfuse.session.id"] == session_id
     # v4 filters and sums over observations, so the session ID and trace name
@@ -1644,8 +1647,8 @@ async def main() -> None:
     # Pipecat's own additional_span_attributes reach the conversation span alone.
     for span in (conversation, turn, tool_call, *requests.values()):
         assert span.attributes["langfuse.session.id"] == session_id, span.name
-        assert span.attributes["langfuse.trace.name"] == tracing_config.TRACE_NAME, span.name
-    assert conversation.resource.attributes["service.name"] == tracing_config.TRACE_NAME
+        assert span.attributes["langfuse.trace.name"] == emitted_telemetry.TRACE_NAME, span.name
+    assert conversation.resource.attributes["service.name"] == emitted_telemetry.TRACE_NAME
     # The whole call is one trace: pipecat already nests turn under
     # conversation, so nothing re-parents anything and nothing splits.
     assert all(span.context.trace_id == conversation.context.trace_id for span in requests.values())
@@ -1706,7 +1709,7 @@ import os
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import bot  # noqa: E402
+bot = _project("bot")
 from pipecat.runner.types import DailyDialinRequest  # noqa: E402
 from pipecat.runner.utils import _maybe_apply_daily_dialin  # noqa: E402
 from pipecat.transports.base_transport import TransportParams  # noqa: E402
@@ -1875,7 +1878,7 @@ import os
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "https://mcp.example/mcp")
 
-import bot  # noqa: E402
+bot = _project("bot")
 
 from pipecat.processors.aggregators.llm_context import LLMContext  # noqa: E402
 from pipecat.services.mcp_service import MCPClient  # noqa: E402
@@ -1883,7 +1886,7 @@ from pipecat.workers.llm import LLMWorker  # noqa: E402
 
 workers = sorted(
     name for name, obj in vars(bot).items()
-    if inspect.isclass(obj) and issubclass(obj, LLMWorker) and obj.__module__ == "bot"
+    if inspect.isclass(obj) and issubclass(obj, LLMWorker) and obj.__module__ == "agents"
 )
 assert workers, "no agent workers found in bot.py"
 
@@ -1907,7 +1910,7 @@ import os
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "https://mcp.example/mcp")
 
-import bot  # noqa: E402
+bot = _project("bot")
 from mcp.types import ListToolsResult, Tool  # noqa: E402
 from pipecat.processors.aggregators.llm_context import LLMContext  # noqa: E402
 from pipecat.workers.llm import LLMWorker  # noqa: E402
@@ -1981,7 +1984,7 @@ worker_types = [
     for value in vars(bot).values()
     if inspect.isclass(value)
     and issubclass(value, LLMWorker)
-    and value.__module__ == "bot"
+    and value.__module__ == "agents"
     and value.__name__.endswith("Agent")
 ]
 mcp_worker_type = next(worker_type for worker_type in worker_types if "start_mcp" in vars(worker_type))
@@ -2227,57 +2230,8 @@ func TestSmokeV24PipecatDailyTransferStaticCheck(t *testing.T) {
 	runPipecatSmokeScript(t, "daily_carrier", nil, nil, pipecatStaticCheckScript)
 }
 
-// TestSmokeV24PipecatExamplesStaticCheck holds raw Pipecat output to the bar
-// LiveKit has had since V26, over the same examples: `uv run ruff check .`, the
-// exact command a user would run in a generated project. It closes the gap where
-// a lint regression in a Pipecat template was caught on one driver and missed on
-// the other, and it only became runnable once the emitted pyproject declared a
-// pinned ruff of its own.
-//
-// ty stays on simple-prompt (TestSmokeV24PipecatSimplePromptStaticCheck) rather
-// than widening here: run over a task-bearing package it reports real type
-// errors in emitted task code (self.context is `Unknown | None` at the snapshot
-// and aggregator call sites, self.state likewise where results are assigned).
-// Those are driver bugs to fix in their own change, not something to widen the
-// gate into and leave red.
-func TestSmokeV24PipecatExamplesStaticCheck(t *testing.T) {
-	if _, err := exec.LookPath("uv"); err != nil {
-		t.Skip("uv not available")
-	}
-	for _, example := range []string{"simple-prompt", "salon-concierge", "remy"} {
-		t.Run(example, func(t *testing.T) {
-			pkg, err := spec.Load(examplePackagePath(example))
-			if err != nil {
-				t.Fatal(err)
-			}
-			agent, err := ir.Build(pkg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			artifact, err := Generate(agent, targetByProvider(t, agent, ir.ProviderPipecat), target.Default())
-			if err != nil {
-				t.Fatal(err)
-			}
-			// Only the emitted project lands here: no smoke script alongside, so
-			// ruff sees exactly what a user would compile.
-			dir := t.TempDir()
-			for _, file := range artifact.Files {
-				path := filepath.Join(dir, file.Path)
-				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(path, file.Content, 0o644); err != nil {
-					t.Fatal(err)
-				}
-			}
-			cmd := uvCommand("run", "ruff", "check", ".")
-			cmd.Dir = dir
-			if out, err := cmd.CombinedOutput(); err != nil {
-				t.Fatalf("uv run ruff check . failed:\n%s", out)
-			}
-		})
-	}
-}
+// TestSmokeEmittedProjectsPassTheirOwnGate (emitted_static_smoke_test.go)
+// holds every example's Pipecat output to ruff, ty, format and an import.
 
 func runPipecatSmoke(t *testing.T, example string, mutate func(*ir.Target), mutateAgent func(*ir.Agent)) {
 	t.Helper()
@@ -2293,7 +2247,7 @@ func runPipecatSmokeScript(t *testing.T, example string, mutate func(*ir.Target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2320,15 +2274,24 @@ func runPipecatSmokeScript(t *testing.T, example string, mutate func(*ir.Target)
 // is a 401.
 //
 // So the stub replaces each `_embed_<base>` with MockEmbedding *before* anything
-// imports bot. `knowledge` lands in sys.modules already patched, and bot's own
-// `import knowledge` picks up the patched module. Reading, text-layer detection,
-// splitting, indexing and both halves of the search still run for real; only the
-// hosted call is stubbed.
+// imports bot. `utils.knowledge` lands in sys.modules already patched, and the
+// project's own `from utils import knowledge` picks up the patched module.
+// Reading, text-layer detection, splitting, indexing and both halves of the
+// search still run for real; only the hosted call is stubbed.
 //
 // Silent when the package declares no knowledge base, which is most of them.
+//
+// The stub also defines _project, which a script calls where it used to write
+// `import bot` or `import agent`. The emitted code is several modules now, and a
+// script reads and patches it as the one namespace the entry file used to be:
+// a read finds the name in whichever module defines or imports it, and a write
+// rebinds it in every module that holds it. That second half is the point. Each
+// module holds its own binding of a name it imported from another, so patching
+// only the module that defines a function leaves the module that calls it
+// running the original.
 const knowledgeSmokeStub = `
 try:
-    import knowledge as _knowledge
+    from utils import knowledge as _knowledge
 
     from llama_index.core.embeddings import MockEmbedding
 
@@ -2336,6 +2299,41 @@ try:
         setattr(_knowledge, _name, lambda: MockEmbedding(embed_dim=8))
 except ImportError:
     pass  # no knowledge base in this package
+
+import importlib as _importlib
+import pathlib as _pathlib
+import types as _types
+
+
+class _Project(_types.ModuleType):
+    """The emitted modules, read and patched as one namespace."""
+
+    def __setattr__(self, name, value):
+        for module in self.__dict__.get("_modules", ()):
+            if name in vars(module):
+                setattr(module, name, value)
+        super().__setattr__(name, value)
+
+
+def _project(entry):
+    """Import the entry module, then every other emitted module, as one namespace."""
+    modules = [_importlib.import_module(entry)]
+    paths = [*sorted(_pathlib.Path().glob("*.py")), *sorted(_pathlib.Path("utils").glob("*.py"))]
+    for path in [*paths, _pathlib.Path("prompts/__init__.py")]:
+        name = ".".join(path.with_suffix("").parts).removesuffix(".__init__")
+        if path.exists() and name not in (entry, "utils") and not name.startswith(("smoke_", "telephony_", "text_run_")):
+            modules.append(_importlib.import_module(name))
+    project = _Project(entry)
+    for module in reversed(modules):
+        project.__dict__.update(vars(module))
+    project.__dict__["_modules"] = modules
+    return project
+
+
+def _project_source():
+    """Every emitted module's source, joined, for a script that reads the code."""
+    paths = [*sorted(_pathlib.Path().glob("*.py")), *sorted(_pathlib.Path("utils").glob("*.py"))]
+    return "\n".join(p.read_text() for p in paths if not p.name.startswith(("smoke_", "telephony_", "text_run_")))
 `
 
 // withKnowledgeStub splices the stub in below the script's own module docstring,

@@ -31,7 +31,7 @@ func run(t *testing.T, args ...string) (string, error) {
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
 	cmd.SetArgs(args)
-	err := cmd.Execute()
+	err := cmd.ExecuteContext(recordedCtx(t))
 	return out.String(), err
 }
 
@@ -44,7 +44,7 @@ func runWithInput(t *testing.T, input string, args ...string) (string, error) {
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
 	cmd.SetArgs(args)
-	err := cmd.Execute()
+	err := cmd.ExecuteContext(recordedCtx(t))
 	return out.String(), err
 }
 
@@ -73,6 +73,73 @@ func TestInit_scaffoldsValidV1Package(t *testing.T) {
 	}
 	if !strings.Contains(vout, "✓ livekit (livekit)") {
 		t.Fatalf("scaffold did not validate clean:\n%s", vout)
+	}
+}
+
+// --target writes the same starter the wizard does after picking a target, so
+// a twilio package can be scaffolded without a terminal.
+func TestInitTargetTwilioValidatesAndCompiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "relay")
+	if out, err := run(t, "init", dir, "--target", "twilio"); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	if out, err := run(t, "validate", dir); err != nil || !strings.Contains(out, "✓ twilio (twilio)") {
+		t.Fatalf("validate: %v\n%s", err, out)
+	}
+	if out, err := run(t, "compile", dir); err != nil {
+		t.Fatalf("compile: %v\n%s", err, out)
+	}
+	app, err := os.ReadFile(filepath.Join(dir, "build", "twilio", "settings.py"))
+	if err != nil {
+		t.Fatalf("no twilio app: %v", err)
+	}
+	// The starter thinks through the SLNG Context Router, scoped to the package.
+	for _, want := range []string{`ROUTER_BASE_URL = "https://eu-west.context-router.slng.ai/v1"`, `ROUTER_SCOPE = "relay-v1:assistant"`} {
+		if !strings.Contains(string(app), want) {
+			t.Errorf("the starter settings.py lacks %s", want)
+		}
+	}
+}
+
+func TestInitTargetFrameworksValidate(t *testing.T) {
+	for _, provider := range []string{"livekit", "pipecat"} {
+		t.Run(provider, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "desk")
+			if out, err := run(t, "init", dir, "--target", provider); err != nil {
+				t.Fatalf("init: %v\n%s", err, out)
+			}
+			want := "✓ " + provider + " (" + provider + ")"
+			if out, err := run(t, "validate", dir); err != nil || !strings.Contains(out, want) {
+				t.Fatalf("validate: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+func TestInitTargetRefusesBeforeWriting(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"unknown target", []string{"--target", "vapi"}, `--target "vapi" is not a target; use one of livekit, pipecat, twilio`},
+		// SLNG needs a deployment region, which only the wizard asks for.
+		{"slng", []string{"--target", "slng"}, "--target slng needs a deployment region, and only the wizard asks for one: run `unmute init` in a terminal and pick SLNG there"},
+		{"with a manifest", []string{"--from-manifest", "--target", "twilio"}, "--target and --from-manifest cannot be used together"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "relay")
+			_, err := run(t, append([]string{"init", dir}, tc.args...)...)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+			if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+				t.Error("a refused init wrote files")
+			}
+		})
+	}
+	if _, err := run(t, "init", "--target", "twilio"); err == nil || !strings.Contains(err.Error(), "--target needs a name") {
+		t.Errorf("init --target with no name: %v", err)
 	}
 }
 
@@ -197,7 +264,7 @@ func TestInitRefusesAFolderThatCannotBeAnAgentName(t *testing.T) {
 	cmd.SetOut(&out)
 	cmd.SetErr(&errOut)
 	cmd.SetArgs([]string{"init", dir})
-	err := cmd.Execute()
+	err := cmd.ExecuteContext(recordedCtx(t))
 	if err == nil {
 		t.Fatal("init wrote a package whose name it could not derive")
 	}
@@ -221,7 +288,7 @@ func TestInitWritesAPackageThatValidates(t *testing.T) {
 	cmd.SetOut(&out)
 	cmd.SetErr(&errOut)
 	cmd.SetArgs([]string{"init", dir})
-	if err := cmd.Execute(); err != nil {
+	if err := cmd.ExecuteContext(recordedCtx(t)); err != nil {
 		t.Fatal(err)
 	}
 	written, err := os.ReadFile(filepath.Join(dir, "agent.yaml"))
@@ -231,7 +298,7 @@ func TestInitWritesAPackageThatValidates(t *testing.T) {
 	if !strings.Contains(string(written), "name: acme-support\n") {
 		t.Errorf("agent.yaml does not carry the name derived from the folder:\n%s", written)
 	}
-	if _, _, err := loadPackage(dir, nil); err != nil {
+	if _, _, err := loadPackage(recordedCtx(t), dir, nil); err != nil {
 		t.Errorf("the scaffolded package does not build: %v", err)
 	}
 }

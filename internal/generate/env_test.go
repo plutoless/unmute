@@ -16,7 +16,7 @@ func exampleArtifact(t *testing.T, example string, provider ir.Provider) Artifac
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestDeclaredFieldsReachTheGeneratedProject(t *testing.T) {
 			name:     "interruption disabled reaches pipecat",
 			mutate:   func(a *ir.Agent) { a.Conversation.Interruption = &ir.Interruption{Enabled: &off} },
 			provider: ir.ProviderPipecat,
-			file:     "bot.py",
+			file:     agentSource,
 			want:     "AlwaysUserMuteStrategy()",
 		},
 		{
@@ -74,7 +74,7 @@ func TestDeclaredFieldsReachTheGeneratedProject(t *testing.T) {
 				a.Conversation.Inactivity = &ir.Inactivity{NudgeAfter: "15s", EndAfter: "45s"}
 			},
 			provider: ir.ProviderPipecat,
-			file:     "bot.py",
+			file:     agentSource,
 			want:     "_end_after(",
 		},
 		{
@@ -83,7 +83,7 @@ func TestDeclaredFieldsReachTheGeneratedProject(t *testing.T) {
 			name:     "a transfer with no when: still describes itself on pipecat",
 			mutate:   func(a *ir.Agent) { setTransferWhen(a, "to_billing", "") },
 			provider: ir.ProviderPipecat,
-			file:     "bot.py",
+			file:     agentSource,
 			want:     "Transfer the caller to the billing agent.",
 		},
 		{
@@ -91,7 +91,7 @@ func TestDeclaredFieldsReachTheGeneratedProject(t *testing.T) {
 			name:     "a whitespace when: does not defeat the default",
 			mutate:   func(a *ir.Agent) { setTransferWhen(a, "to_billing", "   ") },
 			provider: ir.ProviderLiveKit,
-			file:     "agent.py",
+			file:     agentSource,
 			want:     "Transfer the caller to the billing.",
 		},
 	} {

@@ -93,7 +93,11 @@ type TelephonyRoute struct {
 	PublicEndpoints            []TelephonyEndpointRule
 	RuntimeEnvironment         []TelephonyEnvironmentRule
 	LocallySuppliedEnvironment []string
-	ManualSteps                []string
+	// DeployOnlyEnvironment names connection keys a deploy step reads and the
+	// running app never does. The plan leaves them out of the runtime set, so a
+	// secret the process has no use for is never asked of it.
+	DeployOnlyEnvironment []string
+	ManualSteps           []string
 	// AutoWebhookEndpoint names the public endpoint the carrier's voice webhook
 	// has to point at on this route. Empty means the carrier keeps printed
 	// manual steps instead. Nothing writes it for the operator any more: it is
@@ -428,6 +432,40 @@ func TelephonyRoutes() map[TelephonyKey]TelephonyRoute {
 		"deploy a self-hosted LiveKit Server and set LIVEKIT_URL and the API key pair to it; the bridge and worker connect out to it, so it needs no public SIP or RTP",
 	}
 	routes[connector] = route
+	// Twilio ConversationRelay, served by the twilio target's own app.py. Twilio
+	// transcribes and speaks; the app answers the voice webhook with TwiML,
+	// holds the ConversationRelay WebSocket and thinks. One process, no Redis.
+	relay := TelephonyKey{Provider: Twilio, Transport: TwilioTransport, Carrier: "twilio"}
+	add(Twilio, TwilioTransport, "twilio", TwilioDocs.ConversationRelay,
+		TelephonyRouteSelected, TelephonyInbound, TelephonyFeature(Hangup))
+	route = routes[relay]
+	for feature, evidence := range route.Features {
+		evidence.Verified = TwilioTargetVerified
+		evidence.Note = "offline-proven against a signed fake ConversationRelay client; one real call through a Twilio number, to a Render host, reached speech, the end message and the action callback"
+		route.Features[feature] = evidence
+	}
+	route.RequiredEnvironment = []string{"account_sid", "auth_token", "phone_number_sid", "public_url"}
+	// The number SID is what a deploy step uses to point the number at the
+	// app. The app never reads it.
+	route.DeployOnlyEnvironment = []string{"phone_number_sid"}
+	route.Processes = []TelephonyProcess{{
+		Name: "application", Command: []string{"python", "app.py"}, Health: "/healthz", Readiness: "/healthz",
+	}}
+	route.PublicEndpoints = []TelephonyEndpointRule{
+		{Name: "voice", Method: "POST", Path: "/voice", AnyFeatures: []TelephonyFeature{TelephonyInbound}},
+		{Name: "conversation", Method: "WS", Path: "/conversation"},
+		{Name: "connect_action", Method: "POST", Path: "/connect-action"},
+		{Name: "health", Method: "GET", Path: "/healthz"},
+	}
+	// No AutoWebhookEndpoint: the dev loop never reaches this route. The
+	// number's webhook is written only by an explicit `unmute deploy --target`,
+	// or by hand, as the steps below say.
+	route.ManualSteps = []string{
+		"host the built app behind HTTPS at a public origin you control, and set the public_url environment name to that origin, for example https://relay.example.com, with no path",
+		"take the number off any SIP trunk and any TwiML App, and clear its voice fallback URL: deploy refuses a number with any of them, and never clears one for you",
+		"run `unmute deploy --target <name> --dry-run`, then again without --dry-run, to point the number at https://<your origin>/voice; or, in the Twilio Console, open the number (Phone Numbers, Manage, Active Numbers) and set \"A call comes in\" to Webhook, HTTP POST, https://<your origin>/voice",
+	}
+	routes[relay] = route
 	return routes
 }
 

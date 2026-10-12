@@ -165,6 +165,7 @@ func DefaultCatalog() Catalog {
 	entries = append(entries, livekitCatalog...)
 	entries = append(entries, livekitLiveCatalog...)
 	entries = append(entries, livekitRealtimeCatalog...)
+	entries = append(entries, twilioCatalog...)
 	return Catalog{entries: entries}
 }
 

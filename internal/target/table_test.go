@@ -128,7 +128,7 @@ func TestDefaultTableIsCompleteAndTyped(t *testing.T) {
 	// Tracing needs a process to instrument, which every remaining target has.
 	// The other half of this check used to assert both fields were Gated on the
 	// two managed targets; those are retired, so only the passing half is left.
-	for _, field := range []Field{FieldTracingLangfuse, FieldTracingCoval} {
+	for _, field := range []Field{FieldTracingLangfuse, FieldTracingCoval, FieldTracingLogfire} {
 		if table.Capability(field, LiveKit).Tag != Core || table.Capability(field, Pipecat).Tag != Core {
 			t.Fatalf("%s must pass on code drivers", field)
 		}
@@ -786,5 +786,100 @@ func TestPipecatHistoryRowIsPerValue(t *testing.T) {
 		if note := table.HistorySupport(history, Pipecat).Note; note != "" {
 			t.Errorf("history %s passes on pipecat and still carries a note: %q", history, note)
 		}
+	}
+}
+
+// TestTwilioRowsAreDeliberate is the twilio sibling of the slng check above.
+// field() seeds only the framework targets, so every twilio answer is written
+// in twilioFields; this asserts that mechanism directly, and that every note
+// the target speaks names itself and an alternative.
+func TestTwilioRowsAreDeliberate(t *testing.T) {
+	if got := field()[Twilio]; got.Tag != "" {
+		t.Fatalf("field() seeds twilio with %q; every undecided row is now silently supported", got.Tag)
+	}
+	table := Default()
+	for field := range table.Fields {
+		if _, ok := twilioFields()[field]; !ok {
+			t.Errorf("%s has no twilio decision in twilioFields", field)
+		}
+	}
+	notes := map[string]string{}
+	for field, byProvider := range table.Fields {
+		if tag := byProvider[Twilio].Tag; tag == Gated || tag == Warn {
+			notes[string(field)] = byProvider[Twilio].Note
+		}
+	}
+	for control, byProvider := range table.Controls {
+		if byProvider[Twilio].Tag == Gated {
+			notes["control "+string(control)] = byProvider[Twilio].Note
+		}
+	}
+	for name, note := range notes {
+		if !strings.HasPrefix(note, "twilio target") {
+			t.Errorf("%s: twilio note does not start with %q, so it reads like a note about the twilio carrier: %q", name, "twilio target", note)
+		}
+		if split := strings.LastIndex(note, ": "); split < 0 || strings.TrimSpace(note[split+2:]) == "" {
+			t.Errorf("%s: twilio note names no alternative: %q", name, note)
+		}
+	}
+	if IsCode(Twilio) || !EmitsProject(Twilio) {
+		t.Error("twilio emits a project on no framework: EmitsProject true, IsCode false")
+	}
+	if _, ok := Window(Twilio); ok {
+		t.Error("twilio has a framework support window; its runtime pins live in TwilioPins")
+	}
+}
+
+func TestTwilioTurnParams(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value any
+		ok    bool
+	}{
+		{"speechTimeout", 800, true},
+		{"speechTimeout", uint64(5000), true},
+		{"speechTimeout", 599, false},
+		{"speechTimeout", 800.5, false},
+		{"interruptSensitivity", "medium", true},
+		{"interruptSensitivity", "loud", false},
+		{"ignoreBackchannel", true, true},
+		{"ignoreBackchannel", "yes", false},
+		{"eotThreshold", 0.7, false}, // the listen model is not flux
+	} {
+		if err := CheckTwilioParam(Turn, "turn", tc.name, tc.value, "nova-3-general"); (err == nil) != tc.ok {
+			t.Errorf("%s=%v: err=%v, want ok=%v", tc.name, tc.value, err, tc.ok)
+		}
+	}
+}
+
+// The listen and speak attributes, and the one turn attribute that applies to
+// a single speech model.
+func TestTwilioParams(t *testing.T) {
+	for _, tc := range []struct {
+		role  Role
+		name  string
+		value any
+		model string
+		ok    bool
+	}{
+		{Listen, "hints", []any{"Unmute", "front desk"}, "nova-3-general", true},
+		{Listen, "hints", []any{"one, two"}, "nova-3-general", false},
+		{Listen, "hints", []any{}, "nova-3-general", false},
+		{Listen, "hints", "Unmute", "nova-3-general", false},
+		{Listen, "deepgramSmartFormat", false, "nova-3-general", true},
+		{Listen, "keywords", []any{"x"}, "nova-3-general", false},
+		{Speak, "elevenlabsTextNormalization", "auto", "", true},
+		{Speak, "elevenlabsTextNormalization", "yes", "", false},
+		{Turn, "eotThreshold", 0.7, "flux", true},
+		{Turn, "eotThreshold", 1, "flux", false},
+		{Turn, "eotThreshold", 0.4, "flux", false},
+		{Reason, "hints", []any{"x"}, "", false},
+	} {
+		if err := CheckTwilioParam(tc.role, string(tc.role), tc.name, tc.value, tc.model); (err == nil) != tc.ok {
+			t.Errorf("%s.%s=%v on %q: err=%v, want ok=%v", tc.role, tc.name, tc.value, tc.model, err, tc.ok)
+		}
+	}
+	if got := TwilioAttr([]any{"Unmute", " front desk "}); got != "Unmute,front desk" {
+		t.Errorf("hints attribute = %q", got)
 	}
 }

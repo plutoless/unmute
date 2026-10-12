@@ -3,6 +3,7 @@ package generate
 import (
 	"encoding/json"
 	"flag"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/slng-ai/unmute/internal/ir"
 	"github.com/slng-ai/unmute/internal/spec"
+	"github.com/slng-ai/unmute/internal/stateschema"
 	"github.com/slng-ai/unmute/internal/target"
 )
 
@@ -37,7 +39,7 @@ func TestSlngPreviewIncludesTheBuiltinDescription(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +56,7 @@ func compileSlng(t *testing.T, fixture string) (Artifact, map[string]string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,6 +121,34 @@ func TestSlngV1CoreGolden(t *testing.T) {
 func TestSlngV1ToolsGolden(t *testing.T) {
 	artifact, _ := compileSlng(t, "slng_tools")
 	slngGolden(t, artifact, "slng_v1_tools.txt")
+}
+
+// TestSlngV1TasksGolden is every task feature the target writes: a task with
+// its own when:, a group-only step, a skip, typed values with a shape, an
+// append, a last_n history and a tool only a task can call.
+func TestSlngV1TasksGolden(t *testing.T) {
+	artifact, _ := compileSlng(t, "slng_tasks")
+	slngGolden(t, artifact, "slng_v1_tasks.txt")
+}
+
+// A task names its tool by the name the tool's reference carries, and that
+// reference carries no attachment_id: the push chooses one and rewrites the
+// task to match, so a compiled task holding an id would hold one nobody chose.
+func TestSlngTaskToolsAreTheirReferencesNames(t *testing.T) {
+	_, files := compileSlng(t, "slng_tasks")
+	body := slngBodyOf(t, files)
+	refs := map[any]bool{}
+	for _, ref := range body["tool_refs"].([]any) {
+		refs[ref.(map[string]any)["tool"]] = true
+	}
+	for _, task := range body["tasks"].([]any) {
+		tools, _ := task.(map[string]any)["tools"].([]any)
+		for _, tool := range tools {
+			if !refs[tool] {
+				t.Errorf("task names %v, which no tool_refs entry carries", tool)
+			}
+		}
+	}
 }
 
 // Two files, and the reason there are two rather than four is the shape of this
@@ -211,9 +241,11 @@ func TestSlngV1WritesEmptyVariableMapsRatherThanNone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// No variables at all: state.py read as an empty State.
 	pkg.Agent.Variables = nil
+	pkg.State = &stateschema.Model{}
 	pkg.Agent.Conversation.Greeting.Text = "Hi, you have reached Acme Support."
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,6 +261,92 @@ func TestSlngV1WritesEmptyVariableMapsRatherThanNone(t *testing.T) {
 		if !strings.Contains(files["agent.json"], want) {
 			t.Errorf("agent.json does not carry %s; a null map says something different from an empty one:\n%s", want, files["agent.json"])
 		}
+	}
+}
+
+// world_part picks the speech gateway on the code targets, and Pipecat requires
+// it. On a think model it builds the Context Router base URL. On SLNG the
+// agent's region does both and SLNG refuses world_part as a kwarg, so the same
+// package must compile without it, on all three models. Other params stay.
+func TestSlngV1DropsWorldPart(t *testing.T) {
+	pkg, err := spec.Load(filepath.Join("..", "testdata", "slng_core"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := buildWithState(t, pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt := targetByProvider(t, agent, ir.ProviderSlng)
+	if tgt.Models.Listen == nil {
+		t.Fatal("fixture has no listen binding")
+	}
+	listen := *tgt.Models.Listen
+	listen.Params = map[string]any{"world_part": "eu-north", "punctuate": true}
+	tgt.Models.Listen = &listen
+	speak := maps.Clone(tgt.Models.Speak)
+	for name, binding := range speak {
+		binding.Params = map[string]any{"world_part": "eu-north", "speed": 1.1}
+		speak[name] = binding
+	}
+	tgt.Models.Speak = speak
+	reasons := maps.Clone(tgt.Models.Reason)
+	for name, binding := range reasons {
+		binding.Params = map[string]any{"world_part": "eu-west", "world_part_override": "eu-west", "temperature": 0.2}
+		reasons[name] = binding
+	}
+	tgt.Models.Reason = reasons
+
+	artifact, err := Generate(agent, tgt, target.Default())
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	files := map[string]string{}
+	for _, file := range artifact.Files {
+		files[file.Path] = string(file.Content)
+	}
+	models := slngBodyOf(t, files)["models"].(map[string]any)
+	want := map[string]map[string]any{
+		"stt_kwargs": {"punctuate": true},
+		"llm_kwargs": {"temperature": 0.2},
+		"tts_kwargs": {"speed": 1.1},
+	}
+	for field, expected := range want {
+		got, _ := models[field].(map[string]any)
+		if !maps.Equal(got, expected) {
+			t.Errorf("%s = %v, want %v", field, got, expected)
+		}
+	}
+}
+
+// A call fact is filled by the phone adapter on the code targets. SLNG fills
+// none, and an inbound call carries no arguments, so a required call_id would
+// refuse every inbound call that names it. It must be written optional, while
+// an ordinary variable stays required.
+func TestSlngV1CallFactsAreOptional(t *testing.T) {
+	pkg, err := spec.Load(filepath.Join("..", "testdata", "slng_core"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := buildWithState(t, pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.Variables["call_id"] = ir.Variable{Type: ir.PrimitiveString, Source: ir.VariableSourceCallID}
+	artifact, err := Generate(agent, targetByProvider(t, agent, ir.ProviderSlng), target.Default())
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	files := map[string]string{}
+	for _, file := range artifact.Files {
+		files[file.Path] = string(file.Content)
+	}
+	options := slngBodyOf(t, files)["template_variable_options"].(map[string]any)
+	if got := options["call_id"].(map[string]any)["required"]; got != false {
+		t.Errorf("call_id required = %v, want false", got)
+	}
+	if got := options["customer_name"].(map[string]any)["required"]; got != true {
+		t.Errorf("customer_name required = %v, want true", got)
 	}
 }
 
@@ -474,7 +592,7 @@ func TestSlngEmitsTheHostedNameAndKeepsTheLocalOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -633,7 +751,7 @@ func TestResolvedBodyCarriesExactlyWhatWasChecked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}

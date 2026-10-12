@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/slng-ai/unmute/internal/ir"
 	"github.com/slng-ai/unmute/internal/spec"
 	"github.com/slng-ai/unmute/internal/target"
 )
@@ -20,7 +19,7 @@ func terminalModule(t *testing.T, targetName, file string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,8 +33,8 @@ func terminalModule(t *testing.T, targetName, file string) string {
 func terminalModules(t *testing.T) map[string]string {
 	t.Helper()
 	return map[string]string{
-		"livekit": terminalModule(t, "livekit", "agent.py"),
-		"pipecat": terminalModule(t, "pipecat", "bot.py"),
+		"livekit": terminalModule(t, "livekit", agentSource),
+		"pipecat": terminalModule(t, "pipecat", agentSource),
 	}
 }
 
@@ -43,7 +42,7 @@ func terminalModules(t *testing.T) map[string]string {
 // cannot answer "did this tool succeed" differently.
 func TestTerminalHelpersAreByteIdenticalOnBothTargets(t *testing.T) {
 	modules := terminalModules(t)
-	for _, marker := range []string{"def _terminal_success(", "def _merge_retained(", "def _success_word("} {
+	for _, marker := range []string{"def _terminal_success(", "    def retain(", "def _success_word("} {
 		livekit := blockAfter(t, modules["livekit"], marker)
 		pipecat := blockAfter(t, modules["pipecat"], marker)
 		if livekit != pipecat {
@@ -73,12 +72,12 @@ func TestTerminalHelpersCarryNoLibrarySpecificPlaceholder(t *testing.T) {
 // A step that names a tool under finish: ends on it: the tool's own method hands
 // the result to the step's ending, and the ending completes without a reply.
 func TestTerminalToolEndsTheStepOnBothTargets(t *testing.T) {
-	livekit := terminalModule(t, "livekit", "agent.py")
+	livekit := terminalModule(t, "livekit", agentSource)
 	for _, want := range []string{
 		"return await self._end_on_book_it(ctx, result)",
 		"return await self._end_on_cancel_it(ctx, result)",
 		"return await self._end_on_look_up(ctx, result)",
-		`_values = _save_result("book", ctx.userdata, result)`,
+		`_values = ctx.userdata.save_result("book", result)`,
 		"self.complete(_values)",
 		// None, so livekit-agents sets reply_required False and makes no
 		// request. This one line is the feature.
@@ -88,16 +87,16 @@ func TestTerminalToolEndsTheStepOnBothTargets(t *testing.T) {
 			t.Errorf("livekit agent.py missing %q", want)
 		}
 	}
-	pipecat := terminalModule(t, "pipecat", "bot.py")
+	pipecat := terminalModule(t, "pipecat", agentSource)
 	for _, want := range []string{
-		"async def _do_book_terminal_book_book_it(self, args, flow_manager):",
+		"async def _do_book_terminal_book_book_it(\n        self, args: Any, flow_manager: FlowManager\n    ) -> tuple[dict[str, Any], Any]:",
 		"result = await _flow_tool_book_it(args, flow_manager, state=self.state)",
-		`_values = _save_result("book", self.state, result)`,
+		`_values = self.state.save_result("book", result)`,
 		// The wrapper saves once and hands the saved values to the finish
 		// handler's tail. Going through the finish handler saved twice, and a
 		// second save is a second entry on every list an assign appends to.
 		"return await self._do_book_advance_book(_values)",
-		"async def _do_book_advance_book(self, _values):",
+		"async def _do_book_advance_book(\n        self, _values: dict[str, Any]\n    ) -> tuple[dict[str, Any], Any]:",
 	} {
 		if !strings.Contains(pipecat, want) {
 			t.Errorf("pipecat bot.py missing %q", want)
@@ -123,7 +122,7 @@ func TestTerminalToolLeavesANonSuccessToTheModel(t *testing.T) {
 // how to record it, and the step stays open.
 func TestARefusedSaveKeepsTheResultAndSaysHowToRepair(t *testing.T) {
 	for name, module := range terminalModules(t) {
-		if !strings.Contains(module, "except _StateRefused as refused:") {
+		if !strings.Contains(module, "except StateRefused as refused:") {
 			t.Errorf("%s does not catch a refused save in its terminal path", name)
 		}
 		for _, want := range []string{
@@ -145,7 +144,7 @@ func TestARefusedSaveKeepsTheResultAndSaysHowToRepair(t *testing.T) {
 // again in the same invocation. Different arguments do not prove a new request:
 // during a save repair the model could change a time and book twice.
 func TestASucceededMutationIsClosedForTheRestOfTheInvocation(t *testing.T) {
-	livekit := terminalModule(t, "livekit", "agent.py")
+	livekit := terminalModule(t, "livekit", agentSource)
 	for _, want := range []string{
 		"if self._terminal is not None:",
 		"book_it already succeeded in this step",
@@ -162,7 +161,7 @@ func TestASucceededMutationIsClosedForTheRestOfTheInvocation(t *testing.T) {
 	if guardAt < 0 || callAt < guardAt {
 		t.Errorf("the closure must be checked before the tool runs: guard=%d call=%d", guardAt, callAt)
 	}
-	pipecat := terminalModule(t, "pipecat", "bot.py")
+	pipecat := terminalModule(t, "pipecat", agentSource)
 	if !strings.Contains(pipecat, "if self._do_book_terminal is not None:") {
 		t.Error("pipecat bot.py does not close the step's mutations")
 	}
@@ -176,24 +175,24 @@ func TestASucceededMutationIsClosedForTheRestOfTheInvocation(t *testing.T) {
 // The step consumed a caller turn the owner never saw, so the owner is handed it
 // back immediately before the status, once.
 func TestTheCarriedTurnReachesTheOwnerOnce(t *testing.T) {
-	livekit := terminalModule(t, "livekit", "agent.py")
+	livekit := terminalModule(t, "livekit", agentSource)
 	for _, want := range []string{
-		"def _newest_caller_turn(chat_ctx):",
-		"def _insert_carried_turn(owner_ctx, carried):",
-		"if owner_ctx.get_by_id(item.id) is None:",
+		"def _newest_caller_turn(chat_ctx: llm.ChatContext) -> llm.ChatMessage | None:",
+		"def _insert_carried_turn(owner_ctx: llm.ChatContext, carried: list[llm.ChatMessage | None]) -> None:",
+		"if item is not None and owner_ctx.get_by_id(item.id) is None:",
 		"_insert_carried_turn(owner_ctx, _carried)",
 	} {
 		if !strings.Contains(livekit, want) {
 			t.Errorf("livekit agent.py missing %q", want)
 		}
 	}
-	pipecat := terminalModule(t, "pipecat", "bot.py")
+	pipecat := terminalModule(t, "pipecat", agentSource)
 	for _, want := range []string{
-		"def _newest_caller_message(messages):",
+		"def _newest_caller_message(messages: list[Any]) -> dict[str, Any] | None:",
 		// Decided where the turn is captured, by counting the caller's turns
 		// against the owner's snapshot: matching on text dropped a caller who
 		// said the same word twice.
-		"def _caller_turns(messages):",
+		"def _caller_turns(messages: list[Any]) -> int:",
 		"self._do_book_snapshot_turns = _caller_turns(self.context.get_messages())",
 		"if _caller_turns(_messages) > self._do_book_snapshot_turns:",
 		"_carried_messages(self._do_book_carried_turn)",

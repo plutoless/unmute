@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/slng-ai/unmute/internal/ir"
+	"github.com/slng-ai/unmute/internal/stateschema"
 )
 
 // Each declared type parses to its JSON counterpart, so a bot expecting a number
@@ -105,7 +106,7 @@ func TestCallStartPayload(t *testing.T) {
 		want string
 	}{
 		{"not name=value", "dispatched", "must be name=value"},
-		{"undeclared", "nobody=Ada", "no variable"},
+		{"undeclared", "nobody=Ada", "declares no"},
 		{"an unrecognized source", "unrecognized=Ada", "not a source unmute recognizes"},
 		{"the route's own", "from_the_route=Ada", "the runtime supplies it"},
 	} {
@@ -123,6 +124,30 @@ func TestCallStartPayload(t *testing.T) {
 				t.Errorf("the refusal names an empty source: %v", err)
 			}
 		})
+	}
+}
+
+// An object or a list is passed as JSON, which the docs promise, and reaches the
+// agent as JSON rather than as one quoted string its type check would refuse.
+// Text with a checked format stays text: a Phone is not JSON.
+func TestCallStartPayloadDecodesStructuredValues(t *testing.T) {
+	agent := &ir.Agent{Variables: map[string]ir.Variable{
+		"record": {Type: ir.PrimitiveString, Schema: &stateschema.Type{Kind: stateschema.KindObject, Model: "CustomerRecord"}},
+		"notes":  {Type: ir.PrimitiveString, Schema: &stateschema.Type{Kind: stateschema.KindArray, Items: &stateschema.Type{Kind: stateschema.KindString}}},
+		"phone":  {Type: ir.PrimitiveString, Schema: &stateschema.Type{Kind: stateschema.KindString, Format: "phone"}},
+	}}
+	got, err := callStartPayload(agent, []string{
+		`record={"record_id":"R1"}`, `notes=["one","two"]`, "phone=+34600111222",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"notes":["one","two"],"phone":"+34600111222","record":{"record_id":"R1"}}`; got != want {
+		t.Errorf("payload = %s, want %s", got, want)
+	}
+	_, err = callStartPayload(agent, []string{"record=R1"})
+	if err == nil || !strings.Contains(err.Error(), "is not JSON for a CustomerRecord") {
+		t.Errorf("a structured value that is not JSON must be refused by name, got %v", err)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/slng-ai/unmute/internal/spec"
+	"github.com/slng-ai/unmute/internal/stateschema"
 	targetcap "github.com/slng-ai/unmute/internal/target"
 )
 
@@ -37,6 +38,8 @@ func TestAgoraRejectsUnsupportedFeatures(t *testing.T) {
 	}{
 		{"tools", "tools", func(a *Agent, _ *Target) { a.Tools = map[string]Tool{"x": {Execution: ToolMCP}} }},
 		{"tasks", "tasks", func(a *Agent, _ *Target) { a.Tasks = map[string]Task{"x": {}} }},
+		{"state", "package.state", func(a *Agent, _ *Target) { a.State = &stateschema.Model{} }},
+		{"custom logic", "target.logic", func(_ *Agent, t *Target) { t.Logic = &Logic{Path: "logic"} }},
 		{"variables", "variables", func(a *Agent, _ *Target) { a.Variables = map[string]Variable{"x": {}} }},
 		{"phone", "channels.web", func(a *Agent, _ *Target) { a.Channels["web"] = Channel{Kind: ChannelTelephony} }},
 		{"turn", "turn", func(a *Agent, _ *Target) { a.Turn = "detector" }},
@@ -66,5 +69,17 @@ func TestAgoraRejectsUnsupportedFeatures(t *testing.T) {
 				t.Fatalf("missing %q: %+v", tc.want, report)
 			}
 		})
+	}
+}
+
+// Target-specific restrictions must supplement, not replace, the shared table.
+func TestAgoraHonorsSharedCapabilityTable(t *testing.T) {
+	agent, tgt := agoraExample(t)
+	caps := targetcap.Default()
+	const note = "duration disabled by the shared capability table"
+	caps.Fields[targetcap.FieldMaxDuration][targetcap.Agora] = targetcap.Capability{Tag: targetcap.Gated, Note: note}
+	report, err := Validate(agent, []Target{tgt}, caps)
+	if err == nil || len(report.PerTarget) != 1 || !strings.Contains(strings.Join(report.PerTarget[0].Errors, "\n"), note) {
+		t.Fatalf("shared capability refusal was lost: %+v, %v", report, err)
 	}
 }

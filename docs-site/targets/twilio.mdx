@@ -1,0 +1,564 @@
+---
+title: "The Twilio target"
+description: "Configuration, hosting requirements, and advanced options for your ConversationRelay application."
+sidebarTitle: "Twilio"
+---
+
+```sh
+unmute init my-agent --target twilio
+```
+
+The Twilio target generates a FastAPI app that you host. Follow the
+[first-call walkthrough](/telephony/twilio-conversation-relay) to create an
+account, get a number, and connect it to your agent.
+
+## What Twilio runs and what you run
+
+Twilio handles phone calls, transcription, turn detection, and speech synthesis.
+Your app keeps the conversation, runs tools, and sends text replies over
+ConversationRelay's secure WebSocket. The default LLM path uses the
+[SLNG Context Router](/optimization/context-router) in front of OpenAI.
+
+Twilio requires a reachable `wss://` server; FastAPI is Unmute's implementation
+choice. SLNG optimizes model requests and does not host this phone application.
+See [Twilio's ConversationRelay requirements](https://www.twilio.com/docs/voice/twiml/connect/conversationrelay).
+
+## The package
+
+The starter creates the complete package, including instructions, speech
+settings, an inbound phone channel, and `end_call`. Edit `instructions.md` for
+your agent's behavior. Its default think binding is:
+
+```yaml
+models:
+  think:
+    assistant_model:
+      provider: slng
+      model: gpt-5.6-luna
+      agent_id: my-agent-v1
+      upstream:
+        provider: openai
+      params:
+        world_part: eu-west
+        reasoning_effort: none
+        parallel_tool_calls: false
+```
+
+Declare both `SLNG_API_KEY` and `OPENAI_API_KEY` in `secrets`. The router reuses
+answers it judges cacheable and sends other requests to the upstream model.
+The app forwards the upstream key to SLNG in each request so the router can
+call the model. Keep `agent_id` stable for cache reuse; change it when prompt
+changes should invalidate earlier answers. The cache key excludes the system
+prompt. Each request logs whether the router cache or model answered.
+
+```yaml targets.yaml
+targets:
+  twilio:
+    provider: twilio
+    sdk_language: python
+    connection: twilio
+```
+
+```yaml connections/twilio.yaml
+transport: conversation-relay
+carrier: twilio
+environment:
+  account_sid: TWILIO_ACCOUNT_SID
+  auth_token: TWILIO_AUTH_TOKEN
+  phone_number_sid: TWILIO_PHONE_NUMBER_SID
+  public_url: TWILIO_PUBLIC_URL
+```
+
+The connection contains environment variable names, never secret values.
+
+### Every key a twilio target takes
+
+<ParamField path="provider" type="twilio" required>
+  Selects this target. Generates a FastAPI application that you host.
+</ParamField>
+
+<ParamField path="sdk_language" type="python">
+  The only language this target writes. Optional.
+</ParamField>
+
+<ParamField path="connection" type="connection file stem" required>
+  The connection file with `transport: conversation-relay` and `carrier: twilio`.
+  Required, because a twilio package always has its one phone channel.
+</ParamField>
+
+<ParamField path="models" type="model entry name to a model definition">
+  Per target overrides of named `agent.yaml` entries, for example to think with
+  SLNG on one target and a direct model provider on another.
+</ParamField>
+
+<ParamField path="logic" type="folder path">
+  A folder of your own Python that runs each agent turn in place of the
+  generated one. See [Bring your own agent logic](#bring-your-own-agent-logic).
+</ParamField>
+
+### Every key the connection takes
+
+<ParamField path="transport" type="conversation-relay" required>
+  The only transport this target serves.
+</ParamField>
+
+<ParamField path="carrier" type="twilio" required>
+  The only carrier on this transport.
+</ParamField>
+
+<ParamField path="environment" type="account_sid | auth_token | phone_number_sid | public_url to an env name" required>
+  The four names the route needs. The app reads `account_sid`, `auth_token` and
+  `public_url`. `phone_number_sid` is read only by `unmute deploy`.
+</ParamField>
+
+## What the package may carry
+
+| Section | What works |
+|---|---|
+| agents | one agent |
+| channels | exactly one: `kind: telephony`, `inbound: true`, `outbound: false` |
+| think | `slng` (the Context Router), `openai` (Chat Completions) or `google` / `gemini` (native `generateContent`); `params` are sent as written |
+| listen | `deepgram`, with a model such as `nova-3-general`, an optional `language`, and the `params` `hints` and `deepgramSmartFormat` |
+| speak | `elevenlabs`, with `model`, a bare voice id in `voice`, an optional `language`, and the `params` `elevenlabsTextNormalization` |
+| turn | optional, `params` only: `speechTimeout` (600 to 5000 ms), `interruptSensitivity` (`high`, `medium`, `low`), `ignoreBackchannel`, and `eotThreshold` (0.5 to 0.9, listen model `flux` only) |
+| greeting | a fixed `text` with `speaks_first: agent`, or `speaks_first: user` with no text |
+| interruption | `enabled: true` or `false`, and `protect: [greeting]` |
+| tools | local handlers with flat `input` and `output` schemas of `string`, `integer`, `number` and `boolean` fields, and the builtin `end_call` |
+
+The app builds ConversationRelay's `voice` attribute as `<voice id>-<model>`,
+for example `UgBBYS2sOqTuMpoF3BR0-flash_v2_5`. Write the id alone; a voice
+that already has the suffix is refused.
+
+<Accordion title="Every ConversationRelay attribute">
+
+Each row is one attribute of
+[`<ConversationRelay>`](https://www.twilio.com/docs/voice/twiml/connect/conversationrelay),
+and where its value comes from. A setting under `params` has the attribute's
+own name.
+
+```yaml
+models:
+  listen:
+    transcriber:
+      provider: deepgram
+      model: nova-3-general
+      params:
+        hints:
+          - relay desk
+          - opening hours
+        deepgramSmartFormat: true
+  speak:
+    voice:
+      provider: elevenlabs
+      model: flash_v2_5
+      voice: UgBBYS2sOqTuMpoF3BR0
+      params:
+        elevenlabsTextNormalization: auto
+```
+
+<ParamField path="hints" type="list of strings">
+  Words or phrases the caller may say. The app joins them with commas, so a
+  phrase may not hold a comma.
+</ParamField>
+
+<ParamField path="deepgramSmartFormat" type="boolean">
+  Deepgram's Smart Format on the transcript. Twilio's default is `true`.
+</ParamField>
+
+<ParamField path="elevenlabsTextNormalization" type="string">
+  `on`, `auto` or `off`. Twilio's default is `off`.
+</ParamField>
+
+<ParamField path="eotThreshold" type="number">
+  Under `models.turn` params. How sure the model must be that the caller has
+  finished, from 0.5 to 0.9. Twilio uses it only when the listen model is
+  `flux`, so any other model refuses it.
+</ParamField>
+
+| Attribute | Set from |
+|---|---|
+| `url` | the app's public origin, `wss://<host>/conversation` |
+| `welcomeGreeting`, `welcomeGreetingInterruptible` | `conversation.greeting`, and `protect: [greeting]` |
+| `transcriptionProvider`, `speechModel`, `transcriptionLanguage` | the listen binding |
+| `ttsProvider`, `voice`, `ttsLanguage` | the speak binding |
+| `interruptible`, `reportInputDuringAgentSpeech` | `conversation.interruption.enabled` |
+| `interruptSensitivity`, `speechTimeout`, `ignoreBackchannel`, `eotThreshold` | turn `params` |
+| `hints`, `deepgramSmartFormat` | listen `params` |
+| `elevenlabsTextNormalization` | speak `params` |
+| `preemptible`, `dtmfDetection` | always `false`: the app sends no preemptible text and reads no keypad digits |
+| `language`, `<Language>` | not written: the two per-side languages cover one language |
+| `partialPrompts` | not written: the app answers final prompts only |
+| `events` | not written: Twilio does not document the event payloads |
+| `intelligenceService`, `conversationConfiguration`, `conversationId` | not written: these connect other Twilio products |
+| `debug` | not written |
+
+Speech providers are Deepgram for transcription and ElevenLabs for synthesis.
+
+</Accordion>
+
+Everything else is refused before a file is written. Each refusal says what to
+do instead. The refused list:
+
+- more agents, tasks, task groups, handoffs and transfers;
+- variables, a `state.py` and prefetch;
+- webhook, MCP, knowledge and hosted tools;
+- tool `announce`, `interruption: cancel`, and `effect: ends_conversation` on a local tool;
+- `instructions` on `end_call`;
+- inactivity and duration timers, `pace` and the other turn fields;
+- tracing, realtime and live architectures, fallbacks and custom endpoints;
+- the target keys `version`, `pins`, `deployment_region` and `warm_instances`.
+
+## What compiling writes
+
+```sh
+unmute compile
+```
+
+writes `build/<target>/`:
+
+| File | What it is |
+|---|---|
+| `app.py` | the entry point, on FastAPI and uvicorn: the routes, the WebSocket and the server |
+| `call.py` | one call: reading the socket, speaking, running tools, interrupts, call slots |
+| `brain.py` | the model: one history per call, and one streamed response at a time |
+| `handoff.py` | what the call does after its session, and the TwiML the app answers with |
+| `tool_runner.py` | the tools the model may call: their schemas, and how a handler runs |
+| `settings.py` | every compiled value and limit, in one place |
+| `prompts/instructions.md` | the agent's instructions, as you wrote them |
+| `conversation-relay.xml.tmpl` | the TwiML `/voice` returns; the app fills in your public origin at startup |
+| `tools/` | your local handlers, copied from the package |
+| `logic/` | your own agent logic, copied as written, when the target names `logic:` |
+| `pyproject.toml` | exact dependency pins for Python 3.12 |
+| `Dockerfile` | a non-root image running one process |
+| `.dockerignore` | keeps `.env` and local state out of the image |
+| `.env.example` | every environment name the app reads |
+| `README.md` | the runbook for this build |
+| `compile-report.json` | what was resolved, the pins, and capability notes |
+
+The generated project has no unmute dependency and reads no YAML.
+
+`compile` deletes `build/<target>/` and writes it again, keeping only `.env`.
+A file you add there by hand is lost on the next compile. Put it in the
+package's `hosting/<target>/` folder instead, for example
+`hosting/twilio/service.conf`. Every compile copies that folder into
+`build/<target>/` and lists each file as `copied`. A hosting file may not use a
+name compile writes, such as `app.py`, or `.env`: compile refuses it and
+changes nothing. A hosting file does not change the build's `artifact_id`.
+
+## Host it
+
+Use a container service, VM, or other Python host of your choice. The
+[walkthrough](/telephony/twilio-conversation-relay#4-host-the-application)
+walks through uploading the compiled project, deploying a container on Render
+as one example, running on a VM, and testing through a local tunnel. Compile
+creates files on your computer; your host deploys those files; `unmute deploy`
+then points the number at the running app. The host must supply:
+
+- Public HTTPS and WSS, with WebSocket upgrades and connections kept open for a whole call.
+- The exact public origin in `TWILIO_PUBLIC_URL`, without a path. Signature checks use this URL.
+- `PORT`, defaulting to `8080`; the app binds to `0.0.0.0`.
+- `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and the model keys. The default uses `SLNG_API_KEY` and `OPENAI_API_KEY`.
+- One process and one instance per number: sessions and parked conversations are held in memory.
+- `GET /healthz` as its health check and about 35 seconds of shutdown grace.
+
+Keep the service available when calls arrive. A sleeping service can miss
+Twilio's webhook timeout. On shutdown the app stops accepting calls, allows
+up to 20 seconds for active calls, then ends remaining sessions and gives
+Twilio time to close the sockets. A health check returning 200 confirms the
+process is running, not that a call slot is available; draining returns 503.
+
+To update the agent, recompile, redeploy the generated project to your host,
+then run `unmute deploy --target twilio` again. It checks that the hosted
+`artifact_id` matches the local build. Hosting files do not affect that ID.
+
+## Point the number at it
+
+```sh
+unmute deploy --target twilio --dry-run
+unmute deploy --target twilio
+```
+
+Deploy reads the connection's four Twilio values from the shell or package
+`.env`. It needs no model key. It checks the number's voice capability, routing
+region, hosted build ID, and signed `/voice` response. A TwiML App, SIP trunk,
+or fallback URL on the number blocks deployment; it never clears those settings.
+
+The dry run writes nothing. Deployment saves the previous route in a private
+`unmute/twilio-rollback/` file under your user configuration directory, then
+sets only `VoiceUrl` and `VoiceMethod` to the app's `/voice` URL and `POST`.
+It reads the number back and writes `build/<target>/deploy-report.json`.
+An already-correct route is left unchanged. An uncertain write reports
+`unknown`, exits 1, and prints the snapshot path; inspect the number before
+retrying. Do not deploy to the same number concurrently.
+
+Deploy uploads no application, buys no number, and makes no call. Its probes
+check HTTP wiring; a real call checks the WebSocket and speech path.
+
+## How the app behaves
+
+- **Signatures.** Twilio callbacks must carry a valid `X-Twilio-Signature`, checked
+  with the official Twilio library against `TWILIO_PUBLIC_URL`, the exact path
+  and query, and every form field
+  ([Twilio webhook security](https://www.twilio.com/docs/usage/security)). The
+  app never trusts forwarded headers for this. The WebSocket handshake is also
+  accepted with a trailing slash on the path, the one variant Twilio documents.
+- **Calls at once.** At most `capacity.max_sessions`, in one process. When it is
+  full, `/voice` hangs up. The other capacity fields are planning numbers only.
+  Run one copy per number.
+- **Speech settings.** Deepgram transcribes and ElevenLabs speaks, both inside
+  ConversationRelay
+  ([voice configuration](https://www.twilio.com/docs/voice/conversationrelay/voice-configuration)).
+  DTMF detection is off. With interruption on, the caller can
+  talk over the agent; `protect: [greeting]` keeps the greeting whole.
+- **Streaming.** The reply streams as text tokens
+  ([WebSocket messages](https://www.twilio.com/docs/voice/conversationrelay/websocket-messages)).
+  `last: true` marks the end of one reply. It means the app sent it, not that
+  the caller heard it.
+- **Interruptions.** The app stops sending, and keeps in history only the part
+  of the reply the caller heard. Text already sent cannot be recalled.
+- **Tools.** Arguments and results are checked against the tool's schemas. A
+  tool always runs to the end. After 30 seconds the turn moves on and the model
+  is told the outcome is unknown. A synchronous handler runs in its own thread,
+  which Python cannot stop, so bound its network calls. At most 8 tool rounds
+  per caller turn.
+- **Ending the call.** `end_call` ends the session at once, so a goodbye said in
+  the same turn may be cut off.
+- **Failures.** A failed or timed-out model response gets one short fixed line.
+  Three in a row end the call.
+
+### How the app is secured
+
+Three checks stand between the internet and your agent:
+
+1. `/voice` and `/connect-action` check `X-Twilio-Signature` over the exact URL
+   on `TWILIO_PUBLIC_URL`, and check that `AccountSid` is your account
+   ([webhook security](https://www.twilio.com/docs/usage/security)).
+2. The WebSocket handshake on `/conversation` is signed the same way, over the
+   `wss://` URL with no form fields
+   ([ConversationRelay onboarding](https://www.twilio.com/docs/voice/conversationrelay/onboarding)).
+   An unsigned handshake gets HTTP 403 before the socket opens.
+3. The first message must be Twilio's `setup`, for your account, with a valid
+   call SID and session ID. No call state exists before it.
+
+The Auth Token is the one shared secret. To rotate it, set the new token on
+the host and restart the app. Twilio publishes no fixed IP ranges for its
+webhooks
+([webhooks security](https://www.twilio.com/docs/usage/webhooks/webhooks-security)),
+so an IP allow list is not an option: the signature is the protection. Serve
+the app over HTTPS only.
+
+## Advanced
+
+<Accordion title="Direct model providers">
+
+SLNG is the default optimization path. To call OpenAI directly, replace the
+think binding with `provider: openai`, keep the model and the
+`reasoning_effort` and `parallel_tool_calls` params, and remove `agent_id`,
+`upstream`, and `world_part`. Only `OPENAI_API_KEY` is needed for the model.
+
+For Gemini, replace the think binding with:
+
+```yaml
+    assistant_model:
+      provider: google
+      model: gemini-3.1-flash-lite
+      params:
+        thinking_config:
+          thinking_level: MINIMAL
+```
+
+Declare `GOOGLE_API_KEY` instead of the router and OpenAI keys. This uses the
+Gemini Developer API. Adding `vertexai: true` and `location: eu` to `params`
+uses Vertex AI with that API key. The SLNG `vertex` upstream is unsupported
+on this target.
+
+</Accordion>
+
+### Regional configuration
+
+<Accordion title="Choose a region or set up Ireland">
+
+| Twilio call-processing region | Connection value |
+|---|---|
+| United States (default) | `us1` |
+| Ireland | `ie1` |
+| Australia | `au1` |
+
+[ConversationRelay supports all three](https://www.twilio.com/docs/voice/twiml/connect).
+The Twilio region is independent of the FastAPI host's location and SLNG's
+`world_part`; selecting `ie1` does not move either service or guarantee that
+all speech-provider and LLM processing stays in Ireland.
+
+<ParamField path="region" type="us1 | ie1 | au1" default="us1">
+  The [Twilio Region](https://www.twilio.com/docs/global-infrastructure/understanding-twilio-regions)
+  that handles the calls. Each region keeps its own copy of the number's voice
+  settings and has its own Auth Token. Outside `us1`, `auth_token` must name
+  that region's token
+  ([regional credentials](https://www.twilio.com/docs/global-infrastructure/manage-regional-api-credentials)),
+  because Twilio signs the region's requests with it. The number's routing
+  region must match too
+  ([inbound processing region](https://www.twilio.com/docs/global-infrastructure/inbound-processing-console)).
+  Refused on every other route.
+</ParamField>
+
+For an Ireland deployment:
+
+1. In Twilio Console's **API keys & tokens**, select **Ireland (IE1)** and
+   obtain that region's Auth Token. Use it as `TWILIO_AUTH_TOKEN` in both the
+   host's environment and the source package's `.env`. An API key secret is
+   not a substitute for the Auth Token used to validate webhook signatures.
+2. Add `region: ie1` at the top level of `connections/twilio.yaml`:
+
+   ```yaml
+   transport: conversation-relay
+   carrier: twilio
+   region: ie1
+   environment:
+     account_sid: TWILIO_ACCOUNT_SID
+     auth_token: TWILIO_AUTH_TOKEN
+     phone_number_sid: TWILIO_PHONE_NUMBER_SID
+     public_url: TWILIO_PUBLIC_URL
+   ```
+
+   Validate, compile, and deploy the new build to your host with the IE1
+   token. Keep `TWILIO_PUBLIC_URL` pointing to the same host if it has not moved.
+3. In the number's **Ireland** configuration, set the incoming-call webhook
+   to `https://YOUR-HOST/voice`, method **POST**. Then change its incoming-call
+   processing region to **Ireland (IE1)**, following
+   [Twilio's routing instructions](https://www.twilio.com/docs/global-infrastructure/inbound-processing-console).
+   Allow up to five minutes for the routing change. Coordinate the token and
+   routing switch while the number is idle; mismatched regions fail signature
+   checks. `unmute deploy` checks the routing region but does not change it.
+4. From the local source package, run `unmute deploy --target twilio --dry-run`,
+   then `unmute deploy --target twilio`. Make a real call and inspect that
+   call in the **IE1** Console. The CLI uses `api.dublin.ie1.twilio.com`;
+   the app still receives calls on its own public HTTPS/WSS origin.
+
+</Accordion>
+
+<Accordion title="Manual routing and rollback">
+
+In Twilio Console, open the active number and set **A call comes in** to
+Webhook, HTTP POST, `https://your-host/voice` to route manually.
+
+Before restoring a saved route, check that the number still uses the snapshot's
+`new_voice_url` with POST and has no TwiML App, SIP trunk, or fallback URL. If
+it differs, stop and coordinate with whoever changed it. Otherwise restore
+`voice_url` and `voice_method` from the snapshot in the Console, then test a call.
+
+</Accordion>
+
+### Bring your own agent logic
+
+<Accordion title="Custom Python turns">
+
+The app you host is yours, so the agent turn can be too. Point the target at a
+folder of your own Python:
+
+```yaml targets.yaml
+targets:
+  twilio:
+    provider: twilio
+    connection: twilio
+    logic: logic/
+```
+
+```python logic/__init__.py
+async def respond(session):
+    """Stream the reply to the caller's last words."""
+    yield "Hello from my own agent."
+```
+
+The app still owns the call: Twilio's signatures and protocol, interruptions,
+call slots, the drain on shutdown, and the fixed line when a turn fails.
+`respond()` owns the turn, and it runs its own tools. Compile copies the folder
+into `build/<target>/logic/` exactly as written and never changes it. The
+folder counts in the build's `artifact_id`, so `unmute deploy` refuses a host
+that runs older logic.
+
+What `session` holds:
+
+| Field | What it is |
+|---|---|
+| `history` | the conversation as a list of `{"role": "user" \| "assistant", "content": str}`, oldest first. The last entry is the turn to answer. An interrupted reply holds only what the caller heard. It is a copy. |
+| `call` | `call_sid`, `session_id`, `from`, `to`, `direction` and `custom_parameters`, from Twilio's setup message |
+| `instructions` | the package's instructions |
+| `model` | the package's think binding: `model`, `base_url` (the SLNG router's, or `None`), `api_key`, `params`, and the router's `extra_body` and `extra_headers` |
+| `state` | a dict of your own, kept for the whole call |
+| `end(reason, **data)` | ends the session once this reply has been sent, before Twilio runs the post-session callback. `reason` and `data` reach [`next_twiml()`](#other-twilio-services-after-the-session) |
+| `twilio` | a Twilio REST client on your account and region, for any Twilio API during the call. It is synchronous, so call it through `asyncio.to_thread` |
+
+Rules the app holds `respond()` to:
+
+- It must be `async def respond(session)` in the folder's `__init__.py`, and
+  yield strings.
+- A turn has 30 seconds. A turn that raises, times out or yields nothing gets
+  the fixed failure line. Three failures in a row end the call.
+- `end()` ends the session after the reply has been sent; this does not
+  guarantee that Twilio has finished speaking it.
+- `requirements.txt` in the folder, one requirement per line, is added to the
+  app's pinned dependencies. A pin that clashes with the app's own pins fails
+  at install, with the installer's message.
+
+`think:` remains required. Your logic may use `session.model`, including the
+SLNG router configuration, or call another model itself.
+
+</Accordion>
+
+### Other Twilio services after the session
+
+<Accordion title="Post-session TwiML and resuming a conversation">
+
+When the agent's session ends, Twilio asks the app what the call does next.
+The answer can be any TwiML: put the caller through with `<Dial>`, queue them
+for a person with `<Enqueue>`, take a card with `<Pay>`, or play a line. It can
+also hand the caller back to the agent, with the conversation kept.
+
+```python logic/__init__.py
+import os
+
+
+def next_twiml(handoff):
+    if handoff.reason == "hold":
+        return handoff.resume(
+            "a short hold", before="<Say>Please hold.</Say>", greeting="Thanks for holding."
+        )
+    if handoff.reason == "transfer":
+        # A number you set on the host, never one the model or the caller chose.
+        return f"<Response><Dial>{os.environ['FRONT_DESK_NUMBER']}</Dial></Response>"
+    return None  # hang up
+```
+
+What `handoff` holds:
+
+| Field | What it is |
+|---|---|
+| `reason` | the reason `session.end()` sent. The app's own reasons are `end_call`, `busy` and `shutdown`. It is empty when the session ended without an `end` |
+| `data` | the other keyword arguments `session.end()` sent |
+| `call` | `call_sid`, `from`, `to` and `direction` |
+| `status` | Twilio's `SessionStatus`: `completed`, `ended` or `failed` |
+| `twilio` | the same REST client as `session.twilio` |
+| `resume(note, before="", greeting="")` | TwiML that hands the caller back to the agent. `before` is TwiML verbs Twilio runs first. `greeting` is the line the caller hears on coming back; without one, the agent waits for the caller. The note reaches logic as `session.call["custom_parameters"]["resume"]` |
+
+Rules the app holds `next_twiml()` to:
+
+- It may be `def` or `async def`. Twilio waits 15 seconds for the answer, so an
+  `async` one gets 10 and a slow one should hand work to a thread.
+- The answer must be well-formed XML. An exception, a non-string or broken XML
+  is logged, and the call hangs up.
+- The kept history waits 10 minutes, in this process only. A resume that
+  reaches another copy of the app starts a fresh conversation. Run one copy
+  per number, as for calls at once.
+- Never put card numbers or other secrets in `session.end()` data: it travels
+  through Twilio as the session's handoff data.
+- Build TwiML from values you trust. A number to dial, or text to put in the
+  XML, that came from the model or the caller needs checking and escaping first.
+- A resume waits for the caller after its optional greeting.
+
+</Accordion>
+
+## Related guides
+
+- [First call with ConversationRelay](/telephony/twilio-conversation-relay)
+- [Connection reference](/reference/connections-yaml)
+- [SLNG Context Router](/optimization/context-router)

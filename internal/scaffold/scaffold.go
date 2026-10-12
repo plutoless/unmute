@@ -6,7 +6,9 @@ package scaffold
 
 import (
 	"bytes"
+	"cmp"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -88,6 +90,17 @@ Everything you say is read out loud.
 	// Authored as two fields, never a folded `openai/...` string: the value is
 	// forwarded to the SDK verbatim.
 	DefaultReasonModel = "gpt-5.6-terra"
+	// SlngSpeechStarterParams names the gateway the starter's SLNG speech
+	// calls. Pipecat has no default since pipecat-slng 0.6.0, so a package
+	// without it fails validate. eu-north is the gateway the examples use.
+	SlngSpeechStarterParams = "world_part: eu-north"
+	// TwilioReasonModel is the think model the twilio target was measured on:
+	// streamed replies and tool follow-ups through Chat Completions on
+	// 2026-09-25, with reasoning_effort none.
+	TwilioReasonModel = "gpt-5.6-luna"
+	// TwilioGeminiModel is the Gemini model the twilio target was measured on,
+	// on the same day, with thinking_level MINIMAL.
+	TwilioGeminiModel = "gemini-3.1-flash-lite"
 	// RouterExampleModel is the second, and last, model identifier this
 	// repository teaches. It exists because the router example has to name a
 	// different model from the scaffold default to be worth reading: a matched
@@ -174,11 +187,12 @@ type Data struct {
 	Listen        Binding
 	Reason        Binding
 	Speak         Binding
-	// Shapes is the package's shapes: section. The console does not edit it, and
-	// it has to be here anyway: maintain rewrites agent.yaml from this struct, so
-	// a field absent here is a field deleted from the author's file, and what
-	// would be deleted is every declared shape and the types that name them.
-	Shapes    []Shape
+	// State is the package's own state.py, written back as it was read. Nil for
+	// a package with none, which is then written one made from Variables.
+	State []byte
+	// Variables are the console's simple variables. A package with its own
+	// state.py carries only its variables: entries here, the ones with source:
+	// or confirm:, because its types live in that file.
 	Variables []Variable
 	// Knowledge is the package's knowledge: section. The console does not edit
 	// it, but it has to carry it: maintain rewrites agent.yaml from this struct,
@@ -226,6 +240,11 @@ type Binding struct {
 	Voice    string
 	Language string // per-model BCP-47 tag (N16); listen/speak only, omitted when empty
 	Params   string
+	// AgentID and Upstream are a SLNG Context Router think binding's. Upstream
+	// is JSON text like Params. Both are carried for the reason every field
+	// here is: maintain rewrites agent.yaml from this struct.
+	AgentID  string
+	Upstream string
 }
 
 type Variable struct {
@@ -239,22 +258,6 @@ type Variable struct {
 	// skippable group step into a compile refusal on the next build.
 	Confirm string
 	// Description is what the model reads about the value. Same reason.
-	Description string
-}
-
-// Shape is one declared shape: a named group of fields a variable's type:
-// refers to. Carried so the console's rewrite keeps it.
-type Shape struct {
-	Name        string
-	Description string
-	Fields      []ShapeField
-}
-
-// ShapeField is one member of a shape. Description is what decides which of the
-// two authored forms it is written back as: one line without, a block with.
-type ShapeField struct {
-	Name        string
-	Type        string
 	Description string
 }
 
@@ -475,6 +478,8 @@ func DefaultTransport(target string) string {
 		return "daily-sip"
 	case "livekit":
 		return "sip"
+	case string(targetcap.Twilio):
+		return targetcap.TwilioTransport
 	}
 	return ""
 }
@@ -493,6 +498,11 @@ func ceilingFor(provider targetcap.Provider) string {
 
 // SetTarget selects an orchestrator and resets its target-dependent defaults.
 func (d *Data) SetTarget(provider string) {
+	if d.Target == string(targetcap.Twilio) {
+		// The phone channel was twilio's default, not the author's choice, and
+		// no other target's starter carries it.
+		d.Channels = nil
+	}
 	d.Target = provider
 	d.Transport = ""
 	d.Carrier = ""
@@ -512,6 +522,19 @@ func (d *Data) SetTarget(provider string) {
 	case "livekit":
 		d.TargetVersion = ceilingFor(targetcap.LiveKit)
 		d.SDKLanguage = "python"
+	case string(targetcap.Twilio):
+		// The first-release shape, and nothing it refuses: one inbound phone
+		// channel, ConversationRelay's own speech, and the think binding
+		// measured on 2026-09-25. Returns before the shared starter below,
+		// which is SLNG speech the twilio target does not run.
+		d.SDKLanguage = "python"
+		d.Transport = targetcap.TwilioTransport
+		d.Carrier = "twilio"
+		d.Channels = []Channel{{Name: "phone", Kind: "telephony", Inbound: true}}
+		d.Listen = Binding{Provider: "deepgram", Model: "nova-3-general", Language: "en-US"}
+		d.Reason = TwilioReasonStarter("slng")
+		d.Speak = Binding{Provider: "elevenlabs", Model: "flash_v2_5", Voice: "UgBBYS2sOqTuMpoF3BR0", Language: "en-US"}
+		return
 	}
 	// Pipecat and LiveKit share the safe SLNG/OpenAI starter.
 	//
@@ -522,7 +545,7 @@ func (d *Data) SetTarget(provider string) {
 	// 605ms on slng/deepgram/nova:3-en (n=16). A new package pays that on every
 	// turn, so the faster route is the one to hand out. It is also the only one
 	// salon-concierge could use, because the hosted id has no eu world part.
-	d.Listen = Binding{Provider: "slng", Model: "deepgram/nova:3"}
+	d.Listen = Binding{Provider: "slng", Model: "deepgram/nova:3", Params: SlngSpeechStarterParams}
 	// One generation parameter, and it is not a preference: a fresh package has
 	// tools, and OpenAI rejects function tools on /v1/chat/completions for a
 	// reasoning model unless the request says `reasoning_effort: "none"`. Sending
@@ -543,7 +566,29 @@ func (d *Data) SetTarget(provider string) {
 	// Proxied to match the transcriber above. The measurement behind that choice
 	// is a transcription one and does not carry over to synthesis, so this half
 	// is consistency with the examples rather than a measured win.
-	d.Speak = Binding{Provider: "slng", Model: "deepgram/aura:2", Voice: "aura-2-thalia-en"}
+	d.Speak = Binding{Provider: "slng", Model: "deepgram/aura:2", Voice: "aura-2-thalia-en", Params: SlngSpeechStarterParams}
+}
+
+// TwilioReasonStarter is the think binding a twilio package starts with for
+// one vendor, with the params that vendor's request was measured with. The
+// console loads it when the author switches the think provider, because the
+// other vendor's model and params would reach a request that cannot take them.
+// Google starts on the Gemini Developer API: vertexai and location are the
+// author's choice, and they need a Vertex key.
+func TwilioReasonStarter(vendor string) Binding {
+	switch vendor {
+	case "google", "gemini":
+		return Binding{Provider: vendor, Model: TwilioGeminiModel, Params: "thinking_config:\n  thinking_level: MINIMAL"}
+	case "slng":
+		// The default: the SLNG Context Router in front of the same OpenAI
+		// model, the binding a hosted twilio call was first made on. agent_id is
+		// filled from the package name when the files are written.
+		return Binding{
+			Provider: "slng", Model: TwilioReasonModel, Upstream: `{"provider":"openai"}`,
+			Params: "world_part: eu-west\nreasoning_effort: \"none\"\nparallel_tool_calls: false",
+		}
+	}
+	return Binding{Provider: "openai", Model: TwilioReasonModel, Params: "reasoning_effort: \"none\"\nparallel_tool_calls: false"}
 }
 
 // AgentNameFrom turns a folder name into a legal package name, or returns ""
@@ -587,7 +632,9 @@ func (d Data) withDefaults() Data {
 	if d.Channel == "" {
 		d.Channel = DefaultChannel
 	}
-	if d.Greeting == "" && !d.ModelGreeting {
+	// A caller who speaks first gets no greeting text: validation refuses text
+	// that nobody would say, so defaulting it wrote a package that failed.
+	if d.Greeting == "" && !d.ModelGreeting && d.SpeaksFirst != "user" {
 		d.Greeting = DefaultGreeting
 	}
 	if d.Instructions == "" {
@@ -628,6 +675,12 @@ func (d Data) withDefaults() Data {
 	if d.Connection == "" && d.UsesPhoneRoute() {
 		d.Connection = "phone"
 	}
+	// A router binding needs an agent_id. The starter one is the package's
+	// name with a version suffix, written once: after that the author owns it
+	// and bumps it after a prompt change they judge meaningful.
+	if d.Reason.Provider == "slng" && d.Reason.AgentID == "" {
+		d.Reason.AgentID = cmp.Or(d.AgentName, AgentNameFrom(d.Name), "agent") + "-v1"
+	}
 	return d
 }
 
@@ -654,8 +707,12 @@ func (d Data) ConnectionEnvironment() []ConnectionKey {
 		return nil
 	}
 	keys := make([]ConnectionKey, 0, len(required))
+	prefix := ""
+	if d.Target == string(targetcap.Twilio) {
+		prefix = "TWILIO_" // the names Twilio's own docs and SDKs use
+	}
 	for _, name := range required {
-		keys = append(keys, ConnectionKey{Key: name, Env: strings.ToUpper(name)})
+		keys = append(keys, ConnectionKey{Key: name, Env: prefix + strings.ToUpper(name)})
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i].Key < keys[j].Key })
 	return keys
@@ -928,6 +985,10 @@ func (d Data) DeclaredSecrets() []string {
 		if name != "" {
 			set[name] = true
 		}
+		// The router calls the upstream with the upstream's own credentials.
+		for _, name := range upstreamEnvs(binding.Upstream) {
+			set[name] = true
+		}
 	}
 	for _, tool := range d.Tools {
 		if tool.URLEnv != "" {
@@ -935,6 +996,13 @@ func (d Data) DeclaredSecrets() []string {
 		}
 		if tool.Auth != nil && tool.Auth.TokenEnv != "" {
 			set[tool.Auth.TokenEnv] = true
+		}
+	}
+	// The twilio app reads its connection's names, so a fresh package declares
+	// them rather than drawing the undeclared-secret warning on first compile.
+	if framework == targetcap.Twilio {
+		for _, key := range d.ConnectionEnvironment() {
+			set[key.Env] = true
 		}
 	}
 	if d.Tracing != nil {
@@ -947,6 +1015,28 @@ func (d Data) DeclaredSecrets() []string {
 		names = append(names, name)
 	}
 	slices.Sort(names)
+	return names
+}
+
+// upstreamEnvs names the credential variables a router binding's upstream is
+// called with, defaults included, from the router's own provider table.
+func upstreamEnvs(upstream string) []string {
+	var authored map[string]string
+	if upstream == "" || json.Unmarshal([]byte(upstream), &authored) != nil {
+		return nil
+	}
+	provider := authored["provider"]
+	delete(authored, "provider")
+	fields, ok := targetcap.SlngResolveUpstream(provider, authored)
+	if !ok {
+		return nil
+	}
+	var names []string
+	for _, field := range fields {
+		if field.Env {
+			names = append(names, field.Value)
+		}
+	}
 	return names
 }
 
@@ -1014,6 +1104,13 @@ func Write(dir string, d Data) ([]string, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scaffold: %w", err)
+	}
+	if source := statePy(d); source != nil {
+		path := filepath.Join(dir, spec.StateFile)
+		if err := os.WriteFile(path, source, 0o644); err != nil {
+			return nil, fmt.Errorf("scaffold state: %w", err)
+		}
+		created = append(created, path)
 	}
 	if len(d.Manifest) > 0 {
 		path := filepath.Join(dir, spec.ManifestFileName)

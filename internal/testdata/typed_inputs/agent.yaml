@@ -12,20 +12,6 @@ secrets:
   - DEEPGRAM_API_KEY
   - SLNG_API_KEY
 
-shapes:
-  - name: Thing
-    description: One thing the caller named.
-    fields:
-      - label: str
-      - name: count
-        type: int
-        description: How many of it.
-
-variables:
-  notes:
-    type: list[Thing]
-    description: What this call has recorded so far.
-
 agents:
   front:
     instructions: instructions.md
@@ -84,6 +70,8 @@ models:
       provider: slng
       model: "slng/deepgram/aura:2-en"
       voice: "aura-2-thalia-en"
+      params:
+        world_part: eu-north
   listen:
     transcriber:
       provider: deepgram

@@ -51,7 +51,7 @@ func routerFixture(t *testing.T) *ir.Agent {
 	billing := pkg.Agent.Agents["billing"]
 	billing.Think = "fast_reasoning"
 	pkg.Agent.Agents["billing"] = billing
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,12 +74,12 @@ func routerFixture(t *testing.T) *ir.Agent {
 	agent.Tasks["collect"] = ir.Task{
 		Instructions: "Ask for the caller's email and confirm the account for {{customer_id}}.",
 		Tools:        []string{"lookup_customer"},
-		Result:       map[string]ir.ResultField{"tier": {Type: ir.PrimitiveString}},
+		Result:       map[string]ir.ResultField{"tier": {Type: stringType()}},
 		Context:      ir.TaskContext{History: ir.HistoryFull},
 	}
 	agent.Tasks["confirm"] = ir.Task{
 		Instructions: "Read the booking back and ask the caller to confirm.",
-		Result:       map[string]ir.ResultField{"confirmed": {Type: ir.PrimitiveBoolean}},
+		Result:       map[string]ir.ResultField{"confirmed": {Type: boolType()}},
 		Context:      ir.TaskContext{History: ir.HistoryFull},
 	}
 	agent.TaskGroups["triage"] = ir.TaskGroup{
@@ -106,18 +106,11 @@ func emitAgentSource(t *testing.T, agent *ir.Agent, provider ir.Provider, module
 	if err != nil {
 		t.Fatalf("%s: generate: %v", provider, err)
 	}
-	var source string
 	var all strings.Builder
 	for _, file := range artifact.Files {
 		all.Write(file.Content)
-		if file.Path == module {
-			source = string(file.Content)
-		}
 	}
-	if source == "" {
-		t.Fatalf("%s: %s not emitted", provider, module)
-	}
-	return source, all.String()
+	return artifactFile(t, artifact, module), all.String()
 }
 
 func routerTargets() []struct {
@@ -128,8 +121,8 @@ func routerTargets() []struct {
 		provider ir.Provider
 		module   string
 	}{
-		{ir.ProviderPipecat, "bot.py"},
-		{ir.ProviderLiveKit, "agent.py"},
+		{ir.ProviderPipecat, agentSource},
+		{ir.ProviderLiveKit, agentSource},
 	}
 }
 
@@ -244,7 +237,7 @@ func TestSlngRouterScopesAgreeAcrossTargets(t *testing.T) {
 // its request, and this fixture uses full history so it emits none at all.
 func TestSlngRouterLiveKitPassesNoConstructorExtras(t *testing.T) {
 	agent := routerFixture(t)
-	source, _ := emitAgentSource(t, agent, ir.ProviderLiveKit, "agent.py")
+	source, _ := emitAgentSource(t, agent, ir.ProviderLiveKit, agentSource)
 	for _, banned := range []struct{ text, cost string }{
 		{"extra_headers={", "overwrites the per-request scope"},
 		{"extra_body={", "freezes the variable snapshot at the moment the call started"},
@@ -343,7 +336,9 @@ func TestSlngRouterSnapshotReadsLiveState(t *testing.T) {
 		want := "_slng_template_variables(session.userdata,"
 		frozen := "_slng_template_variables(slng_state,"
 		if tc.provider == ir.ProviderPipecat {
-			want = "_slng_template_variables(state,"
+			// The service holds the live state object it was given and reads it on
+			// every request, so the argument is `self._slng_state`, not a copy.
+			want = "_slng_template_variables(\n            self._slng_state, _SLNG_TEMPLATE_PATHS"
 			frozen = ""
 		}
 		if !strings.Contains(source, want) {
@@ -380,7 +375,7 @@ func TestSlngRouterSuppliesEveryNameAndTruncates(t *testing.T) {
 		// And the values come from the shared prompt lookup and truncation helper.
 		for _, want := range []string{
 			`values[name] = text`,
-			`text = _state_text(*_prompt_value(state, name,`,
+			`text = CallState.render(state, name,`,
 			`if len(text) > _SLNG_VARIABLE_LIMIT:`,
 			`text = text[:_SLNG_VARIABLE_LIMIT]`,
 		} {
@@ -409,7 +404,7 @@ func TestSlngRouterPipecatReadsTheVariablesPerRequest(t *testing.T) {
 	// which variable, only that a write is followed by a refresh, and one write
 	// proves nothing about counting.
 	collect := agent.Tasks["collect"]
-	collect.Result["alias"] = ir.ResultField{Type: ir.PrimitiveString}
+	collect.Result["alias"] = ir.ResultField{Type: stringType()}
 	agent.Tasks["collect"] = collect
 	assignedTask := agent.Tasks["collect"]
 	assignedTask.Assign = []ir.AssignTo{{Var: "customer_id", Field: "tier"}, {Var: "caller_alias", Field: "alias"}}
@@ -417,11 +412,11 @@ func TestSlngRouterPipecatReadsTheVariablesPerRequest(t *testing.T) {
 	agent.Controls["run_collect"] = &ir.Delegate{
 		Kind: ir.ControlDelegate, Task: "collect", When: "Collect the caller's account details.",
 	}
-	source, _ := emitAgentSource(t, agent, ir.ProviderPipecat, "bot.py")
+	source, _ := emitAgentSource(t, agent, ir.ProviderPipecat, agentSource)
 	for _, want := range []string{
 		`("customer_id", "tier", False)`,
 		`("caller_alias", "alias", False)`,
-		`_save_batch(state, pending, step=step)`,
+		`self.save_batch(pending, step=step)`,
 	} {
 		if !strings.Contains(source, want) {
 			t.Fatalf("the fixture does not exercise the shared state save %q", want)
@@ -434,7 +429,7 @@ func TestSlngRouterPipecatReadsTheVariablesPerRequest(t *testing.T) {
 	// every request, so there is nothing to count and nothing to forget: a write
 	// anywhere reaches the next request, including one made mid-turn, which is
 	// the gap the three frames left open.
-	if !strings.Contains(source, "def build_chat_completion_params(self, params_from_context) -> dict:") {
+	if !strings.Contains(source, "def build_chat_completion_params(self, params_from_context: Any) -> dict[str, Any]:") {
 		t.Errorf("pipecat emits no per-request parameter override, so a value written mid-turn is one turn late:\n%s",
 			source)
 	}
@@ -477,7 +472,7 @@ func TestSlngRouterSummarizerKeepsConstructionExtras(t *testing.T) {
 		task.Context = ir.TaskContext{History: ir.HistorySummary, Summarizer: "fast_reasoning"}
 		agent.Tasks[name] = task
 	}
-	source, _ := emitAgentSource(t, agent, ir.ProviderLiveKit, "agent.py")
+	source, _ := emitAgentSource(t, agent, ir.ProviderLiveKit, agentSource)
 	if !strings.Contains(source, ":summary") {
 		t.Fatalf("no summarizer scope in the emitted module, so this gate is watching nothing:\n%s", source)
 	}
@@ -503,7 +498,7 @@ func TestSlngRouterSummarizerKeepsConstructionExtras(t *testing.T) {
 // back on every way out, or the owner answers as a task that already ended.
 func TestSlngRouterPipecatRestoresTheOwnerScope(t *testing.T) {
 	agent := routerFixture(t)
-	source, _ := emitAgentSource(t, agent, ir.ProviderPipecat, "bot.py")
+	source, _ := emitAgentSource(t, agent, ir.ProviderPipecat, agentSource)
 	owner := `"X-Slng-Agent-Id": "` + routerAgentID + `:intake"`
 	// Entering the group's first step, then each step in turn, then back to the
 	// owner: four swaps at least, and the owner's own construction on top.
@@ -534,7 +529,7 @@ func TestSlngRouterPipecatRestoresTheOwnerScope(t *testing.T) {
 // picks (livekit-agents llm/fallback_adapter.py:152-192).
 func TestSlngRouterFallbackCannotSplitASiteScope(t *testing.T) {
 	agent := routerFixture(t)
-	source, _ := emitAgentSource(t, agent, ir.ProviderLiveKit, "agent.py")
+	source, _ := emitAgentSource(t, agent, ir.ProviderLiveKit, agentSource)
 	// Written, not merely mentioned. The provenance hook reads this header off the
 	// request it is describing, which is a read and cannot carry a scope of its
 	// own; counting every mention would fail on that and say nothing true.
@@ -600,7 +595,7 @@ func TestSlngRouterEmitsExactlyOneSessionID(t *testing.T) {
 		wantExprs, wantCreate := []string{"slng_session_id", "self._slng_session_id"}, "slng_session_id = str(uuid.uuid4())"
 		if tc.provider == ir.ProviderLiveKit {
 			wantExprs = []string{"session.userdata.slng_session_id"}
-			wantCreate = "Userdata(slng_session_id=str(uuid.uuid4()))"
+			wantCreate = "CallState(slng_session_id=str(uuid.uuid4()))"
 		}
 		for _, want := range wantExprs {
 			delete(found, want)
@@ -698,7 +693,7 @@ func routerFixtureWithUpstream(t *testing.T, upstream *spec.Upstream, secrets []
 	billing := pkg.Agent.Agents["billing"]
 	billing.Think = "fast_reasoning"
 	pkg.Agent.Agents["billing"] = billing
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -821,7 +816,7 @@ func TestSlngRouterEmitsNothingWithoutABinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -855,10 +850,16 @@ func TestSlngRouterUsesTheWorldPartsChatCompletionsEndpoint(t *testing.T) {
 		if !strings.Contains(source, `api_key=os.environ["SLNG_API_KEY"]`) {
 			t.Errorf("%s: the router key is not read from the environment", tc.provider)
 		}
-		for _, banned := range []string{"openai.responses", "inference.LLM", "world_part"} {
+		for _, banned := range []string{"openai.responses", "inference.LLM"} {
 			if strings.Contains(source, banned) {
 				t.Errorf("%s: emitted %q, which a router binding never takes", tc.provider, banned)
 			}
+		}
+		// pipecat-slng 0.6.0 speech calls take world_part, one each. Any more
+		// is the router binding leaking its world part as a kwarg.
+		speech := strings.Count(source, "SlngTTSService(") + strings.Count(source, "SlngSTTService(")
+		if got := strings.Count(source, "world_part"); got != speech {
+			t.Errorf("%s: emitted world_part %d times for %d SLNG speech calls; a router binding never takes it", tc.provider, got, speech)
 		}
 	}
 }
@@ -875,8 +876,8 @@ func TestSlngRouterGolden(t *testing.T) {
 		module   string
 		golden   string
 	}{
-		{ir.ProviderPipecat, "bot.py", "slng_pipecat.py"},
-		{ir.ProviderLiveKit, "agent.py", "slng_livekit.py"},
+		{ir.ProviderPipecat, agentSource, "slng_pipecat.txt"},
+		{ir.ProviderLiveKit, agentSource, "slng_livekit.txt"},
 	} {
 		source, _ := emitAgentSource(t, agent, tc.provider, tc.module)
 		path := filepath.Join("testdata", "golden", tc.golden)
@@ -1095,7 +1096,7 @@ func TestSlngRouterProvenanceAbsentWithoutARouterBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1116,13 +1117,13 @@ func TestSlngRouterProvenanceAbsentWithoutARouterBinding(t *testing.T) {
 // one connection pool per session.
 func TestSlngRouterLiveKitClosesTheClientItOwns(t *testing.T) {
 	agent := routerFixture(t)
-	source, _ := emitAgentSource(t, agent, ir.ProviderLiveKit, "agent.py")
+	source, _ := emitAgentSource(t, agent, ir.ProviderLiveKit, agentSource)
 	// Built once, in the entrypoint, and held on the call's own state object so a
 	// construction inside an agent method reaches the same one.
 	if got := strings.Count(source, "= _slng_router_client()"); got != 1 {
 		t.Errorf("the router client is built in %d places, want 1: a second one is a second connection pool with no owner", got)
 	}
-	if !strings.Contains(source, "client=slng_state.slng_client") {
+	if !strings.Contains(source, "client=slng_state._slng_client") {
 		t.Errorf("the session model is not given the client this call owns, so its response hook never runs:\n%s", source)
 	}
 	if !strings.Contains(source, "ctx.add_shutdown_callback") {
@@ -1144,11 +1145,11 @@ func TestSlngRouterSummarizerCarriesThePromptDirective(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, _ := emitAgentSource(t, agent, ir.ProviderLiveKit, "agent.py")
+	source, _ := emitAgentSource(t, agent, ir.ProviderLiveKit, agentSource)
 	summarize := strings.Index(source, "async def _summarize(")
 	if summarize < 0 {
 		t.Fatal("no _summarize helper emitted, so the fixture no longer summarizes")

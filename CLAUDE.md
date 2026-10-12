@@ -9,7 +9,7 @@ Unmute is written in Go, so you maintain **Go code**, but you also write some Py
 - Go 1.26 (pin in `go.mod`, and keep it on a Go line that still gets security patches, which is the newest two); `CGO_ENABLED=0` static binary; version stamped at link time, never hardcoded.
 - Direct deps — `cobra`, `goccy/go-yaml` (gives line/col on parse errors), `google/jsonschema-go` (**v0.x — pin the exact version, bump deliberately**), and the Charm TUI stack: `charmbracelet/bubbletea` + `bubbles` + `lipgloss` power the interactive console (custom MVU styled with Lip Gloss), while `charmbracelet/huh` v1.0.0 is scoped to the accessible/headless renderer only. **The interactive path imports no `huh`; Lip Gloss is expected there. All color lives in `internal/style` — no color literal anywhere else** (guarded by `internal/style/literal_test.go`, which walks every Go string literal in the tree). Everything else is stdlib. **No new dep for what a few lines of stdlib do — justify any addition in the PR.** No `viper` until a real global config file exists.
 - `golangci-lint` from day one (`.golangci.yml`).
-- Make targets: `build test smoke contracts lint fmt install`. `contracts` re-fetches the published SLNG conformance fixtures and fails on a digest mismatch: network, no accounts.
+- Make targets: `build test smoke contracts lint lint-emitted fmt install`. `lint-emitted` compiles every example and runs each generated project's own pinned ruff over it (needs uv, and ruff on PATH so compile formats). `contracts` re-fetches the published SLNG conformance fixtures and fails on a digest mismatch: network, no accounts.
 
 ## Command rules (cobra) — these are what make commands testable, not suggestions
 1. Build the tree with a `newRootCmd()` constructor; **no package-level `var rootCmd`** (fresh tree per call = flag isolation between tests).
@@ -36,19 +36,28 @@ difference the author can act on, and the table is allowed exactly one
 and not a place to park a note to self.
 
 ## IR
-Go structs are the schema source for their own surface: `internal/spec` derives the unresolved authoring schema, while `internal/ir` derives the resolved/debug schema. **Do not hand-author `.json` schema files.** Flow: `spec.Load` → `ir.Build` → `ir.Validate` → `generate.Generate`.
+Go structs are the schema source for their own surface: `internal/spec` derives the unresolved authoring schema, while `internal/ir` derives the resolved/debug schema. **Do not hand-author `.json` schema files.** Flow: `spec.Load` → `state.py` read through uv → `ir.Build` → `ir.Validate` → `generate.Generate`.
 
 ### Typed session state
-A variable's `type:` is a single-line Python type expression, and `shapes:` is
-a top-level **list** of named field groups it can refer to. A task's `assign:`
-derives its finish fields from the destination variables, so authors declare
-each type once. The grammar and error column live in
-`internal/spec/typeexpr.go`; the vocabulary and advice live in
-`internal/ir/shapes.go`. The shared emitted Python lives in
-`internal/generate/shapes.go` and is inserted into both code targets verbatim.
+A package's call state is a Pydantic model the author writes in
+`<package>/state.py`: `class State(BaseModel)`. `agent.yaml` keeps a
+`variables:` **list** holding only the values that need a `source:` or a
+`confirm:`. A task's `assign:` derives its finish fields from the destination
+fields, so authors declare each type once.
+
+Go never parses a type. `internal/stateschema` reads `state.py` by running uv
+with the pinned Pydantic in `internal/target/state.go` and parses the JSON
+Schema Pydantic writes for `State`, between `spec.Load` and `ir.Build`. Tests
+use the recorded fixtures under `internal/stateschema/testdata/recorded`, so
+`make test` needs no Python. Re-record them with
+`go test ./internal/stateschema -run TestRecord -update` (needs uv) after any
+edit to a `state.py`, then re-record the generate goldens. The emitted runtime
+is `internal/generate/call_state.go`: the author's `state.py` is copied as
+written, and a generated `call_state.py` adds `CallState(State)` and one
+`StepResult` model per step.
 
 No saved value enters a prompt automatically. A prompt grants access by naming
-`{{variable}}` or `{{variable.field}}`. Omitted task and handoff history means
+`{{state.x}}` or `{{state.x.y}}`. Omitted task and handoff history means
 spoken `messages`; `reset` receives no old conversation. Task return restores
 the owner's earlier context and adds only a completed or unserved status.
 
@@ -78,7 +87,7 @@ broken gate can be hundreds.
 - L4 smoke (`make smoke`, build tag `smoke`) proves emitted Python is valid — opt-in, needs Python, never in the default suite or PR gate.
 - **Test a change to an example with Coval (advisory).** After a change to an example's prompts, tools or flow, or to emitted behaviour an example uses, and once the text harness below passes, run `make sim TEST_SET=<id>`. Coval calls that example on both code targets, running on this laptop, and the command exits 1 on any failed row. Find the test set: `coval --format json agents list`, then the `test_set_ids` of the agents named `unmute-<example>-livekit` and `-pipecat`. No test set means the example is not covered. Say so; do not report it as passing. A row reading `answered NO` is an LLM judge, not a fact: read the call with `coval --format json simulations get <call id>` before you call it a regression, and compare against a run of `main` when in doubt, because one call cannot carry a claim. A call that did not finish, or where the agent never spoke, is always real; its `log:` line names the file to read. The manual guide and every failure seen so far are in [`utils/coval_sim/README.md`](utils/coval_sim/README.md). It never runs in CI, and each run costs Coval credits and provider usage, so run the one test set the change touches, not all of them.
 - Telephony is verified on a **deployed** agent, against a real carrier. There is no local phone loop, and no test level stands in for one: `unmute dev` is the browser loop and it stops where the phone leg starts.
-- Before asking for a live call, find the layer the defect lives in and reproduce it there. A provider defect is usually one HTTP request, so it needs no audio, no tunnel and no simulated caller: [`scripts/replay_router_scopes.py`](scripts/replay_router_scopes.py) is the worked example. A prompt or seam defect lives in the model's turns, and [`scripts/text_run_livekit.py`](scripts/text_run_livekit.py) drives the emitted LiveKit agent through a scripted text conversation with the real model and real local tools, no audio. [`scripts/text_run_pipecat.py`](scripts/text_run_pipecat.py) does the same for the emitted Pipecat bot, on a real WorkerRunner and FlowManager, and takes the same `--line` and `--from-number` flags.
+- Before asking for a live call, find the layer the defect lives in and reproduce it there. A provider defect is usually one HTTP request, so it needs no audio, no tunnel and no simulated caller: [`scripts/replay_router_scopes.py`](scripts/replay_router_scopes.py) is the worked example. A prompt or seam defect lives in the model's turns, and [`scripts/text_run_livekit.py`](scripts/text_run_livekit.py) drives the emitted LiveKit agent through a scripted text conversation with the real model and real local tools, no audio. [`scripts/text_run_pipecat.py`](scripts/text_run_pipecat.py) does the same for the emitted Pipecat bot, on a real WorkerRunner and FlowManager, and takes the same `--line` and `--from-number` flags. [`scripts/text_run_twilio.py`](scripts/text_run_twilio.py) drives a compiled twilio target's `app.py` as a signed fake ConversationRelay client: `--fake` runs the offline protocol cases, `--real` the real model.
 - After somebody runs `unmute dev` and talks to the agent, read the call back yourself with [`scripts/read_langfuse_trace.py`](scripts/read_langfuse_trace.py): transcript, tool calls and per-span latency, newest trace by default. Needs the package on `tracing.provider: langfuse`, which `examples/salon-concierge` is. Never describe a call from what you were told about it when the spans are one command away. A call is one trace and one session, with a `turn` span per exchange inside it. Add `--check-v4` after any change to tracing: it fails the run when the call splits into several traces, when its root carries no conversation, when a turn recorded the caller and not the reply, when a turn sits in the trace but outside its root, or when an observation is missing the session ID or trace name, none of which is visible in the Langfuse UI.
 
 ## Commits and pull requests (advisory)

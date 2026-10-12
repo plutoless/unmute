@@ -69,21 +69,21 @@ func neededHint(name string, variable ir.Variable, suppliers map[string]string) 
 }
 
 // injectExpr renders one inject value as a Python expression. A value that is
-// exactly one token reads the state attribute directly, so an integer variable
-// stays an integer in the JSON body; a mixed string renders through the helper;
-// a non-string value is forwarded as a literal (V14).
-func injectExpr(value any, stateExpr string) string {
+// exactly one token reads the state directly, so an integer variable stays an
+// integer in the JSON body; a mixed string renders through the helper; a
+// non-string value is forwarded as a literal (V14).
+//
+// A structured value or any part of one leaves through state.plain, the one
+// way a value becomes JSON data: a request body cannot carry a Pydantic model.
+// A plain value reads its attribute, exactly as before.
+func injectExpr(value any, stateExpr string, variables map[string]ir.Variable) string {
 	text, ok := value.(string)
 	if !ok {
 		return pyLiteral(value)
 	}
 	if name := ir.TemplateVar(text); name != "" {
-		if ir.PathRoot(name) != name {
-			// One part of a declared value, emitted as a flat name. Through the
-			// lookup rather than an attribute read, and [1] because the lookup
-			// also returns the root's name, which a request body has no use for.
-			// The part keeps its own type, so an integer field stays an integer.
-			return "_state_lookup(" + stateExpr + ", " + pyQuote(name) + ")[1]"
+		if ir.PathRoot(name) != name || variables[name].Structured() {
+			return stateExpr + ".plain(" + pyQuote(name) + ")"
 		}
 		return stateExpr + "." + name
 	}
@@ -104,7 +104,7 @@ func loweredInject(tool ir.Tool, variables map[string]ir.Variable, suppliers map
 	slices.Sort(keys)
 	values := make([]injectedValue, 0, len(keys))
 	for _, key := range keys {
-		values = append(values, injectedValue{Key: key, Expr: injectExpr(tool.Inject[key], stateExpr)})
+		values = append(values, injectedValue{Key: key, Expr: injectExpr(tool.Inject[key], stateExpr, variables)})
 	}
 	return values, neededVars(tool, variables, suppliers)
 }

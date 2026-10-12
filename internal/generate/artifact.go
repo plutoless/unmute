@@ -35,11 +35,18 @@ type Artifact struct {
 	// anything, and the emitted runbook prints the same value, so the two cannot
 	// disagree about what a package needs.
 	Requires Requirements
+	// ArtifactID is the twilio driver's build identity, the value its app.py
+	// serves on /healthz and its compile report records. Empty for every other
+	// target.
+	ArtifactID string
 }
 
 type File struct {
 	Path    string
 	Content []byte
+	// Verbatim is the author's own code, copied as written: the write path
+	// formats it no more than it would edit it.
+	Verbatim bool
 }
 
 type GenerateReport struct {
@@ -101,6 +108,17 @@ func Generate(agent *ir.Agent, resolved ir.Target, caps target.Table) (Artifact,
 		artifact.Notes.Notes = append(artifact.Notes.Notes, emitted.Notes.Notes...)
 		artifact.Notes.Notes = append(artifact.Notes.Notes, knowledgeNotes(agent)...)
 		artifact.Notes.Warnings = append(artifact.Notes.Warnings, emitted.Notes.Warnings...)
+		return withManifestReport(artifact, agent)
+	case ir.ProviderTwilio:
+		emitted, err := GenerateTwilio(agent, resolved, report.ForwardedBindings, report.Sizing)
+		if err != nil {
+			return Artifact{}, fmt.Errorf("generate %s twilio: %w", resolved.Name, err)
+		}
+		artifact.Files, err = withTelephonyReport(emitted.Files, artifact.Telephony)
+		if err != nil {
+			return Artifact{}, fmt.Errorf("generate %s twilio: %w", resolved.Name, err)
+		}
+		artifact.ArtifactID = emitted.ArtifactID
 		return withManifestReport(artifact, agent)
 	case ir.ProviderSlng:
 		// No withTelephonyReport: unmute writes slng no carrier state, so there is
@@ -179,7 +197,7 @@ func targetDiagnostics(report ir.ValidateReport) string {
 
 func artifactKind(provider ir.Provider) ArtifactKind {
 	switch provider {
-	case ir.ProviderLiveKit, ir.ProviderPipecat, ir.ProviderAgora:
+	case ir.ProviderLiveKit, ir.ProviderPipecat, ir.ProviderTwilio, ir.ProviderAgora:
 		return CodeTarget
 	case ir.ProviderSlng:
 		return BodyTarget
@@ -198,35 +216,30 @@ func artifactKind(provider ir.Provider) ArtifactKind {
 // drivers emit the same expression, so there is one of it.
 func envRef(name string) string { return "os.environ[" + pyQuote(name) + "]" }
 
-// primitiveTypes is the one place a schema primitive is named. Three different
-// outputs are needed from it — the JSON Schema name, the Python annotation, and
-// the runtime isinstance check — so the table carries three columns and the
-// accessors below stay separate. Merging the outputs themselves would be wrong;
+// primitiveTypes is the one place a schema primitive is named. Two different
+// outputs are needed from it — the JSON Schema name and the Python annotation —
+// so the table carries two columns and the accessors below stay separate. Merging the outputs themselves would be wrong;
 // what was wrong was writing the key set out five times.
 var primitiveTypes = map[ir.PrimitiveType]struct {
-	json  string
-	py    string
-	check string
+	json string
+	py   string
 }{
-	ir.PrimitiveBoolean: {"boolean", "bool", "isinstance(value, bool)"},
-	ir.PrimitiveInteger: {"integer", "int", "isinstance(value, int) and not isinstance(value, bool)"},
-	ir.PrimitiveNumber:  {"number", "float", "isinstance(value, (int, float)) and not isinstance(value, bool)"},
-	ir.PrimitiveString:  {"string", "str", "isinstance(value, str)"},
+	ir.PrimitiveBoolean: {"boolean", "bool"},
+	ir.PrimitiveInteger: {"integer", "int"},
+	ir.PrimitiveNumber:  {"number", "float"},
+	ir.PrimitiveString:  {"string", "str"},
 }
 
 // primitiveString is the fallback row: anything unrecognised is a string, which
 // is what all five original switches did in their default arm.
 var primitiveString = primitiveTypes[ir.PrimitiveString]
 
-func primitiveRow(t ir.PrimitiveType) struct{ json, py, check string } {
+func primitiveRow(t ir.PrimitiveType) struct{ json, py string } {
 	if row, ok := primitiveTypes[t]; ok {
 		return row
 	}
 	return primitiveString
 }
-
-// jsonType is a primitive's JSON Schema name.
-func jsonType(t ir.PrimitiveType) string { return primitiveRow(t).json }
 
 // pyType is a primitive's Python annotation.
 func pyType(t ir.PrimitiveType) string { return primitiveRow(t).py }
@@ -242,5 +255,8 @@ func pyTypeForJSON(name string) string {
 	return primitiveString.py
 }
 
-// livekitTypeCheck is a primitive's runtime isinstance expression.
-func livekitTypeCheck(t ir.PrimitiveType) string { return primitiveRow(t).check }
+// authoredType is a variable's type the way state.py's schema names it:
+// `CustomerRecord | None`, or `str` for a plain value.
+func authoredType(variable ir.Variable) string {
+	return variable.Schema.String()
+}

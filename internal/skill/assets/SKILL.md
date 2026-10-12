@@ -7,7 +7,7 @@ metadata:
 
 # Build voice agents with Unmute
 
-Unmute compiles one declarative package into native LiveKit Agents or Pipecat projects. Author the package; do not hand-write framework Python or edit generated `build/` files.
+Unmute compiles declarative packages for LiveKit, Pipecat, SLNG, Twilio and Agora, within each target's supported surface. Author the package; do not hand-write framework Python or edit generated `build/` files.
 
 ## Start with one reference
 
@@ -27,7 +27,7 @@ Open the first matching reference; load another only when needed.
 | `references/latency.md` | the brief is make it faster, it feels slow, or optimize the agent |
 | `references/telephony.md` | answering or placing a phone call |
 | `references/transfers.md` | sending a phone caller to a person |
-| `references/deploy.md` | hosting a compiled livekit or pipecat project; an slng push is the `unmute-deploy` skill |
+| `references/deploy.md` | hosting a compiled livekit or pipecat project; an slng push is the `unmute-deploy` skill; a twilio app is "The twilio target" in `references/package.md` |
 | `references/examples.md` | starting from the closest working package |
 
 ## Choose the structure before files
@@ -42,10 +42,10 @@ Choose the smallest native shape and tell the user what you chose.
 **Every agent-level list attaches something already declared, except `tasks:`, written where it runs.** Five kinds: `tools:`, `tasks:` and `task_groups:` come back, `handoffs:` and `escalations:` do not. No `kind:` field, and all five share one namespace. `references/orchestration.md` has the table.
 **Define each tool once.** Its contract lives in `tools/<name>.yaml`; `tools:` lists hold names only.
 
-**Task `assign:` and tool `output:` are different contracts.** Task finish fields come from destination variables; do not repeat their types.
+**Task `assign:` and tool `output:` are different contracts.** Task finish fields come from destination fields on `State` in `state.py`; do not repeat their types.
 **A step that ends on a tool result should say so.** `finish:` names the tools that end it and what a successful result looks like, so it saves and moves on with no model request in between. `skip_when_confirmed:` skips a group step whose confirmation holds; `opening: listen` speaks one fixed question and waits. Code targets only; `references/orchestration.md` has the rules.
 
-Omitted task and handoff history means `messages`: spoken turns without tool records. With `reset`, name each needed saved value in the receiver's prompt as `{{variable}}`.
+Omitted task and handoff history means `messages`: spoken turns without tool records. With `reset`, name each needed saved value in the receiver's prompt as `{{state.variable}}`.
 
 Use block-style YAML sequences in assistant-authored packages. Do not use anchors or aliases.
 
@@ -73,7 +73,7 @@ For every change:
 1. Write the package.
 2. Run `unmute validate`; read the exact error and fix the package, not the refusal.
 3. Run `unmute compile` when validation is clean.
-4. Run `unmute dev` and talk to the agent.
+4. Run `unmute dev` for LiveKit or Pipecat and talk to the agent; use the target runbook for other providers.
 5. For a slng target only, the `unmute-deploy` skill pushes it: a push replaces the live agent rather than merging with it.
 
 Repeat validation until clean. If commands cannot run, give the exact package
@@ -81,7 +81,7 @@ path and commands and ask for their output. If audio cannot be heard, run the
 other checks and say that the agent still needs a listening test. Never claim a
 package works because files were written.
 
-For `provider: agora`, read [references/agora.md](references/agora.md).
+For `provider: agora`, read [references/agora.md](references/agora.md); copy its example instead of `unmute init`.
 ## Hard rules
 
 - The CLI wins when a reference and validation disagree.

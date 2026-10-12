@@ -47,7 +47,7 @@ the SLNG dashboard instead if you prefer. A name is {{.NameShape}}.
 `{{"{{$NAME}}"}}` tokens. Nothing declares them in the package: SLNG holds the
 value. SLNG substitutes one into an MCP server URL and nowhere else, so a token
 in a prompt or a greeting is refused rather than listed here; a value your
-prompt varies per call is a package variable written `{{"{{name}}"}}`.
+prompt varies per call is a field on `State` in `state.py`, written `{{"{{state.name}}"}}`.
 
 | Vault name | Needed because |
 |---|---|
@@ -83,11 +83,10 @@ One SLNG key serves every SLNG role, so this is the same key a generated livekit
 or pipecat project reads at run time. `{{.CredentialEnv}}` is the name the push
 tool itself reads, and either works.
 
-The organisation the push resolved is printed on every run. That matters because
-an exported key and a stored profile can belong to **different** organisations,
-and nothing else on screen would tell you which one you just wrote to.
+The key decides the organisation. An exported key wins over a stored profile,
+and the `credential from` line names the key a deploy used.
 
-Deployment requires a compatible `voiceai`; this flow was verified with 0.1.18.
+Deployment requires `voiceai` 0.1.22 or later.
 Use `--dry-run` to preview checked versions and attachment changes without
 changing SLNG. Future session inputs remain runtime checks. The result is saved
 in `deploy-report.json` beside these files.
@@ -149,11 +148,17 @@ same shape.
 The push step resolves those names against your organisation's tools and mints
 the attachment ids. It creates none of them: every name here is a tool your
 organisation already holds. Nothing here is yours to edit by hand.
-
+{{if .HasTasks}}
+A task names its tools the same way, by the name the tool's reference carries,
+and SLNG wants the attachment id there too. The push writes the id it chose
+into every task. A `voiceai` that does not rewrite task tools sends the names
+as they are, and SLNG refuses the agent.
+{{end}}
 **A curated capability is no exception.** A builtin such as `end_call` needs
 nothing *created*, and its `tool_id` still has to be filled in, which the push
-does. A setting the package pinned with `inject:` rides the attachment as
-`config_overrides`, so it is this agent's and does not change the shared tool.
+does. A setting the package pinned with `inject:`, and the `announce:` on
+`end_call`, which is its goodbye, ride the attachment as `config_overrides`, so
+they are this agent's and do not change the shared tool.
 {{if .Builtins}}
 This package's curated references: {{range $i, $name := .Builtins}}{{if $i}}, {{end}}`{{$name}}`{{end}}.
 {{end}}
@@ -161,8 +166,9 @@ This package's curated references: {{range $i, $name := .Builtins}}{{if $i}}, {{
 **This target creates no tool.** Every tool the body names is one your
 organisation already holds, referenced by name, and the deploy resolves each
 name to its identifier and its latest published version. A name your
-organisation does not have is a refusal, not something the push makes for you: a
-new tool starts in the SLNG dashboard.
+organisation does not have is a refusal, not something the push makes for you. A
+new code tool starts from a Python file with `voiceai tool create`, and a new
+request tool in the SLNG dashboard.
 
 These are the hosted names; deployment selects and checks their published versions:
 
@@ -226,8 +232,8 @@ For your own LiveKit client, use the agent id step 2 printed and the same accoun
 export {{.CredentialEnv}}="${{.RouterKeyEnv}}"
 ```
 
-Supply a request body with `--file`. Write a `session.json`, filling in any
-required session arguments:
+The command below takes every default, and needs `voiceai` 0.1.22 or later. To
+set session arguments, write a `session.json` and add `--file session.json`:
 
 ```json
 {"arguments": {}, "participant_name": "you"}
@@ -237,16 +243,24 @@ required session arguments:
 takes strings only, at most 32 of them.
 {{if .VariableNames}}
 This agent declares: {{range $i, $name := .VariableNames}}{{if $i}}, {{end}}`{{$name}}`{{end}}.
-A declared default can fill an omitted value. Supply any value a required
+A default in `state.py` can fill an omitted value. Supply any value a required
 tool binding uses when it has no default; otherwise session creation is refused.
 Inbound phone calls supply no session arguments. Every required injected input
 needs a valid default before SLNG can attach an inbound trunk.
 {{end}}{{if .MemoryVariables}}
 This agent records during the call: {{range $i, $name := .MemoryVariables}}{{if $i}}, {{end}}`{{$name}}`{{end}}.
+{{if .HasTasks -}}
+No session argument supplies these. A task saves the values its `assign:`
+names when it finishes, the model records any other one with SLNG's own
+`set_runtime_variables` tool, and the call record returns them under
+`memory_variables`, so you can read what was captured without reading the
+transcript.
+{{- else -}}
 No session argument supplies these. The model fills each one with SLNG's own
 `set_runtime_variables` tool once the caller has given and confirmed the value,
 and the call record returns them under `memory_variables`, so you can read what
 was captured without reading the transcript.
+{{- end}}
 {{end}}
 ```bash
 {{.WebSessionCommand}}

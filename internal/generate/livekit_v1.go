@@ -284,19 +284,11 @@ type livekitTelephony struct {
 	HasWarm       bool
 	Greeting      *livekitGreeting
 	SystemSources []livekitSystemSource
-	CallStart     []livekitCallStart
 }
 
 type livekitSystemSource struct {
 	Variable string
 	Source   string
-}
-
-type livekitCallStart struct {
-	Name      string
-	Type      string
-	TypeCheck string
-	Required  bool
 }
 
 // livekitDelegate lowers a delegate control. A single task awaits its
@@ -365,22 +357,19 @@ type livekitAssign struct {
 // livekitVar is one typed shared-state field on the generated Userdata
 // dataclass (SCHEMA 4.4; LiveKit session userdata).
 type livekitVar struct {
-	// Anno is the whole annotation, including nullability, because a declared
-	// list is not nullable: it starts empty so an append never has to create it.
-	Anno        string
 	Name        string
 	PyType      string
-	Default     string // Python literal; "None" when the spec declares none
 	Description string
 }
 
 // livekitCallStartVar is one dispatched input variable, hydrated from the job
 // metadata or the dev UNMUTE_CALL_START payload before the greeting.
 type livekitCallStartVar struct {
-	Name      string
-	Type      string
-	TypeCheck string
-	Required  bool
+	Name string
+	// Type is the authored type, `CustomerRecord` rather than `string`, because
+	// the runbook lists it and the dispatched value is checked against it.
+	Type     string
+	Required bool
 }
 
 type livekitStep struct {
@@ -538,11 +527,6 @@ type livekitArg struct {
 	Anno     string   // rendered Python annotation (PyType, Literal[...], or Annotated[...])
 }
 
-type livekitPrompt struct {
-	Const string
-	Body  string
-}
-
 // livekitDeploy is one row of the README's deploy commands: one per declared
 // region, or a single region-less row when the package declares none.
 type livekitDeploy struct {
@@ -554,6 +538,8 @@ type livekitDeploy struct {
 }
 
 type livekitData struct {
+	// StateSource is the author's state.py, copied into the project as written.
+	StateSource string
 	// Project is the package's own name, and it labels the generated project:
 	// the pyproject name, the logger, the trace name, the README title, the
 	// Twilio friendly names. It used to be the target instance name, which made
@@ -614,7 +600,7 @@ type livekitData struct {
 	LocalTools      []livekitLocalTool    // copied handler files (tools/<name>.py)
 	MCPServers      []livekitMCPServer    // unique mounted sources, used by the shared constructor + startup preflight
 	Pins            map[string]string     // plugin pins (C6): raise dep floors
-	Prompts         []livekitPrompt
+	Prompts         []pyPrompt
 	EntryPromptExpr string   // templated entry prompt rendered from session.userdata after outbound SIP hydration
 	PluginModules   []string // merged `from livekit.plugins import ...` names
 	// Slng is the SLNG Context Router's module-level helpers. Empty on a package
@@ -654,9 +640,6 @@ type livekitData struct {
 	TypingImports      string     // `from typing import ...` names (Annotated/Literal), "" if none (V2)
 	NeedsField         bool       // any tool arg carries a description (V2)
 	PydanticImports    string     // the whole `from pydantic import ...` line, "" if none
-	// NeedsDataclassField is `field` beside `dataclass`, wanted only by a
-	// declared list, which starts empty through a default_factory.
-	NeedsDataclassField bool
 	// TypedState is the declared-shape block, rendered once in shapes.go for
 	// both targets, or nil for a package that declares nothing structured. That
 	// nil is what makes such a package byte-identical (FR-015).
@@ -803,12 +786,12 @@ var livekitEmittedFields = map[targetcap.Field]bool{
 	targetcap.FieldVoicemail:             true, // AMD machine-vm branches (N6)
 	targetcap.FieldTracingLangfuse:       true,
 	targetcap.FieldTracingCoval:          true, // tracing.py exports to Coval off the SIP simulation ID
+	targetcap.FieldTracingLogfire:        true,
 	targetcap.FieldDeploymentMultiRegion: true, // one README deploy row per declared region, own config file
 	targetcap.FieldToolInject:            true, // hidden request values merged from userdata
 	targetcap.FieldWebhookPath:           true, // rendered, URL-encoded path on the base URL
 	targetcap.FieldTemplates:             true, // update_instructions/_render at session start
 	targetcap.FieldTypedState:            true, // a generated Pydantic class per shape, validated at each finish
-	targetcap.FieldShapedText:            true, // str plus an AfterValidator, never a schema keyword
 
 }
 
@@ -912,13 +895,38 @@ func livekitDeploys(regions []string) []livekitDeploy {
 	return deploys
 }
 
+// livekitModules are the agent's own Python modules, each rendered from its
+// template and given its imports by linkPython. A module whose template renders
+// nothing past its docstring is not emitted. agent.py keeps the server and its
+// rtc_session: that is what `start agent.py` looks for, and what the Coval
+// harness reads the agent name from.
+var livekitModules = []struct{ tmpl, path string }{
+	{"settings.py", "settings.py"},
+	{"prompts.py", "prompts/__init__.py"},
+	{"utils_google.py", "utils/google.py"},
+	{"utils_auth.py", "utils/auth.py"},
+	{"utils_context.py", "utils/context.py"},
+	{"utils_mcp.py", "utils/mcp.py"},
+	{"call_state.py", "call_state.py"},
+	{"session.py", "session.py"},
+	{"utils_telephony.py", "utils/telephony.py"},
+	{"utils_router.py", "utils/router.py"},
+	{"agents.py", "agents.py"},
+	{"call.py", "call.py"},
+	{"agent.py", "agent.py"},
+}
+
 func renderLiveKitFiles(data livekitData) ([]File, error) {
+	files, err := renderPythonModules(livekitV1Templates, "templates/livekit_v1/", livekitFuncs(), data, livekitModules)
+	if err != nil {
+		return nil, fmt.Errorf("livekit modules: %w", err)
+	}
+	files = append(append(files, utilsPackage), writePromptFiles(data.Prompts)...)
 	outputs := []struct{ tmpl, path string }{
-		{"agent.py", "agent.py"},
 		// Always emitted, inert unless the dev loop sets devmetrics.Env. Emitting
 		// it only for `dev` would make build/<target>/ depend on which command
 		// last ran, so the dev loop would stop testing the file that ships.
-		{"dev_metrics.py", "dev_metrics.py"},
+		{"dev_metrics.py", "utils/dev_metrics.py"},
 		{"pyproject.toml", "pyproject.toml"},
 		{"README.md", "README.md"},
 		{"env.example", ".env.example"},
@@ -930,7 +938,7 @@ func renderLiveKitFiles(data livekitData) ([]File, error) {
 		// first deploy and unmute compile preserves it from then on.
 	}
 	if data.Tracing {
-		outputs = append(outputs, struct{ tmpl, path string }{tracingTemplate(data.TracingProvider), "tracing.py"})
+		outputs = append(outputs, struct{ tmpl, path string }{tracingTemplate(data.TracingProvider), "utils/tracing.py"})
 	}
 	// Only when the package declares a knowledge base: the module imports
 	// llama-index, which is only in .Deps for the same reason.
@@ -944,7 +952,6 @@ func renderLiveKitFiles(data livekitData) ([]File, error) {
 			outputs = append(outputs, struct{ tmpl, path string }{"telephony_bridge.py", "telephony_bridge.py"})
 		}
 	}
-	var files []File
 	for _, o := range outputs {
 		content, err := renderLiveKitV1(o.tmpl, data)
 		if err != nil {
@@ -969,8 +976,19 @@ func renderLiveKitFiles(data livekitData) ([]File, error) {
 		if err != nil {
 			return nil, err
 		}
-		files = append(files, File{Path: "knowledge.py", Content: content})
+		files = append(files, File{Path: "utils/knowledge.py", Content: content})
 	}
+	// The telemetry module is the shared one too, for the same reason.
+	telemetry, err := telemetryFile(telemetryData{
+		Project:   data.Project,
+		Provider:  data.TracingProvider,
+		Target:    "livekit",
+		AgentName: data.EntryAgent + "-" + data.AgentName,
+	})
+	if err != nil {
+		return nil, err
+	}
+	files = append(files, telemetry...)
 	// Both clouds build from this directory, and LiveKit caps the uploaded
 	// context at 1 GB, so local run leftovers are excluded too.
 	files = append(files, File{Path: ".dockerignore", Content: []byte(".env\n.env.*\n.venv/\n__pycache__/\n")})
@@ -981,6 +999,10 @@ func renderLiveKitFiles(data livekitData) ([]File, error) {
 		for _, lt := range data.LocalTools {
 			files = append(files, File{Path: "tools/" + lt.Name + ".py", Content: []byte(lt.Source)})
 		}
+	}
+	// The author's state.py, copied as written: call_state.py subclasses it.
+	if data.StateSource != "" {
+		files = append(files, File{Path: "state.py", Content: []byte(data.StateSource), Verbatim: true})
 	}
 	return files, nil
 }
@@ -1065,20 +1087,7 @@ func renderLiveKitV1(name string, data livekitData) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("livekit template %s: %w", name, err)
 	}
-	tmpl, err := template.New(name).Funcs(template.FuncMap{
-		"pyq":          pyQuote,
-		"resultAccess": resultAccess,
-		"join":         strings.Join,
-		"localRunEnv":  func() string { return LocalRunEnv },
-
-		"triple":     pyTriple,
-		"mcpTimeout": func() int { return mcpTimeoutSeconds },
-		// SLNG's contract for a hosted code tool, named once in Go so the
-		// template cannot drift from what internal/generate/hosted_tool.go says
-		// the platform guarantees.
-		"hostedEntry": func() string { return hostedEntryPoint },
-		"hostedInput": func() string { return hostedInputModel },
-	}).Parse(string(raw))
+	tmpl, err := template.New(name).Funcs(livekitFuncs()).Parse(string(raw))
 	if err != nil {
 		return nil, fmt.Errorf("livekit template %s: %w", name, err)
 	}
@@ -1086,7 +1095,39 @@ func renderLiveKitV1(name string, data livekitData) ([]byte, error) {
 	if err := tmpl.Execute(&buf, data); err != nil {
 		return nil, fmt.Errorf("livekit template %s: %w", name, err)
 	}
+	if strings.HasSuffix(name, ".py") {
+		return wrapLongImports(buf.Bytes()), nil
+	}
 	return buf.Bytes(), nil
+}
+
+// CallStartNames is the Python tuple of variables a dispatch may fill.
+func (d livekitData) CallStartNames() string {
+	names := make([]string, len(d.CallStartVars))
+	for i, v := range d.CallStartVars {
+		names[i] = v.Name
+	}
+	return "(" + pyTuple(names) + ")"
+}
+
+// livekitFuncs are the functions every LiveKit template can call.
+func livekitFuncs() template.FuncMap {
+	return template.FuncMap{
+		"pyq":          pyQuote,
+		"resultAccess": resultAccess,
+		"join":         strings.Join,
+		"checkers":     pythonCheckers,
+		"localRunEnv":  func() string { return LocalRunEnv },
+
+		"triple":     pyTriple,
+		"doc":        pyDoc,
+		"mcpTimeout": func() int { return mcpTimeoutSeconds },
+		// SLNG's contract for a hosted code tool, named once in Go so the
+		// template cannot drift from what internal/generate/hosted_tool.go says
+		// the platform guarantees.
+		"hostedEntry": func() string { return hostedEntryPoint },
+		"hostedInput": func() string { return hostedInputModel },
+	}
 }
 
 // pyTriple renders a Go string as a Python triple-quoted string literal, safe
@@ -1154,4 +1195,60 @@ func livekitReport(agent *ir.Agent, data livekitData, files []File, bindings []i
 		return nil, err
 	}
 	return append(out, '\n'), nil
+}
+
+// pyDoc renders a tool description as the docstring the framework reads it
+// from, at the indent of the body it opens, and marks the docstring rules the
+// text would trip. The words are the model's tool description, so they cannot
+// be reshaped to satisfy a linter (a summary line, a blank second line, a full
+// stop). The layout can: every continuation line is indented to the body and a
+// multi-line docstring closes on its own line, which is what ruff format would
+// write anyway, and Python strips that indent (inspect.cleandoc) before the
+// framework reads it, so the model sees the same text either way. A noqa is
+// added only for a rule the text really breaks, because an unused one is
+// itself a finding.
+func pyDoc(indent int, s string) string {
+	body := strings.TrimSpace(s)
+	if body == "" {
+		return pyTriple(s)
+	}
+	lines := strings.Split(body, "\n")
+	var codes []string
+	if len(lines) > 1 && strings.TrimSpace(lines[1]) != "" {
+		codes = append(codes, "D205")
+	}
+	first := strings.TrimSpace(lines[0])
+	if !strings.ContainsAny(first[len(first)-1:], ".?!") {
+		codes = append(codes, "D415")
+	}
+	if first[0] >= 'a' && first[0] <= 'z' {
+		codes = append(codes, "D403")
+	}
+	if strings.Contains(s, `\`) {
+		codes = append(codes, "D301")
+	}
+	doc := pyTriple(indentDocLines(lines, strings.Repeat(" ", indent)))
+	if len(codes) == 0 {
+		return doc
+	}
+	slices.Sort(codes)
+	return doc + "  # noqa: " + strings.Join(codes, ", ")
+}
+
+// indentDocLines joins a docstring's lines with every continuation line at
+// pad, blank lines left empty, and a closing line of its own when there is
+// more than one line.
+func indentDocLines(lines []string, pad string) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(lines[0]))
+	for _, line := range lines[1:] {
+		b.WriteString("\n")
+		if line = strings.TrimRight(line, " \t\r"); strings.TrimSpace(line) != "" {
+			b.WriteString(pad + line)
+		}
+	}
+	if len(lines) > 1 {
+		b.WriteString("\n" + pad)
+	}
+	return b.String()
 }

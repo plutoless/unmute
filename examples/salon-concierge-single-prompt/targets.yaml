@@ -17,3 +17,8 @@ targets:
     connection: twilio_voice
     deployment_region: eu-central
     warm_instances: 1
+    models:
+      detector:
+        provider: local
+        model: silero
+        endpointing_delay: 200ms

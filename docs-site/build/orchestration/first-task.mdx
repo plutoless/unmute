@@ -13,12 +13,12 @@ the agent looks it up and says when the parcel is due. It is small on purpose.
 The shape is what matters, and you will swap the parcel for your own thing.
 
 <Note>
-  **Tasks need a code target: Pipecat or LiveKit.** The package `unmute init`
-  writes targets LiveKit, so you are ready.
+  **Tasks run on LiveKit, Pipecat and SLNG.** The package `unmute init`
+  writes targets LiveKit, so you are ready. SLNG takes most task features;
+  [the SLNG page](/targets/slng#tasks-and-task-groups) lists them.
 
-  SLNG compiles one agent with one prompt, so it refuses a task today and tells
-  you to fold the step into the agent's instructions instead. Tasks on SLNG are
-  coming.
+  Twilio compiles one agent with one prompt and refuses tasks. Fold the step
+  into the agent's instructions or use another target.
 </Note>
 
 ## What a task is
@@ -168,22 +168,28 @@ stop anywhere and come back.
 
   <Step title="Say what you want to keep">
     A task can save what it learns. You say what that is by declaring a
-    variable, once, with a type. Add this block to `agent.yaml`, anywhere at
-    the top level:
+    field, once, with a type. Write a `State` class in a new `state.py` next to
+    `agent.yaml`:
 
-    ```yaml agent.yaml
-    variables:
-      tracking_number:
-        type: str
-        description: The tracking number of the parcel we found for this caller.
-      delivery_date:
-        type: Date
-        description: The day that parcel is due, written year-month-day.
+    ```python state.py
+    from datetime import date
+
+    from pydantic import BaseModel, Field
+
+
+    class State(BaseModel):
+        tracking_number: str = Field(
+            "", description="The tracking number of the parcel we found for this caller."
+        )
+        delivery_date: date | None = Field(
+            None, description="The day that parcel is due, written year-month-day."
+        )
     ```
 
-    `Date` is a built-in type. A value that is not a date in that form is
+    `date` is a Pydantic type. A value that is not a date in that form is
     refused where it enters, and the model is told the form, so it can try
     again. The description is read by the model, so write it for the model.
+    `unmute` reads `state.py` through `uv`, so `uv` must be on your `PATH`.
 
     Nothing reads these yet. Declaring a value and using it are two separate
     things, and that is on purpose.
@@ -331,7 +337,7 @@ stop anywhere and come back.
 
     When the caller asks where their parcel is, run find_parcel.
 
-    The parcel we found on this call: {{tracking_number}}, due {{delivery_date}}.
+    The parcel we found on this call: {{state.tracking_number}}, due {{state.delivery_date}}.
     When those are filled in, tell the caller the day and do not run find_parcel
     again unless they give a different number.
     ```
@@ -400,7 +406,8 @@ stop anywhere and come back.
     ```
 
     This is also where you can see what the compiler adds to the task's
-    prompt. Run `unmute compile my-agent` and open `build/livekit/agent.py`.
+    prompt. Run `unmute compile my-agent` and open
+    `build/livekit/prompts/tasks/find_parcel.md`.
     Under your own instructions you will find these lines:
 
     ```text
@@ -532,14 +539,6 @@ models:
     detector:
       provider: livekit
       model: turn-detector-mini
-
-variables:
-  tracking_number:
-    type: str
-    description: The tracking number of the parcel we found for this caller.
-  delivery_date:
-    type: Date
-    description: The day that parcel is due, written year-month-day.
 
 tools:
   - end_call

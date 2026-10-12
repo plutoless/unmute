@@ -50,7 +50,7 @@ organisation the key belongs to.
 Validate, compile, and push in one command. A real push needs a `voiceai`
 release that supports a checked, resolved attachment; an older one is refused
 with upgrade guidance before anything is written. This flow has been verified
-with `voiceai 0.1.18`:
+with `voiceai 0.1.22`:
 
 ```bash
 export SLNG_API_KEY=...
@@ -82,13 +82,13 @@ one block to read.
 | Named MCP tools | `tools/web_search.yaml` | `mcp.server` and two names under `mcp.tools` |
 | A curated builtin | `tools/end_call.yaml` | `builtin: {id: end_call}` |
 | A curated text message with a pinned sender | `tools/send_sms.yaml` | `builtin: {id: send_sms}` and `inject: from_number`; the model writes the message, SLNG sends it to the caller's number, on phone calls only |
-| Template variables in the greeting and the prompt | `agent.yaml` `variables:`, `conversation.greeting.text`, `instructions.md` | four variables, each with a default |
-| A value the model records during the call | `agent.yaml` `variables.caller_phone` | `source: conversation`, no default, a description the model reads; returned on the call record as a memory variable |
+| Template variables in the greeting and the prompt | `state.py`, `conversation.greeting.text`, `instructions.md` | four fields on `State`, each with a default |
+| A value the model records during the call | `state.py` `caller_phone`, and `agent.yaml` `variables:` | `source: conversation`, `= None`, a `Field(description=...)` the model reads; returned on the call record as a memory variable |
 | A model fallback | `agent.yaml` `models.think` | `fallback:` naming `backup` on the primary |
 | An inbound phone number | `channels.phone` and the deploy | trunk chosen at the terminal after the push |
 
 What this target does not take, it refuses at validate by name: tasks, step
-announcements, `prefetch:`, `confirm:` and declared shapes. Read the two salon
+announcements, `prefetch:`, `confirm:` and any `state.py` field that is more than a plain `str`, `int`, `float` or `bool`. Read the two salon
 examples for those. Reading the caller's number, detecting voicemail and
 telling the time are capabilities SLNG curates and attaches in the dashboard; a
 package reaches only `end_call` and `send_sms` by name.
@@ -122,16 +122,20 @@ the model has no text tool, and the prompt says so to the guest.
 - **Target.** `targets.yaml` names one target, `slng`, in `eu-north`. A
   push deploys an agent named `hotel-concierge-slng`: the package's name
   joined to the target's name.
+- **State.** `state.py` holds the five values the agent reads or records, as
+  fields on one `State` class.
 - **Agent.** `agent.yaml` defines one agent, `concierge`, whose prompt is in
   `instructions.md`. It reasons with a Gemini model and falls back to a
   second Gemini model, and speaks and transcribes with the Deepgram models
   SLNG serves in Europe. The SLNG-hosted `slng/deepgram/...-en` copies run in
   other regions, and a push into `eu-north` refuses them by name.
-- **Variables.** Four template variables, each with a default: `hotel_name`,
-  `neighbourhood`, `city`, `hotel_website`. The greeting names
-  `{{hotel_name}}` and the prompt names all four. A fifth, `caller_phone`, has
-  `source: conversation` and no default: the model records it once the guest
-  confirms the number, and it comes back on the call record.
+- **Variables.** Four template variables, each with a default in `state.py`:
+  `hotel_name`, `neighbourhood`, `city`, `hotel_website`. The greeting names
+  `{{state.hotel_name}}` and the prompt names all four. A fifth, `caller_phone`, has
+  `source: conversation` in `agent.yaml` and `= None` in `state.py`: the model
+  records it once the guest confirms the number, and it comes back on the call
+  record. This target runs no Python, but `unmute validate` and `unmute compile`
+  read `state.py` through `uv`, so `uv` has to be on your `PATH`.
 - **Tools.** Every one is a reference: this target creates no tool, and no
   tool file carries a mirror.
   - `hotel_info` (`slng: hotel_info`): a Custom Code tool SLNG hosts, answering
@@ -167,15 +171,14 @@ brew install slng-ai/tap/voiceai
 ```
 
 Every `voiceai` command below runs against the same organisation `unmute`
-deploys to:
+deploys to, because they use the same key:
 
 ```bash
 export VOICEAI_API_KEY="$SLNG_API_KEY"
-voiceai whoami
 ```
 
-Check the organisation it names. A stored `voiceai login` profile can belong
-to a different one, and that one will not have these resources.
+A stored `voiceai login` profile can belong to a different organisation, and
+that one will not have these resources.
 
 This example references resources in the organisation it was written for.
 Inspect yours with `unmute resources`, then make sure it holds each of these.
@@ -313,10 +316,7 @@ trunk at all.
 To use your own LiveKit client instead, with the defaults:
 
 ```bash
-cat > session.json <<'JSON'
-{"arguments":{},"participant_name":"you"}
-JSON
-voiceai agents web-sessions create <agent_id> --file session.json
+voiceai agents web-sessions create <agent_id>
 ```
 
 `unmute deploy` prints this command with the agent id already filled in. The
@@ -348,11 +348,10 @@ voiceai agents web-sessions create <agent_id> --file session.json
 The push creates nothing. Both hosted tools and the MCP server have to exist
 before the push, in the organisation the key belongs to.
 
-**Fix:** list what the organisation holds, and check the name on the key:
+**Fix:** list what the key's organisation holds:
 
 ```bash
 unmute resources
-voiceai whoami
 ```
 
 Then create whatever is missing from the table in

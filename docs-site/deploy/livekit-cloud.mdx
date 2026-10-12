@@ -7,7 +7,7 @@ sidebarTitle: "LiveKit Cloud"
 Deploy your compiled package to a LiveKit Cloud project, then update the same agent.
 Unmute writes the runnable project; LiveKit's `lk` CLI builds and hosts it.
 Edit your authored package and compile again when its behavior changes.
-`unmute deploy` handles SLNG; this route uses `lk agent`.
+`unmute deploy` publishes SLNG agents or connects Twilio numbers; this route uses `lk agent`.
 
 On this page:
 
@@ -83,7 +83,7 @@ Run LiveKit commands from `build/livekit/`, where these files are generated:
 
 | File | Role |
 | --- | --- |
-| `agent.py` | Worker and compiled prompts, tasks and tool wiring |
+| `agent.py` and supporting files | Worker entry point, its modules, prompts, tasks and tool wiring |
 | `pyproject.toml` | Python project manifest and selected dependencies |
 | `Dockerfile` and `.dockerignore` | Image build and file exclusions |
 | `tools/` | Copied local tool handlers, when declared |

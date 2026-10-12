@@ -244,25 +244,21 @@ func buildLiveKitData(agent *ir.Agent, tgt ir.Target) (livekitData, error) {
 		scanArgs([]livekitArg{data.Unserved})
 	}
 	data.NeedsField = needAnnotated
-	typed, err := TypedState(agent)
-	if err != nil {
-		return livekitData{}, err
+	// Sorted the way the emitted import line has to be: Annotated, Any, Literal.
+	typingImports := func(needAny bool) string {
+		var names []string
+		if needAnnotated {
+			names = append(names, "Annotated")
+		}
+		if needAny {
+			names = append(names, "Any")
+		}
+		if needLiteral {
+			names = append(names, "Literal")
+		}
+		return strings.Join(names, ", ")
 	}
-	if typed.Source != "" {
-		data.TypedState = &typed
-		needAnnotated = needAnnotated || typed.NeedsAnnotated
-		needLiteral = needLiteral || typed.NeedsLiteral
-	}
-	data.PydanticImports = PydanticImports(data.NeedsField, data.TypedState)
-	data.NeedsDataclassField = StateNeedsDataclassField(agent) || PrefetchUnconfirmed(agent)
-	var typingNames []string
-	if needAnnotated {
-		typingNames = append(typingNames, "Annotated")
-	}
-	if needLiteral {
-		typingNames = append(typingNames, "Literal")
-	}
-	data.TypingImports = strings.Join(typingNames, ", ")
+	data.TypingImports = typingImports(false)
 
 	// Local handler files ride the artifact (tools/<name>.py); mcp mounts and
 	// local wrappers pull their imports.
@@ -280,7 +276,7 @@ func buildLiveKitData(agent *ir.Agent, tgt ir.Target) (livekitData, error) {
 			}
 		}
 		for _, tool := range tools {
-			if tool.URLEnv != "" {
+			if tool.URLEnv != "" || tool.HostedRequest {
 				data.NeedsHTTPX = true // webhook tool POSTs with httpx (agents + tasks own them)
 			}
 			if tool.Auth != nil {
@@ -401,13 +397,10 @@ func buildLiveKitData(agent *ir.Agent, tgt ir.Target) (livekitData, error) {
 	// on the session; `assign` and `requires` read and write its fields.
 	for _, name := range sortedVarNames(agent) {
 		v := agent.Variables[name]
-		anno, def := stateField(v, true)
-		data.Vars = append(data.Vars, livekitVar{
-			Name: name, PyType: pyType(v.Type), Anno: anno, Default: def, Description: oneLine(v.Description),
-		})
+		data.Vars = append(data.Vars, livekitVar{Name: name, PyType: pyType(v.Type), Description: oneLine(v.Description)})
 		if v.Source == ir.VariableSourceCallStart || v.Source == "" {
 			data.CallStartVars = append(data.CallStartVars, livekitCallStartVar{
-				Name: name, Type: string(v.Type), TypeCheck: livekitTypeCheck(v.Type),
+				Name: name, Type: authoredType(v),
 				Required: v.Default == nil && v.Source == ir.VariableSourceCallStart,
 			})
 		}
@@ -461,11 +454,15 @@ func buildLiveKitData(agent *ir.Agent, tgt ir.Target) (livekitData, error) {
 		data.PrefetchRunbook, _ = PrefetchRunbook(agent, tgt)
 	}
 	// Prompt constants, ordered agents-then-tasks for a stable file.
+	var prompts []pyPrompt
 	for _, a := range data.Agents {
-		data.Prompts = append(data.Prompts, livekitPrompt{Const: a.PromptConst, Body: agent.Agents[a.Name].Instructions})
+		prompts = append(prompts, pyPrompt{Const: a.PromptConst, File: a.Name, Text: agent.Agents[a.Name].Instructions})
 	}
 	for _, t := range data.Tasks {
-		data.Prompts = append(data.Prompts, livekitPrompt{Const: t.PromptConst, Body: livekitTaskPrompt(agent.Tasks[t.Name], t.Result)})
+		prompts = append(prompts, pyPrompt{Const: t.PromptConst, File: "tasks/" + t.Name, Text: livekitTaskPrompt(agent.Tasks[t.Name], t.Result)})
+	}
+	if data.Prompts, err = uniquePrompts(prompts); err != nil {
+		return livekitData{}, err
 	}
 	entryInstructions := agent.Agents[agent.EntryAgent].Instructions
 	if _, router := slngRouterBinding(agent, tgt, agent.Agents[agent.EntryAgent].Model); ir.HasTemplate(entryInstructions) && !router {
@@ -577,10 +574,27 @@ func buildLiveKitData(agent *ir.Agent, tgt ir.Target) (livekitData, error) {
 	// variables: the per-call session id lives there now, and a class reaching
 	// it from a method body is the only way the header set can travel per
 	// request.
-	data.HasUserdata = data.HasVars || slng.Any()
+	typed, err := TypedState(agent, livekitStateMembers(data.Slng))
+	if err != nil {
+		return livekitData{}, err
+	}
+	if typed.Source != "" {
+		data.TypedState = &typed
+	}
+	data.HasUserdata = data.TypedState != nil
+	data.StateSource = agent.StateSource
+	data.PydanticImports = PydanticImports(data.NeedsField, data.TypedState)
 	// The emitted mixin names llm.LLM to tell a per-class model override from
 	// the session default, the way the framework's own activity does.
 	data.NeedsLLM = data.NeedsLLM || slng.Any()
+	// The provenance hook annotates its argument as an httpx.Response.
+	data.NeedsHTTPX = data.NeedsHTTPX || slng.Any()
+	// _slng_llm_node serves agents and tasks, which share no base class that
+	// declares _slng_scope, so its first argument is typed Any.
+	data.TypingImports = typingImports(slng.Any())
+	if data.TypedState != nil {
+		data.TypingImports = withTypingNames(data.TypingImports, callStateTypingNames...)
+	}
 	knowledge, err := loweredKnowledge(agent, env)
 	if err != nil {
 		return livekitData{}, err
@@ -640,14 +654,6 @@ func fillLiveKitTelephonyCommon(telephony *livekitTelephony, agent *ir.Agent, pl
 			telephony.HasOutbound = true
 		case "warm_transfer":
 			telephony.HasWarm = true
-		}
-	}
-	for _, variable := range sortedVarNames(agent) {
-		def := agent.Variables[variable]
-		if def.Source == ir.VariableSourceCallStart {
-			telephony.CallStart = append(telephony.CallStart, livekitCallStart{
-				Name: variable, Type: string(def.Type), TypeCheck: livekitTypeCheck(def.Type), Required: def.Default == nil,
-			})
 		}
 	}
 	sourceVariables := make([]string, 0, len(plan.SystemSources))
@@ -1176,16 +1182,10 @@ func buildLiveKitTask(agent *ir.Agent, tgt ir.Target, name string, task ir.Task,
 		}
 		built.LLM = &taskLLM
 	}
+	// The finish fields' schema is StepResult's, built at import from State's
+	// own annotations, so only the names travel from here.
 	for _, fname := range sortedResultNames(task.Result) {
-		rf := task.Result[fname]
-		base := resultPyType(rf)
-		// V2: a result field's enum reaches the finish() arg as Literal[...] too
-		// (resultPyType collapses it to str otherwise); result fields carry no
-		// description in the schema.
-		built.Result = append(built.Result, livekitArg{
-			Name: fname, PyType: base, Required: true, Enum: rf.Enum,
-			Anno: pyAnno(nullableType(pyAnno(base, rf.Enum, "")), nil, rf.Description),
-		})
+		built.Result = append(built.Result, livekitArg{Name: fname})
 	}
 	built.Typed = true
 	built.Terminal = len(task.Finish) > 0
@@ -1624,8 +1624,8 @@ const (
 	// The router client, in the two scopes that build a router model: the
 	// entrypoint local it was just assigned to, and an agent method reaching the
 	// same object through the session.
-	livekitEntryClientExpr   = "slng_state.slng_client"
-	livekitRuntimeClientExpr = "self.session.userdata.slng_client"
+	livekitEntryClientExpr   = "slng_state._slng_client"
+	livekitRuntimeClientExpr = "self.session.userdata._slng_client"
 )
 
 // livekitSessionIDField is the field the per-call session id occupies on the user
@@ -1776,26 +1776,6 @@ func livekitResultExpr(task livekitTask) string {
 		entries = append(entries, pyQuote(field.Name)+": "+field.Name)
 	}
 	return "{" + strings.Join(entries, ", ") + "}"
-}
-
-func resultPyType(field ir.ResultField) string {
-	// A declared shape lowers to its generated class, so the model is told the
-	// field names, their types and their descriptions.
-	//
-	// This used to return "dict" for anything nested, which is the silent gap
-	// this closes: a bare dict annotation carries no field names, so the
-	// pydantic conversion had nothing to turn into properties and the model was
-	// asked for an object and told nothing about what belongs in it.
-	if field.Shape != nil {
-		return PyAnno(field.Shape)
-	}
-	if field.Schema != nil {
-		return "dict" // a raw JSON Schema object, forwarded as a JSON object arg
-	}
-	if len(field.Enum) > 0 {
-		return "str"
-	}
-	return pyType(field.Type)
 }
 
 // LiveKit derives tool schemas from these annotations. An array must stay a
@@ -1972,18 +1952,12 @@ func livekitDeps(data livekitData) []string {
 		"httpx",
 	}...)
 	deps = append(deps, sortedKeys(packages)...)
-	switch data.TracingProvider {
-	case "langfuse":
-		// langfuse 4 is the observations-first data model. It is a major with
-		// breaking changes tracing.py depends on (propagate_attributes, the
-		// default span filter), so the floor is 4 and the ceiling stops the
-		// next major arriving unannounced.
-		deps = append(deps, "langfuse>=4,<5", "opentelemetry-sdk>=1.33,<2")
-	case "coval":
-		// livekit-agents brings the OTel API and SDK in through its own
-		// telemetry module, but nothing in the LiveKit stack pulls the OTLP HTTP
-		// exporter, which is the one Coval ingests. Declare both so a clean
-		// install cannot import tracing.py and fail on the exporter.
+	if data.Tracing {
+		// Every backend is plain OTLP over HTTP from utils/telemetry.py, so no
+		// backend brings an SDK of its own. livekit-agents brings the OTel API
+		// and SDK in through its telemetry module, but nothing in the LiveKit
+		// stack pulls the OTLP HTTP exporter. Declare both so a clean install
+		// cannot import telemetry.py and fail on the exporter.
 		deps = append(deps, "opentelemetry-sdk>=1.33,<2", "opentelemetry-exporter-otlp-proto-http>=1.33,<2")
 	}
 	// The connector bridge is a standalone aiohttp server that places outbound
@@ -1998,18 +1972,9 @@ func livekitDeps(data livekitData) []string {
 	// dependencies strike above. Pinned at 2.2 because that is the release that
 	// reads a display name, which NameEmail's parser needs, and capped below 3
 	// so a major release cannot change what an address means mid-deploy.
-	if data.TypedState != nil && data.TypedState.NeedsEmailValidator {
-		deps = append(deps, "email-validator>=2.2,<3")
-	}
+	deps = append(deps, data.TypedState.Deps()...)
 	slices.Sort(deps)
 	return deps
-}
-
-func nullableType(anno string) string {
-	if strings.HasSuffix(anno, " | None") {
-		return anno
-	}
-	return anno + " | None"
 }
 
 // livekitStepTransfers is the step's handoff method names as a Python set
@@ -2045,4 +2010,30 @@ func pySuccessLiteral(success map[string][]string) string {
 		parts = append(parts, pyQuote(field)+": ("+strings.Join(values, ", ")+",)")
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// words whose authored default is not one of them, which a type checker refuses.
+
+// livekitStateMembers is what LiveKit's CallState carries beyond the shared
+// members: the per-call router session id, and the router client.
+func livekitStateMembers(slng slngHelpers) string {
+	if !slng.Any() {
+		return ""
+	}
+	out := `
+    # One value per call, set where the call begins. It groups this call's think
+    # requests for support and scopes nothing: the cache scope is the agent id
+    # header, so this may differ freely between calls. It lives here because the
+    # header set travels per request, so every agent and task class has to be
+    # able to reach it from a method body.
+    ` + livekitSessionIDField + `: str = ""`
+	if slng.ClientBaseURL != "" {
+		out += `
+    # And the router client, for the same reason: the summarizer is built inside
+    # an agent method, where the entrypoint's local is out of scope. One client
+    # per call, so the pool and its response hook are the call's own. A client
+    # is not call state, so it is private: never validated, never dumped.
+    _slng_client: AsyncOpenAI | None = PrivateAttr(default=None)`
+	}
+	return out
 }

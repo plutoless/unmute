@@ -116,25 +116,12 @@ agents:
 [[if .ThenTarget]]    then_target: [[.ThenTarget]]
 [[end]]    merge: results
 [[end]]
-[[end]][[if .Shapes]]# The named groups of fields a value's type: refers to. Each field is one line,
-# `- name: Type`, and grows a block only when it wants a description the model
-# reads.
-shapes:
-[[range .Shapes]]  - name: [[.Name]]
-[[if .Description]]    description: [[yaml .Description]]
-[[end]]    fields:
-[[range .Fields]][[if .Description]]      - name: [[.Name]]
-        type: [[yaml .Type]]
-        description: [[yaml .Description]]
-[[else]]      - [[.Name]]: [[yaml .Type]]
-[[end]][[end]][[end]]
-[[end]][[if .Variables]]variables:
-[[range .Variables]]  [[.Name]]:
-    type: [[.Type]]
-[[if .Default]]    default: [[.Default]]
-[[end]][[if .Source]]    source: [[.Source]]
+[[end]][[if .BehaviourVariables]]# How the values on State in state.py behave: where one comes from, and which
+# step confirms it. A value needs an entry only for one of those.
+variables:
+[[range .BehaviourVariables]]  - name: [[.Name]]
+[[if .Source]]    source: [[.Source]]
 [[end]][[if .Confirm]]    confirm: [[.Confirm]]
-[[end]][[if .Description]]    description: [[quote .Description]]
 [[end]][[end]]
 [[end]][[if .DeclaredSecrets]]# Every runtime value you supply, by environment variable name. A secret has no
 # other fields, and a value never appears in a package file: put the values in
@@ -236,6 +223,8 @@ knowledge:
       description: [[.ModelDescription]]
 [[if .Reason.Provider]]      provider: [[.Reason.Provider]]
 [[end]][[if .Reason.Model]]      model: [[quote .Reason.Model]]
+[[end]][[if .Reason.AgentID]]      agent_id: [[quote .Reason.AgentID]]
+[[end]][[if .Reason.Upstream]]      upstream:[[yamlBlock 8 .Reason.Upstream]]
 [[end]][[if .Reason.Params]]      # Forwarded to the provider as written. A reasoning model answering with
       # function tools on chat completions needs this exact value, or OpenAI
       # returns 400 on every turn.
@@ -246,6 +235,8 @@ knowledge:
       description: fallback reasoning model
 [[if .Binding.Provider]]      provider: [[.Binding.Provider]]
 [[end]][[if .Binding.Model]]      model: [[quote .Binding.Model]]
+[[end]][[if .Binding.AgentID]]      agent_id: [[quote .Binding.AgentID]]
+[[end]][[if .Binding.Upstream]]      upstream:[[yamlBlock 8 .Binding.Upstream]]
 [[end]][[if .Binding.Params]]      params:[[yamlBlock 8 .Binding.Params]]
 [[end]][[end]]  speak:
 [[range .AllAgents]]    [[.VoiceProfile]]:

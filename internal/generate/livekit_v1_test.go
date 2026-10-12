@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -36,7 +38,7 @@ func TestLiveKitTaskRetryDoesNotRestartTheScript(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	py := artifactFile(t, artifact, "agent.py")
+	py := artifactFile(t, artifact, agentSource)
 	if !strings.Contains(py, "task response was empty; retrying") {
 		t.Fatal("the empty-response retry must exist: without it a task turn goes silent")
 	}
@@ -76,7 +78,7 @@ func TestLiveKitExportHookKeepsTheWholeCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,11 +87,12 @@ func TestLiveKitExportHookKeepsTheWholeCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tracing := artifactFile(t, artifact, "tracing.py")
+	tracing := artifactFile(t, artifact, tracingSource)
 
 	for _, want := range []string{
 		`def _export_call_spans(span: ReadableSpan) -> bool:`,
-		"should_export_span=_export_call_spans",
+		"Telemetry(keep=_export_call_spans)",
+		"self.add(_Filtered(processor, keep) if keep else processor)",
 		"from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor, TracerProvider",
 	} {
 		if !strings.Contains(tracing, want) {
@@ -98,12 +101,14 @@ func TestLiveKitExportHookKeepsTheWholeCall(t *testing.T) {
 	}
 
 	hook := pipecatMethodBody(t, tracing, "def _export_call_spans(", "\n\n\ndef ")
-	// The hook drops exactly one thing: the loop monitor's stall span when it has
-	// no parent, which otherwise arrives as a trace of its own. Anything wider
-	// drops the call, because the v4 default filter this replaces keeps none of it.
-	const keep = `return not (span.name == "event_loop_blocked" and span.parent is None)`
-	if !strings.HasSuffix(strings.TrimSpace(hook), keep) {
-		t.Errorf("the filter hook must export every span but a parentless event_loop_blocked:\n%s", hook)
+	// The hook drops exactly two things: the loop monitor's stall span when it
+	// has no parent, which otherwise arrives as a trace of its own, and the
+	// wrapper spans that only repeat a row the trace keeps. Anything wider would
+	// drop part of the call for no reason a reader can see.
+	const keep = `    stall = span.name == "event_loop_blocked" and span.parent is None
+    return not stall and span.name not in WRAPPER_SPANS`
+	if !strings.HasSuffix(strings.TrimRight(hook, "\n"), keep) {
+		t.Errorf("the filter hook must export every span but a parentless event_loop_blocked and the wrapper spans:\n%s", hook)
 	}
 	if strings.Contains(hook, "return False") {
 		t.Errorf("this hook drops nothing else:\n%s", hook)
@@ -120,7 +125,7 @@ func TestLiveKitV1RemyGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +168,7 @@ func TestLiveKitV1EmitsSlngPlugin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +176,7 @@ func TestLiveKitV1EmitsSlngPlugin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"from livekit.plugins import openai, silero, slng",
 		"slng.STT(",
@@ -190,7 +195,7 @@ func TestV22LiveKitSpeechTracingWiring(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,16 +205,15 @@ func TestV22LiveKitSpeechTracingWiring(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bot := artifactFile(t, artifact, "agent.py")
-	tracing := artifactFile(t, artifact, "tracing.py")
+	bot := artifactFile(t, artifact, agentSource)
+	tracing := artifactFile(t, artifact, tracingSource)
 	readme := artifactFile(t, artifact, "README.md")
 	if !strings.Contains(readme, "`greeter-remy-fixture-livekit`") {
 		t.Error("README trace name must match the emitted Langfuse trace name")
 	}
 	for _, want := range []string{
-		"from tracing import setup_langfuse",
-		`"langfuse.session.id": ctx.room.name`,
-		`"langfuse.trace.name": "greeter" + "-" + "remy-fixture-livekit"`,
+		"from utils.tracing import setup_tracing",
+		"setup_tracing(ctx, session)",
 		"await session.start(agent=Greeter(initial=True), room=ctx.room)",
 	} {
 		if !strings.Contains(bot, want) {
@@ -217,12 +221,16 @@ func TestV22LiveKitSpeechTracingWiring(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"def setup_langfuse(",
+		"def setup_tracing(ctx: JobContext, session: AgentSession) -> Telemetry:",
+		`AGENT_NAME = "greeter-remy-fixture-livekit"`,
+		`attributes = telemetry.backend.call_attributes(ctx.room.name)`,
+		`"langfuse.session.id"`,
+		`"langfuse.trace.name"`,
 		"def trace_speech_metrics(",
 		// Langfuse v4 filters and sums over observations, so the session ID and
 		// trace name have to reach every span, not only the session span.
 		"class CallTrace(SpanProcessor):",
-		"trace_provider.add_span_processor(call)",
+		"telemetry.add(call)",
 		"span.set_attributes(self._attributes)",
 		// And a call is a session of one trace per turn, so livekit's turn spans
 		// are routed into a root this module owns.
@@ -230,8 +238,8 @@ func TestV22LiveKitSpeechTracingWiring(t *testing.T) {
 		"install_turn_spans(trace_provider, call)",
 		`TURN_SPANS = ("user_turn", "agent_turn")`,
 		`self._tracer.start_span("turn", context=self._call_context)`,
-		"set_tracer_provider(trace_provider, metadata=metadata)",
-		"should_export_span=_export_call_spans",
+		"set_tracer_provider(trace_provider, metadata=attributes)",
+		"Telemetry(keep=_export_call_spans)",
 		"ctx.add_shutdown_callback(flush_trace)",
 		`@session.on("conversation_item_added")`,
 	} {
@@ -242,7 +250,7 @@ func TestV22LiveKitSpeechTracingWiring(t *testing.T) {
 	if strings.Contains(tracing, "if not any(values)") || !strings.Contains(tracing, "if not all(values)") {
 		t.Error("configured tracing must reject missing credentials, including all three")
 	}
-	setupAt := strings.Index(bot, "    setup_langfuse(")
+	setupAt := strings.Index(bot, "    setup_tracing(")
 	startAt := strings.Index(bot, "await session.start(")
 	if setupAt < 0 || startAt < 0 || setupAt > startAt {
 		t.Error("Langfuse tracing must be configured before AgentSession.start")
@@ -252,10 +260,14 @@ func TestV22LiveKitSpeechTracingWiring(t *testing.T) {
 	if !strings.Contains(pyproject, `name = "unmute-remy-fixture"`) {
 		t.Error("pyproject.toml distribution name shadows the livekit dependency")
 	}
-	for _, dep := range []string{`"langfuse>=4,<5"`, `"opentelemetry-sdk>=1.33,<2"`} {
+	for _, dep := range []string{`"opentelemetry-sdk>=1.33,<2"`, `"opentelemetry-exporter-otlp-proto-http>=1.33,<2"`} {
 		if !strings.Contains(pyproject, dep) {
 			t.Errorf("pyproject.toml missing %s", dep)
 		}
+	}
+	// Every backend is plain OTLP now, so no backend brings its own SDK.
+	if strings.Contains(pyproject, "langfuse") {
+		t.Error("pyproject.toml still declares the langfuse SDK")
 	}
 	env := artifactFile(t, artifact, ".env.example")
 	for _, name := range []string{"LANGFUSE_SECRET_KEY=", "LANGFUSE_PUBLIC_KEY=", "LANGFUSE_BASE_URL="} {
@@ -270,7 +282,7 @@ func TestV31LiveKitTracingIsIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,16 +292,16 @@ func TestV31LiveKitTracingIsIsolated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bot := artifactFile(t, artifact, "agent.py")
-	if !strings.Contains(bot, "from tracing import setup_langfuse") {
+	bot := artifactFile(t, artifact, agentSource)
+	if !strings.Contains(bot, "from utils.tracing import setup_tracing") {
 		t.Fatal("agent.py missing tracing import")
 	}
-	for _, forbidden := range []string{"def setup_langfuse", "def trace_speech_metrics", "Langfuse("} {
+	for _, forbidden := range []string{"def setup_tracing", "def trace_speech_metrics", "Langfuse(", "Telemetry("} {
 		if strings.Contains(bot, forbidden) {
 			t.Errorf("agent.py contains tracing implementation %q", forbidden)
 		}
 	}
-	_ = artifactFile(t, artifact, "tracing.py")
+	_ = artifactFile(t, artifact, tracingSource)
 }
 
 func TestV23LiveKitSpeechObservationsAreUtteranceScoped(t *testing.T) {
@@ -297,7 +309,7 @@ func TestV23LiveKitSpeechObservationsAreUtteranceScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,12 +319,13 @@ func TestV23LiveKitSpeechObservationsAreUtteranceScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tracing := artifactFile(t, artifact, "tracing.py")
+	tracing := artifactFile(t, artifact, tracingSource)
 	for _, want := range []string{
 		"from livekit.agents.voice import ConversationItemAddedEvent, MetricsCollectedEvent",
 		"def trace_speech_metrics(",
-		`"langfuse.observation.input": input_value`,
-		`"langfuse.observation.output": output_value`,
+		`telemetry.backend.observation(input_value=input_value, output_value=output_value, kind="generation")`,
+		`("langfuse.observation.input", input_value)`,
+		`("langfuse.observation.output", output_value)`,
 		// Langfuse v4 has no trace input or output. The call's overall input and
 		// output go on the root observation, and nothing may write the retired
 		// pair back onto a speech span.
@@ -348,7 +361,7 @@ func TestLiveKitV1UnconfiguredGolden(t *testing.T) { // V24
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,8 +369,8 @@ func TestLiveKitV1UnconfiguredGolden(t *testing.T) { // V24
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot := artifactFile(t, artifact, "agent.py")
-	path := filepath.Join("testdata", "golden", "livekit_v1_remy_unconfigured_agent.py")
+	bot := artifactFile(t, artifact, agentSource)
+	path := filepath.Join("testdata", "golden", "livekit_v1_remy_unconfigured_agent.txt")
 	if *updateLiveKitV1 {
 		if err := os.WriteFile(path, []byte(bot), 0o644); err != nil {
 			t.Fatal(err)
@@ -370,11 +383,11 @@ func TestLiveKitV1UnconfiguredGolden(t *testing.T) { // V24
 	if bot != string(want) {
 		t.Fatal("unconfigured livekit agent.py golden differs; run: go test ./internal/generate -run TestLiveKitV1UnconfiguredGolden -update-livekit")
 	}
-	if artifactHasFile(artifact, "tracing.py") {
+	if artifactHasFile(artifact, "utils/tracing.py") {
 		t.Fatal("unconfigured artifact emitted tracing.py")
 	}
 	for path, forbidden := range map[string][]string{
-		"agent.py":       {"Langfuse", "LANGFUSE_", "trace_speech_metrics", "set_tracer_provider"},
+		agentSource:      {"Langfuse", "LANGFUSE_", "trace_speech_metrics", "set_tracer_provider"},
 		"pyproject.toml": {"langfuse", "opentelemetry"},
 		".env.example":   {"LANGFUSE_"},
 		"README.md":      {"Trace with Langfuse"},
@@ -393,7 +406,7 @@ func TestV26LiveKitStaticCheckSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +416,7 @@ func TestV26LiveKitStaticCheckSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	withToolsAgent := artifactFile(t, withTools, "agent.py")
+	withToolsAgent := artifactFile(t, withTools, agentSource)
 	for _, want := range []string{"    RunContext,", "    function_tool,"} {
 		if !strings.Contains(withToolsAgent, want) {
 			t.Errorf("agent.py with tools missing %q", want)
@@ -418,7 +431,7 @@ func TestV26LiveKitStaticCheckSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolFreeAgent := artifactFile(t, toolFree, "agent.py")
+	toolFreeAgent := artifactFile(t, toolFree, agentSource)
 	for _, forbidden := range []string{"    RunContext,", "    function_tool,", "from collections.abc import Sequence"} {
 		if strings.Contains(toolFreeAgent, forbidden) {
 			t.Errorf("unconfigured tool-free agent.py contains unused import %q", forbidden)
@@ -447,17 +460,19 @@ func TestV26LiveKitStaticCheckSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	configuredAgent := artifactFile(t, configured, "agent.py")
-	configuredTracing := artifactFile(t, configured, "tracing.py")
+	configuredAgent := artifactFile(t, configured, agentSource)
+	configuredTracing := artifactFile(t, configured, tracingSource)
 	for _, forbidden := range []string{"    RunContext,", "    function_tool,"} {
 		if strings.Contains(configuredAgent, forbidden) {
 			t.Errorf("configured tool-free agent.py contains unused import %q", forbidden)
 		}
 	}
+	if !pyImports(configuredTracing, "collections.abc", "Sequence") {
+		t.Error(`configured tracing.py does not import Sequence from collections.abc`)
+	}
 	for _, want := range []string{
-		"from collections.abc import Sequence",
-		") -> TracerProvider:",
-		"trace_provider: TracerProvider,",
+		") -> Telemetry:",
+		"telemetry: Telemetry,",
 		"speech_metrics: Sequence[STTMetrics | TTSMetrics]",
 		// start_span returns the API span, not the SDK one on_start receives.
 		"self._turn: trace.Span | None = None",
@@ -490,7 +505,7 @@ func TestV26_LiveKitAgentWebhookImportsHTTPX(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,7 +513,7 @@ func TestV26_LiveKitAgentWebhookImportsHTTPX(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	agentPy := artifactFile(t, artifact, "agent.py")
+	agentPy := artifactFile(t, artifact, agentSource)
 	if !strings.Contains(agentPy, "httpx.AsyncClient(") {
 		t.Fatal("fixture no longer lowers an agent webhook tool to httpx; pick one that does")
 	}
@@ -539,7 +554,7 @@ func authAgent(t *testing.T, auth *ir.ToolAuth) *ir.Agent {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +577,7 @@ func TestLiveKitV1WebhookAuth(t *testing.T) {
 			if err != nil {
 				t.Fatalf("generate: %v", err)
 			}
-			agentPy := artifactFile(t, artifact, "agent.py")
+			agentPy := artifactFile(t, artifact, agentSource)
 			for _, want := range []string{fixture.CallSite, fixture.Helper} {
 				if !strings.Contains(agentPy, want) {
 					t.Errorf("agent.py missing %q:\n%s", want, agentPy)
@@ -586,7 +601,7 @@ func TestLiveKitV1NoAuthHelpersWithoutAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +609,7 @@ func TestLiveKitV1NoAuthHelpersWithoutAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	agentPy := artifactFile(t, artifact, "agent.py")
+	agentPy := artifactFile(t, artifact, agentSource)
 	for _, unwanted := range []string{"_bearer", "_api_key"} {
 		if strings.Contains(agentPy, unwanted) {
 			t.Errorf("agent.py emits %q with no auth tool", unwanted)
@@ -611,7 +626,7 @@ func TestLiveKitV1MultiVendor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,9 +638,13 @@ func TestLiveKitV1MultiVendor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
+	for _, plugin := range []string{"cartesia", "deepgram", "elevenlabs", "openai", "silero"} {
+		if !pyImports(botpy, "livekit.plugins", plugin) {
+			t.Errorf("no module imports %s from livekit.plugins", plugin)
+		}
+	}
 	for _, want := range []string{
-		"from livekit.plugins import cartesia, deepgram, elevenlabs, openai, silero",
 		`stt=deepgram.STT(api_key=os.environ["DEEPGRAM_API_KEY"], model="nova-3")`,
 		`tts=elevenlabs.TTS(api_key=os.environ["ELEVEN_API_KEY"], voice_id="cgSgspJ2msm6clMCkdW9")`,
 		`tts=cartesia.TTS(api_key=os.environ["CARTESIA_API_KEY"], voice="f786b574-daa5-4673-aa0c-cbe3e8534c02", model="sonic-3")`,
@@ -661,7 +680,7 @@ func TestT16_LiveKitEmitsListenFallbackAdapter(t *testing.T) {
 	primary.Fallback = []string{"backup_stt"}
 	pkg.Agent.Models.Listen["transcriber"] = primary
 	pkg.Agent.Listen = "transcriber"
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,7 +688,7 @@ func TestT16_LiveKitEmitsListenFallbackAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"    stt,",
 		`stt=stt.FallbackAdapter(stt=[slng.STT(`,
@@ -695,8 +714,125 @@ func TestLiveKitV1UnknownVendorFailsWithMatrix(t *testing.T) {
 	}
 }
 
+// agentSource names, for artifactFile, the agent's own Python modules joined in
+// the order they are emitted, then its prompt files: what one entry file held
+// before the project was split into modules. A test that asserts on what the
+// agent does reads this; one that asserts on a particular file names the file.
+// The join is not one valid Python file, so a test that runs Python writes the
+// modules out with agentModules.
+const agentSource = "<agent source>"
+
+// tracingSource names the two modules a traced call runs through, read as one:
+// utils/tracing.py shapes the spans and utils/telemetry.py exports them. A test
+// about what the call traces should not care which of the two holds a line.
+const tracingSource = "<tracing source>"
+
+// agentModulePaths are the files agentSource joins, in order. A target emits
+// one of the lists, so the union reads any of them.
+func agentModulePaths() []string {
+	var paths []string
+	for _, m := range slices.Concat(livekitModules, pipecatModules, twilioModules) {
+		if !slices.Contains(paths, m.path) {
+			paths = append(paths, m.path)
+		}
+	}
+	return paths
+}
+
+// livekitModuleTemplates joins the LiveKit module templates and the shared
+// defines they call, for a check that has to see every arm of a branch rather
+// than the one a package renders.
+func livekitModuleTemplates(t *testing.T) string {
+	t.Helper()
+	var joined strings.Builder
+	for _, name := range append([]string{"imports.py"}, moduleTemplates(livekitModules)...) {
+		raw, err := livekitV1Templates.ReadFile("templates/livekit_v1/" + name + ".tmpl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		joined.Write(raw)
+	}
+	return joined.String()
+}
+
+// moduleTemplates are the template names of a module list.
+func moduleTemplates(modules []struct{ tmpl, path string }) []string {
+	names := make([]string, 0, len(modules))
+	for _, m := range modules {
+		names = append(names, m.tmpl)
+	}
+	return names
+}
+
+// agentModules are the agent's own Python modules, in the order they are
+// emitted.
+func agentModules(t *testing.T, artifact Artifact) []File {
+	t.Helper()
+	var modules []File
+	for _, want := range agentModulePaths() {
+		for _, file := range artifact.Files {
+			if file.Path == want {
+				modules = append(modules, file)
+			}
+		}
+	}
+	if len(modules) == 0 {
+		t.Fatal("no agent module emitted")
+	}
+	return modules
+}
+
+// writeProject writes every emitted file under a fresh directory and returns it,
+// for a test that runs Python or ruff over the project as it would land.
+func writeProject(t *testing.T, artifact Artifact) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, file := range artifact.Files {
+		path := filepath.Join(dir, filepath.FromSlash(file.Path))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, file.Content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// assertModulesCompile byte-compiles each of the agent's modules, where python3
+// is installed, so the default suite still needs no Python.
+func assertModulesCompile(t *testing.T, artifact Artifact, what string) {
+	t.Helper()
+	if _, err := exec.LookPath("python3"); err != nil {
+		return
+	}
+	dir := writeProject(t, artifact)
+	for _, module := range agentModules(t, artifact) {
+		path := filepath.Join(dir, filepath.FromSlash(module.Path))
+		if out, err := exec.Command("python3", "-m", "py_compile", path).CombinedOutput(); err != nil {
+			t.Fatalf("%s: %s is not valid Python:\n%s", what, module.Path, out)
+		}
+	}
+}
+
 func artifactFile(t *testing.T, artifact Artifact, path string) string {
 	t.Helper()
+	if path == agentSource {
+		var joined strings.Builder
+		for _, file := range agentModules(t, artifact) {
+			joined.Write(file.Content)
+		}
+		for _, file := range artifact.Files {
+			if strings.HasPrefix(file.Path, "prompts/") && strings.HasSuffix(file.Path, ".md") {
+				joined.Write(file.Content)
+				joined.WriteString("\n")
+			}
+		}
+		return joined.String()
+	}
+	if path == tracingSource {
+		return artifactFile(t, artifact, "utils/tracing.py") + "\n" + artifactFile(t, artifact, "utils/telemetry.py")
+	}
 	for _, file := range artifact.Files {
 		if file.Path == path {
 			return string(file.Content)
@@ -739,7 +875,7 @@ func TestLiveKitV1EmptyTaskResponseContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -749,7 +885,7 @@ func TestLiveKitV1EmptyTaskResponseContract(t *testing.T) {
 	}
 
 	const mixin = "_RetryEmptyTaskResponseMixin"
-	taskAgent := artifactFile(t, artifact, "agent.py")
+	taskAgent := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"class " + mixin + ":",
 		"class FindSlot(" + mixin + ", AgentTask[dict]):",
@@ -776,7 +912,7 @@ func TestLiveKitV1EmptyTaskResponseContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	minimalAgent, err := ir.Build(minimalPkg)
+	minimalAgent, err := buildWithState(t, minimalPkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -784,7 +920,7 @@ func TestLiveKitV1EmptyTaskResponseContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate task-free package: %v", err)
 	}
-	if minimal := artifactFile(t, minimalArtifact, "agent.py"); strings.Contains(minimal, mixin) {
+	if minimal := artifactFile(t, minimalArtifact, agentSource); strings.Contains(minimal, mixin) {
 		t.Errorf("task-free agent.py must not emit %s", mixin)
 	}
 	if minimalREADME := artifactFile(t, minimalArtifact, "README.md"); strings.Contains(minimalREADME, runbookHeading) {
@@ -802,7 +938,7 @@ func TestLiveKitV1DelegateThenTransferAndEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -821,19 +957,11 @@ func TestLiveKitV1DelegateThenTransferAndEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	var botpy string
-	for _, file := range artifact.Files {
-		if file.Path == "agent.py" {
-			botpy = string(file.Content)
-		}
-	}
-	if botpy == "" {
-		t.Fatal("agent.py not emitted")
-	}
+	botpy := artifactFile(t, artifact, agentSource)
 
 	for _, want := range []string{
 		// transfer: hands off to the target, does not return; no typed-result return.
-		"async def do_reserve(self, ctx: RunContext):",
+		"async def do_reserve(self, ctx: RunContext) -> Agent:",
 		"return Greeter(chat_ctx=owner_ctx.copy(exclude_instructions=True, exclude_config_update=True, exclude_handoff=True))",
 		"when it finishes the caller is handed to the greeter.",
 		// end: shuts the session down, does not return.
@@ -865,13 +993,13 @@ func TestLiveKitV1SingleTaskDelegate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assignedTask := agent.Tasks["find_slot"]
 	assignedTask.Assign = []ir.AssignTo{{Var: "caller_phone", Field: "date"}}
-	assignedTask.Result = map[string]ir.ResultField{"date": {Type: ir.PrimitiveString}}
+	assignedTask.Result = map[string]ir.ResultField{"date": {Type: stringType()}}
 	agent.Tasks["find_slot"] = assignedTask
 	agent.Controls["do_find"] = &ir.Delegate{
 		Kind: ir.ControlDelegate, Task: "find_slot",
@@ -885,15 +1013,14 @@ func TestLiveKitV1SingleTaskDelegate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"async def do_find(self, ctx: RunContext) -> dict:",
 		"result = await FindSlot(chat_ctx=owner_ctx.copy(exclude_instructions=True, exclude_config_update=True, exclude_handoff=True))",
-		`_values = _save_result("find_slot", ctx.userdata, {"date": date, "unserved_request": unserved_request})`,
-		"@dataclass\nclass Userdata:",
-		"caller_phone: str | None = None",
-		"session = AgentSession[Userdata](",
-		"userdata=Userdata(),",
+		`_values = ctx.userdata.save_result("find_slot", dict(raw_arguments))`,
+		"class CallState(State):",
+		"session = AgentSession[CallState](",
+		"userdata=CallState(),",
 		// V1/B1: the single-task delegate docstring carries the finality guidance
 		// so the owner LLM does not re-run the finished flow.
 		"Do not run this flow again for the same request.",
@@ -929,7 +1056,7 @@ func TestLiveKitV1SingleTaskAgentTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -949,13 +1076,13 @@ func TestLiveKitV1SingleTaskAgentTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"class _TaskTransfer(Exception):",
 		"class FindSlot(_RetryEmptyTaskResponseMixin, AgentTask[dict]):",
 		"self._terminal_claimed = False",
 		"def _claim_terminal(self) -> bool:",
-		"async def back_to_greeter(self, ctx: RunContext):",
+		"async def back_to_greeter(self, ctx: RunContext) -> None:",
 		"if not self._claim_terminal():\n            return",
 		`await dev_say(ctx.session, "I will take you back to Remy.", allow_interruptions=False)`,
 		"self.complete(_TaskTransfer(Greeter(chat_ctx=self.chat_ctx.copy(exclude_instructions=True, exclude_config_update=True, exclude_handoff=True))))",
@@ -967,15 +1094,16 @@ func TestLiveKitV1SingleTaskAgentTransfer(t *testing.T) {
 			t.Errorf("agent.py missing %q", want)
 		}
 	}
-	taskStart := strings.Index(botpy, "class FindSlot(_RetryEmptyTaskResponseMixin, AgentTask[dict]):")
+	agents := artifactFile(t, artifact, "agents.py")
+	taskStart := strings.Index(agents, "class FindSlot(_RetryEmptyTaskResponseMixin, AgentTask[dict]):")
 	if taskStart < 0 {
 		t.Fatal("FindSlot task not emitted")
 	}
-	taskEnd := strings.Index(botpy[taskStart:], "# --- session")
-	if taskEnd < 0 {
-		t.Fatal("could not bound FindSlot task")
+	// To the next class, or to the end of the module when FindSlot is last.
+	taskBlock := agents[taskStart:]
+	if next := strings.Index(taskBlock[1:], "\nclass "); next >= 0 {
+		taskBlock = taskBlock[:next+1]
 	}
-	taskBlock := botpy[taskStart : taskStart+taskEnd]
 	if got := strings.Count(taskBlock, "if not self._claim_terminal():"); got != 1 {
 		t.Errorf("transfer claims the terminal %d times, want 1", got)
 	}
@@ -1006,7 +1134,7 @@ func TestLiveKitV1SingleTaskAgentTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate summary transfer: %v", err)
 	}
-	summaryBot := artifactFile(t, summaryArtifact, "agent.py")
+	summaryBot := artifactFile(t, summaryArtifact, agentSource)
 	for _, want := range []string{
 		"async def _summarize(source: llm.ChatContext",
 		"self.complete(_TaskTransfer(Greeter(chat_ctx=summary_ctx)))",
@@ -1022,7 +1150,7 @@ func TestLiveKitV1SharedGroupTaskTransferAndResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1034,7 +1162,7 @@ func TestLiveKitV1SharedGroupTaskTransferAndResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	start := strings.Index(botpy, "async def do_reserve(")
 	if start < 0 {
 		t.Fatal("do_reserve delegate not emitted")
@@ -1076,7 +1204,7 @@ func TestLiveKitV1IsolatedGroupTaskAgentTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1091,14 +1219,14 @@ func TestLiveKitV1IsolatedGroupTaskAgentTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	start := strings.Index(botpy, "async def do_reserve(")
 	if start < 0 {
 		t.Fatal("do_reserve delegate not emitted")
 	}
 	block := botpy[start:]
 	for _, want := range []string{
-		"try:\n            task_results = {}",
+		"try:\n            task_results: dict = {}",
 		// Walked as a plan so the sequence can stop when a step ends unserved,
 		// the same way a shared group does.
 		`_plan = ["find_slot", "confirm_booking"]`,
@@ -1138,7 +1266,7 @@ func TestLiveKitV1TaskRejectsOtherControlKinds(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			agent, err := ir.Build(pkg)
+			agent, err := buildWithState(t, pkg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1169,7 +1297,7 @@ func TestV1LiveKitCompletedFlowEndsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1177,7 +1305,7 @@ func TestV1LiveKitCompletedFlowEndsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 
 	// finish() is the sole resolution: -> None, no value returned after complete().
 	// The reserved unserved-request arg trails the task's own result args, so this
@@ -1241,7 +1369,7 @@ func TestV2LiveKitToolCarriesSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1261,11 +1389,14 @@ func TestV2LiveKitToolCarriesSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 
+	for _, name := range [][2]string{{"typing", "Annotated"}, {"typing", "Literal"}, {"pydantic", "Field"}} {
+		if !pyImports(artifactFile(t, artifact, "agents.py"), name[0], name[1]) {
+			t.Errorf("agents.py does not import %s from %s", name[1], name[0])
+		}
+	}
 	for _, want := range []string{
-		"from typing import Annotated, Literal",
-		"Field, TypeAdapter",
 		// enum → Literal, description → Annotated[..., Field(...)]
 		`service: Annotated[Literal["haircut", "hair-color", "blowout"], Field(description="The service requested")]`,
 		// non-enum described args still carry the description
@@ -1291,7 +1422,7 @@ func TestF3LiveKitSingleAgentMinimalShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1299,7 +1430,7 @@ func TestF3LiveKitSingleAgentMinimalShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	if !strings.Contains(botpy, "    def __init__(self) -> None:") {
 		t.Error("minimal single agent must have a plain __init__(self) with no chat_ctx param")
 	}
@@ -1320,7 +1451,7 @@ func TestF3LiveKitSingleAgentMinimalShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ragent, err := ir.Build(rpkg)
+	ragent, err := buildWithState(t, rpkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1328,7 +1459,7 @@ func TestF3LiveKitSingleAgentMinimalShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate remy: %v", err)
 	}
-	remypy := artifactFile(t, rart, "agent.py")
+	remypy := artifactFile(t, rart, agentSource)
 	if !strings.Contains(remypy, "def __init__(self, chat_ctx: NotGivenOr[llm.ChatContext] = NOT_GIVEN) -> None:") {
 		t.Error("multi-agent Remy must keep the chat_ctx handoff plumbing")
 	}
@@ -1342,7 +1473,7 @@ func TestLiveKitV1IsolatedGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1354,7 +1485,7 @@ func TestLiveKitV1IsolatedGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		// the isolated flow: fresh AgentTasks, results dict, typed return
 		"async def do_reserve(self, ctx: RunContext) -> dict:",
@@ -1380,7 +1511,7 @@ func TestLiveKitV1IsolatedGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate all-isolated: %v", err)
 	}
-	botpy = artifactFile(t, artifact, "agent.py")
+	botpy = artifactFile(t, artifact, agentSource)
 	if strings.Contains(botpy, "TaskGroup") {
 		t.Error("all-isolated project must not import or use TaskGroup")
 	}
@@ -1397,7 +1528,7 @@ func TestLiveKitV1PerTaskModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1412,7 +1543,7 @@ func TestLiveKitV1PerTaskModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	want := `super().__init__(instructions=FIND_SLOT_PROMPT, chat_ctx=chat_ctx, llm=openai.LLM(api_key=os.environ["OPENAI_API_KEY"], model="gpt-4o-mini"))`
 	if !strings.Contains(botpy, want) {
 		t.Errorf("agent.py missing per-task llm override %q", want)
@@ -1431,7 +1562,7 @@ func TestLiveKitV1HistoryShapingAndFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1457,7 +1588,7 @@ func TestLiveKitV1HistoryShapingAndFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		// V4: native adapter around the chain, everywhere the profile binds.
 		`llm=llm.FallbackAdapter(llm=[openai.LLM(api_key=os.environ["OPENAI_API_KEY"], model="gpt-4o-mini", temperature=0.4), openai.LLM(api_key=os.environ["OPENAI_API_KEY"], model="gpt-4o")])`,
@@ -1483,7 +1614,7 @@ func TestLiveKitV1HistoryResetAndToolCallShaping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1498,7 +1629,7 @@ func TestLiveKitV1HistoryResetAndToolCallShaping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		`return Reservations(chat_ctx=self.chat_ctx.copy(exclude_instructions=True, exclude_config_update=True, exclude_function_call=True, exclude_handoff=True))`,
 		"# history: reset — the target starts fresh (a handoff marker still lands).",
@@ -1515,7 +1646,7 @@ func TestLiveKitV1TransferAnnounceAndEntryGreeting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1528,8 +1659,8 @@ func TestLiveKitV1TransferAnnounceAndEntryGreeting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
-	start := strings.Index(botpy, "    async def to_reservations(self, ctx: RunContext):")
+	botpy := artifactFile(t, artifact, agentSource)
+	start := strings.Index(botpy, "    async def to_reservations(self, ctx: RunContext) -> Agent:")
 	if start < 0 {
 		t.Fatal("agent.py missing to_reservations")
 	}
@@ -1564,7 +1695,7 @@ func TestLiveKitV1TransferAnnounceAndEntryGreeting(t *testing.T) {
 	if strings.Contains(botpy, "await session.start(agent=Greeter(), room=ctx.room)") {
 		t.Error("the startup agent must be marked initial; transfer-created agents keep the false default")
 	}
-	backStart := strings.Index(botpy, "    async def back_to_greeter(self, ctx: RunContext):")
+	backStart := strings.Index(botpy, "    async def back_to_greeter(self, ctx: RunContext) -> Agent:")
 	if backStart < 0 {
 		t.Fatal("agent.py missing back_to_greeter")
 	}
@@ -1594,7 +1725,7 @@ func TestV3LiveKitAgentTransfersHiddenOnlyOnEnter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1606,7 +1737,7 @@ func TestV3LiveKitAgentTransfersHiddenOnlyOnEnter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	if strings.Contains(botpy, "IGNORE_ON_ENTER") {
 		t.Error("the on-enter tool flag hides a handoff for the rest of the call; the opening reply must name its tools instead")
 	}
@@ -1627,7 +1758,7 @@ func TestV3LiveKitAgentTransfersHiddenOnlyOnEnter(t *testing.T) {
 	}
 	for _, want := range []string{
 		`if t.id not in {"to_reservations", "to_events"}`,
-		`if t.id not in {"back_to_greeter"}`,
+		`if t.id != "back_to_greeter"`, // a single handoff is a comparison, not a one-item set
 	} {
 		if !strings.Contains(botpy, want) {
 			t.Errorf("an opening reply does not withhold its handoffs: want %s", want)
@@ -1644,7 +1775,7 @@ func TestLiveKitV1BuiltinEndCallTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1664,7 +1795,7 @@ func TestLiveKitV1BuiltinEndCallTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"from livekit.agents.beta.tools import EndCallTool",
 		`tools=[*EndCallTool(extra_description="End the call when the caller is finished.", end_instructions="Thank the caller and say goodbye.").tools],`,
@@ -1687,7 +1818,7 @@ func TestLiveKitV1ConversationShapingAndAgentTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1707,7 +1838,7 @@ func TestLiveKitV1ConversationShapingAndAgentTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		// Agent-level webhook tool on the greeter class, carrying the declared
 		// per-property schema (V2): descriptions via Annotated[..., Field(...)].
@@ -1741,7 +1872,7 @@ func TestLiveKitV1HumanTransferColdAndWarm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate cold: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		// LiveKit may execute parallel tool calls. Reject a duplicate while the
 		// first transfer is in flight so parallel requests cannot trigger two REFERs.
@@ -1800,7 +1931,7 @@ func TestLiveKitV1HumanTransferColdAndWarm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate warm: %v", err)
 	}
-	botpy = artifactFile(t, artifact, "agent.py")
+	botpy = artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		`@function_tool(on_duplicate="reject")
     async def to_human(self, ctx: RunContext) -> str | None:`,
@@ -1914,11 +2045,11 @@ func TestLiveKitV1HumanTransferHangupAlwaysShutsDown(t *testing.T) {
 		instruction string
 	}{
 		"cold": {
-			py:          artifactFile(t, coldArtifact, "agent.py"),
+			py:          artifactFile(t, coldArtifact, agentSource),
 			instruction: "Tell the caller the transfer failed and say goodbye.",
 		},
 		"warm": {
-			py:          artifactFile(t, warmArtifact, "agent.py"),
+			py:          artifactFile(t, warmArtifact, agentSource),
 			instruction: "Tell the caller nobody is available and say goodbye.",
 		},
 	} {
@@ -1955,7 +2086,7 @@ func TestLiveKitV1OutboundVoicemail(t *testing.T) {
 		if err != nil {
 			t.Fatalf("generate %s: %v", tc.action, err)
 		}
-		botpy := artifactFile(t, artifact, "agent.py")
+		botpy := artifactFile(t, artifact, agentSource)
 		for _, want := range []string{
 			"async with AMD(session, participant_identity=\"phone_user\") as detector:",
 			"api.CreateSIPParticipantRequest(",
@@ -2026,7 +2157,7 @@ func TestLiveKitSIPEmitsTopologyAndHydratesContextBeforeGreeting(t *testing.T) {
 		}
 	}
 
-	agentPy := artifactFile(t, artifact, "agent.py")
+	agentPy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		`MAX_SESSIONS = 60`,
 		`len(agent_server.active_jobs) / MAX_SESSIONS`,
@@ -2035,9 +2166,12 @@ func TestLiveKitSIPEmitsTopologyAndHydratesContextBeforeGreeting(t *testing.T) {
 		`"call_id": attributes.get("sip.callID")`,
 		`"from_number": trunk_number if direction == "outbound" else remote_number`,
 		`raise RuntimeError("phone_number must be an E.164 number")`,
-		`raise RuntimeError("call_start.campaign_id must be string")`,
-		`userdata.provider_call_id = value`,
-		`userdata.call_direction = value`,
+		// A dispatched value and a carrier fact are both saved through the
+		// typed check, never assigned straight onto the state.
+		`CALL_START: ClassVar[tuple[str, ...]] = ("campaign_id",`,
+		`userdata.save_call_start(values)`,
+		`not userdata.save_fact("provider_call_id", value)`,
+		`not userdata.save_fact("call_direction", value)`,
 		// System sources and dispatched input variables hydrate through their own
 		// call, so one path serves telephony and a plain `dev --var` session alike.
 		`_hydrate_livekit_context(session.userdata, call_context)`,
@@ -2157,7 +2291,7 @@ func TestLiveKitSIPCapacityIsExactAtOneAndN(t *testing.T) { // telephony V22, V3
 			if err != nil {
 				t.Fatal(err)
 			}
-			agentPy := artifactFile(t, artifact, "agent.py")
+			agentPy := artifactFile(t, artifact, agentSource)
 			for _, want := range []string{
 				fmt.Sprintf("MAX_SESSIONS = %d", maxSessions),
 				`return min(len(agent_server.active_jobs) / MAX_SESSIONS, 1.0)`,
@@ -2206,15 +2340,13 @@ func configuredLiveKitSIP(t *testing.T) (*ir.Agent, ir.Target) {
 	phone := pkg.Agent.Channels["phone"]
 	phone.Outbound, phone.OnVoicemail = &outbound, "hangup"
 	pkg.Agent.Channels["phone"] = phone
-	pkg.Agent.Variables["campaign_id"] = spec.Variable{Type: "string", Source: "call_start", Default: "manual"}
-	pkg.Agent.Variables["provider_call_id"] = spec.Variable{Type: "string", Source: "call_id"}
-	pkg.Agent.Variables["call_direction"] = spec.Variable{Type: "string", Source: "direction"}
+	addCarrierVariables(t, pkg)
 	human := pkg.Agent.Escalations["to_human"]
 	human.Cold = nil
 	human.Warm = &spec.WarmTransfer{Destination: "billing_line", Briefing: "Say who is calling and why."}
 	pkg.Agent.Escalations["to_human"] = human
 
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2240,7 +2372,7 @@ func configuredLiveKitSIPCold(t *testing.T) (*ir.Agent, ir.Target) {
 	}
 	pkg.Connections["primary_phone"] = connection
 
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2264,14 +2396,12 @@ func configuredLiveKitConnector(t *testing.T) (*ir.Agent, ir.Target) {
 	}
 	// Exercise the metadata/hydrate path: the bridge writes these into the
 	// dispatch metadata and the connector agent branch reads them back.
-	pkg.Agent.Variables["campaign_id"] = spec.Variable{Type: "string", Source: "call_start", Default: "manual"}
-	pkg.Agent.Variables["provider_call_id"] = spec.Variable{Type: "string", Source: "call_id"}
-	pkg.Agent.Variables["call_direction"] = spec.Variable{Type: "string", Source: "direction"}
+	addCarrierVariables(t, pkg)
 	configured := pkg.Targets["livekit"]
 	configured.Connection = "primary_phone"
 	setConnectionRoute(pkg, "primary_phone", "connector", "twilio")
 	pkg.Targets = map[string]spec.Target{"livekit": configured}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2304,7 +2434,7 @@ func TestLiveKitConnectorGeneratesBridgeWithoutCloudOrSIP(t *testing.T) {
 		}
 	}
 
-	agentPy := artifactFile(t, artifact, "agent.py")
+	agentPy := artifactFile(t, artifact, agentSource)
 	if !strings.Contains(agentPy, "_livekit_call_context(ctx.room.name, metadata)") {
 		t.Error("agent.py connector branch must build context from metadata")
 	}
@@ -2380,7 +2510,7 @@ func TestLiveKitV1PinsAndSDKLanguage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2428,7 +2558,7 @@ func TestLiveKitV1MCPSelectionTransportAndScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2451,7 +2581,7 @@ func TestLiveKitV1MCPSelectionTransportAndScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	agentpy := artifactFile(t, artifact, "agent.py")
+	agentpy := artifactFile(t, artifact, agentSource)
 	greeterBody := pyClassBody(t, agentpy, "class Greeter(")
 	taskBody := pyClassBody(t, agentpy, "class FindSlot(")
 
@@ -2510,7 +2640,7 @@ func TestLiveKitV1MCPPreflightIsRequired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2530,13 +2660,13 @@ func TestLiveKitV1MCPPreflightIsRequired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	agentpy := artifactFile(t, artifact, "agent.py")
+	agentpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		`def _mcp_toolset(source: str) -> mcp.MCPToolset:`,
 		`if source == "book_table":`,
 		`tools=[_mcp_toolset("book_table")]`,
 		`async def _preflight_mcp() -> None:`,
-		`async def probe(source: str):`,
+		`async def probe(source: str) -> tuple[BaseException | None, BaseException | None]:`,
 		`sources = ("book_table",)`,
 		`*(probe(source) for source in sources)`,
 		`return_exceptions=True`,
@@ -2580,7 +2710,7 @@ func TestLiveKitV1MCPPreflightConnectsOnceOnPhoneRoutes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			agentpy := artifactFile(t, artifact, "agent.py")
+			agentpy := artifactFile(t, artifact, agentSource)
 			if got := strings.Count(agentpy, "    await ctx.connect()"); got != 1 {
 				t.Fatalf("ctx.connect() emitted %d times, want 1", got)
 			}
@@ -2619,7 +2749,7 @@ func TestLiveKitV1LocalAndMCPTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2644,7 +2774,7 @@ func TestLiveKitV1LocalAndMCPTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	botpy := artifactFile(t, artifact, "agent.py")
+	botpy := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"import inspect",
 		"import tools.fetch_notes",
@@ -2708,7 +2838,7 @@ func TestLiveKitV1ParityFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2765,7 +2895,7 @@ func TestLiveKitV1ParityFixture(t *testing.T) {
 	agent.TaskGroups["do_reserve"] = reserve
 	task := agent.Tasks["find_slot"]
 	task.Model = "backup"
-	task.Result["details"] = ir.ResultField{Schema: map[string]any{"type": "object"}}
+	task.Result["details"] = ir.ResultField{Type: objectType()}
 	task.Tools = append(task.Tools, "browse_tables")
 	agent.Tasks["find_slot"] = task
 	task.Assign = []ir.AssignTo{{Var: "caller_phone", Field: "date"}}
@@ -2925,7 +3055,7 @@ func TestLiveKitV1OpenAIResponsesMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2943,7 +3073,7 @@ func TestLiveKitV1OpenAIResponsesMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	agentPy := artifactFile(t, artifact, "agent.py")
+	agentPy := artifactFile(t, artifact, agentSource)
 	want := `openai.responses.LLM(api_key=os.environ["OPENAI_API_KEY"], model="gpt-5.6-terra", reasoning=openai_types.Reasoning(effort="low"), use_websocket=False)`
 	if !strings.Contains(agentPy, want) {
 		t.Errorf("agent.py missing Responses API constructor %q", want)
@@ -2986,7 +3116,7 @@ func TestLiveKitV1OpenAIResponsesMode(t *testing.T) {
 			if err != nil {
 				t.Fatalf("generate: %v", err)
 			}
-			agentPy := artifactFile(t, artifact, "agent.py")
+			agentPy := artifactFile(t, artifact, agentSource)
 			if !strings.Contains(agentPy, tc.want) {
 				t.Errorf("agent.py missing Responses API constructor %q", tc.want)
 			}
@@ -3054,7 +3184,7 @@ func TestLiveKitV1ToolAnnounceSpeaksBeforeTheWork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3077,7 +3207,7 @@ func TestLiveKitV1ToolAnnounceSpeaksBeforeTheWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	agentpy := artifactFile(t, artifact, "agent.py")
+	agentpy := artifactFile(t, artifact, agentSource)
 
 	for _, tc := range []struct{ method, line, work string }{
 		{"get_invoice", `dev_say(self.session, "Let me pull that invoice up.")`, "async with httpx.AsyncClient()"},
@@ -3141,7 +3271,7 @@ func TestLiveKitV1TaskDropsParentInFlightCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3149,7 +3279,7 @@ func TestLiveKitV1TaskDropsParentInFlightCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	agentpy := artifactFile(t, artifact, "agent.py")
+	agentpy := artifactFile(t, artifact, agentSource)
 
 	// The strip lives in the task mixin's llm_node, so it covers the opening turn
 	// and every retry, not just the construction of the context.
@@ -3184,7 +3314,7 @@ func TestLiveKitV1TaskDropsParentInFlightCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bareAgent, err := ir.Build(bare)
+	bareAgent, err := buildWithState(t, bare)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3211,7 +3341,7 @@ func TestLiveKitV1TaskDropsParentInFlightCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate task-free: %v", err)
 	}
-	got := artifactFile(t, bareArtifact, "agent.py")
+	got := artifactFile(t, bareArtifact, agentSource)
 	if strings.Contains(got, "_RetryEmptyTaskResponseMixin") {
 		t.Fatal("a package with no tasks still emits the task mixin; the negative case proves nothing")
 	}

@@ -1,11 +1,20 @@
 === agora listen deepgram ===
-matrix row (no code injection)
+binding:  provider=deepgram model=model-1
+class:    DeepgramSTT
+args:     model="model-1", language="es-MX", sample_rate=24000
+install:  ships with the framework
 
 === agora reason openai ===
-matrix row (no code injection)
+binding:  provider=openai model=model-1
+class:    OpenAI
+args:     model="model-1", sample_rate=24000
+install:  ships with the framework
 
 === agora speak minimax ===
-matrix row (no code injection)
+binding:  provider=minimax model=model-1 voice=voice-1
+class:    MiniMaxTTS
+args:     voice_id="voice-1", model="model-1", sample_rate=24000
+install:  ships with the framework
 
 === livekit listen assemblyai ===
 binding:  provider=assemblyai model=model-1
@@ -328,9 +337,9 @@ env:      OPENAI_API_KEY
 === pipecat listen slng ===
 binding:  provider=slng model=slng/deepgram/nova:3
 class:    SlngSTTService
-args:     api_key=os.environ["SLNG_API_KEY"], model="slng/deepgram/nova:3", language="es-MX", sample_rate=24000
+args:     api_key=os.environ["SLNG_API_KEY"], model="slng/deepgram/nova:3", language="es-MX", sample_rate=24000, world_part="eu-north"
 import:   from pipecat_slng import SlngSTTService
-install:  pipecat-slng>=0.5.2
+install:  pipecat-slng>=0.6.0,<0.7
 env:      SLNG_API_KEY
 
 === pipecat listen soniox ===
@@ -543,9 +552,9 @@ env:      SARVAM_API_KEY
 === pipecat speak slng ===
 binding:  provider=slng model=slng/deepgram/aura:2-en voice=voice-1
 class:    SlngTTSService
-args:     api_key=os.environ["SLNG_API_KEY"], voice="voice-1", model="slng/deepgram/aura:2-en", language="es-MX", sample_rate=24000
+args:     api_key=os.environ["SLNG_API_KEY"], voice="voice-1", model="slng/deepgram/aura:2-en", language="es-MX", sample_rate=24000, world_part="eu-north"
 import:   from pipecat_slng import SlngTTSService
-install:  pipecat-slng>=0.5.2
+install:  pipecat-slng>=0.6.0,<0.7
 env:      SLNG_API_KEY
 
 === pipecat speak soniox ===
@@ -556,4 +565,40 @@ settings: voice="voice-1", model="model-1", language="es-MX", sample_rate=24000
 import:   from pipecat.services.soniox.tts import SonioxTTSService
 install:  pipecat-ai[soniox]
 env:      SONIOX_API_KEY
+
+=== twilio listen deepgram ===
+binding:  provider=deepgram model=model-1
+class:    ConversationRelay
+args:     speechModel="model-1", transcriptionLanguage="es-MX", sample_rate=24000
+install:  ships with the framework
+
+=== twilio reason google ===
+binding:  provider=google model=model-1
+class:    genai.Client
+args:     api_key=os.environ["GOOGLE_API_KEY"], model="model-1", sample_rate=24000
+import:   from google import genai
+install:  google-genai
+env:      GOOGLE_API_KEY
+
+=== twilio reason openai ===
+binding:  provider=openai model=model-1
+class:    AsyncOpenAI
+args:     api_key=os.environ["OPENAI_API_KEY"], model="model-1", sample_rate=24000
+import:   from openai import AsyncOpenAI
+install:  openai
+env:      OPENAI_API_KEY
+
+=== twilio reason slng ===
+binding:  provider=slng model=gpt-5.6-luna
+class:    AsyncOpenAI
+args:     api_key=os.environ["SLNG_API_KEY"], base_url="https://eu-west.context-router.slng.ai/v1", model="gpt-5.6-luna", extra_body={"sample_rate": 24000, "slng_config": _slng_config_reasoning(), "template_variables": _slng_template_variables(state, ("salon_name",), scope="catalog-sample-v1:concierge")}, extra_headers={"X-Slng-Agent-Id": "catalog-sample-v1:concierge", "X-Slng-Session-Id": slng_session_id}
+import:   from openai import AsyncOpenAI
+install:  openai
+env:      OPENAI_API_KEY, SLNG_API_KEY
+
+=== twilio speak elevenlabs ===
+binding:  provider=elevenlabs model=model-1 voice=voice-1
+class:    ConversationRelay
+args:     voice="voice-1", model="model-1", ttsLanguage="es-MX", sample_rate=24000
+install:  ships with the framework
 

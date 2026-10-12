@@ -13,7 +13,7 @@ import "testing"
 // no handoff, and a save failure keeps the step open with the repair
 // instruction in front of the model.
 func TestSmokeGroupExitsLiveKit(t *testing.T) {
-	runLiveKitSmokeScript(t, "terminal_step", nil, nil, groupSmokeScript("agent", "Userdata()"))
+	runLiveKitSmokeScript(t, "terminal_step", nil, nil, groupSmokeScript("agent", "CallState()"))
 }
 
 func TestSmokeGroupExitsPipecat(t *testing.T) {
@@ -32,7 +32,7 @@ from types import SimpleNamespace
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import ` + module + ` as generated
+generated = _project("` + module + `")
 
 BOOKED = {
     "status": "booked",
@@ -43,7 +43,7 @@ BOOKED = {
 
 def verified_state():
     fresh = generated.` + stateExpr + `
-    generated._save_result("verify", fresh, {"customer_phone": "+15550101010", "customer_status": "existing"})
+    fresh.save_result("verify", {"customer_phone": "+34600111222", "customer_status": "existing"})
     return fresh
 
 
@@ -51,10 +51,10 @@ def check_skip_decision():
     """The plan a group starts with, over the same predicate both targets read."""
     fresh = generated.` + stateExpr + `
     steps = (("verify", "customer_phone"), ("book", ""))
-    plan = [name for name, c in steps if not (c and generated._is_confirmed(fresh, c))]
+    plan = [name for name, c in steps if not (c and fresh.is_confirmed(c))]
     assert plan == ["verify", "book"], plan
-    generated._save_result("verify", fresh, {"customer_phone": "+15550101010", "customer_status": "existing"})
-    plan = [name for name, c in steps if not (c and generated._is_confirmed(fresh, c))]
+    fresh.save_result("verify", {"customer_phone": "+34600111222", "customer_status": "existing"})
+    plan = [name for name, c in steps if not (c and fresh.is_confirmed(c))]
     assert plan == ["book"], plan
     # And the last step of that plan is the one that owes the caller a reply.
     assert plan[-1] == "book"
@@ -63,7 +63,7 @@ def check_skip_decision():
 def check_unserved_stops_the_group():
     """A step that ends unserved saves nothing and reads as unserved."""
     fresh = verified_state()
-    values = generated._save_result("book", fresh, {"unserved_request": "they want a refund"})
+    values = fresh.save_result("book", {"unserved_request": "they want a refund"})
     assert values["unserved_request"] == "they want a refund"
     assert fresh.booking is None
     assert generated._task_status(values) == {"status": "unserved"}
@@ -93,7 +93,7 @@ async def check_livekit_handoff_branches():
     assert await step._end_on_book_it(ctx, BOOKED) is None
     assert not step.done()
     assert step._finish_call_id == "tool-1"
-    assert fresh.booking["reference"] == "bkg_0001"
+    assert fresh.booking.reference == "bkg_0001"
     # The transfer sees the settled success and moves the caller.
     moved = await step.to_care(transfer_ctx)
     assert moved is None
@@ -143,7 +143,7 @@ async def check_livekit_handoff_branches():
     finally:
         generated.tools.book_it.book_it = original_tool
     assert ended is None and moved is None, (ended, moved)
-    assert later.booking["reference"] == "bkg_0001"
+    assert later.booking.reference == "bkg_0001"
     assert waiting.done()
     # A save failure is the same answer, and the result stays in front of the
     # model with the repair instruction.

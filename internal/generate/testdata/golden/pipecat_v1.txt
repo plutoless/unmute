@@ -66,21 +66,19 @@ RUN mkdir -p "$NLTK_DATA" && \
     done; \
     python -c "import nltk.data; nltk.data.find('tokenizers/punkt_tab')"
 
-# Named files, never `COPY . .`: /app is the base image's own directory, and
+# Named paths, never `COPY . .`: /app is the base image's own directory, and
 # copying over it replaces the server that answers /bot.
 #
-# tools/ is a directory rather than a file, and it is named the same way. bot.py
-# does `import tools.<name>` for every local tool, so leaving it out builds an
-# image that cannot import its own emitted code: the container starts, raises
-# ModuleNotFoundError, and the deployment never reaches ready. That shipped in
-# v0.1.0 through v0.1.2 and broke five of the eleven examples, `unmute dev`
-# included, because compose.dev.yaml runs this same image with no bind mount.
-COPY bot.py ./
-# dev_metrics.py is emitted unconditionally and imported at bot.py's module
-# scope, so this line is unconditional too. Leaving it out is the same failure
-# tools/ was: the container starts, raises ModuleNotFoundError before it ever
-# answers /bot, and the deployment never reaches ready.
-COPY dev_metrics.py ./
+# Every module and folder bot.py imports is named, because one left out builds an
+# image that cannot import its own code: the container starts, raises
+# ModuleNotFoundError before it ever answers /bot, and the deployment never
+# reaches ready. That shipped in v0.1.0 through v0.1.2 for tools/ and broke five
+# of the eleven examples, `unmute dev` included, because compose.dev.yaml runs
+# this same image with no bind mount. `*.py` is the agent's own modules, which
+# differ by package, and utils/ holds the helpers they share.
+COPY *.py ./
+COPY prompts/ ./prompts/
+COPY utils/ ./utils/
 
 # No CMD: the base image imports bot.py and calls its bot() itself. A local
 # browser run overrides the command instead (see compose.dev.yaml).
@@ -168,7 +166,7 @@ The event feed reconnects separately from audio. Retained events can replay;
 a gap stays marked until the next call. Switching Conversation and Logs keeps
 the same microphone connection.
 
-The generated `dev_metrics.py` is inert unless `UNMUTE_DEV_METRICS` is enabled,
+The generated `utils/dev_metrics.py` is inert unless `UNMUTE_DEV_METRICS` is enabled,
 as `unmute dev` does. Its identified v2 snapshots use `UNMUTE_METRIC ` framing.
 Raw values use seconds. To inspect measurements:
 
@@ -203,7 +201,7 @@ model receives one safe failure result. It must not claim success from either.
 ## Turn taking
 
 Two numbers decide how long a caller waits. **Both are spelled `stop_secs` in
-`bot.py` and they are different fields**, so grep finds two and only this tells
+`call.py` and they are different fields**, so grep finds two and only this tells
 you which is which.
 
 **The floor is 0.2s**, in `VADParams(stop_secs=0.2)`. The VAD waits that
@@ -281,8 +279,12 @@ project and runs it for you behind a dev client.
 
 This agent expects values supplied when the call starts:
 
-- `customer_id` (string)
-- `verified` (boolean)
+- `customer_id` (str | None)
+- `verified` (bool)
+
+Each value is checked against its field's type in `state.py` before the greeting.
+A value that does not fit stops the call start, and the error names the field.
+A model or a list is passed as JSON.
 
 Locally, pass them with `unmute dev` on the source package:
 
@@ -296,25 +298,31 @@ environment variable when the payload carries none.
 
 ## Declared state
 
-Variables declare types once. A task's `assign` derives its finish fields and
-saves validated values. A failed or unserved finish saves nothing.
+The call's state is the `State` class you wrote in `state.py`, copied here as
+you wrote it. `call_state.py` is generated. Its `CallState` subclasses your
+`State` and is the one way a value is saved. It also tracks which values still
+await a confirmation and renders a value for a prompt. Each task step gets its
+own result model, built from your field types when the module loads.
 
-A prompt reads only its own `{{variable}}` or `{{variable.field}}`
-references. Missing values render as `none recorded yet.`; false, zero and
-empty lists keep their values. Referencing an object shares the whole object.
-History is a separate choice and does not clear saved values.
+A task's `assign` derives its finish fields from the fields it saves into. A
+step must return every whole value it assigns, except one its `assign` marks
+with `?`. A failed or unserved finish saves nothing.
 
-Each declared shape is a generated Pydantic class in this module. A step's
-result is validated against it before anything is recorded, so a value outside a
-declared set never enters the state: the previous contents stay as they were and
-the model is told which field and what was allowed, which is what lets it
-correct itself on the next turn.
+A prompt reads only its own `{{state.variable}}` or
+`{{state.variable.field}}` references. Missing values render as
+`none recorded yet.`; false, zero and empty lists keep their values.
+Referencing an object shares the whole object. History is a separate choice and
+does not clear saved values.
 
-A text type with a validated shape (`Phone`, `Date`, `Time`, `Id`, `EmailStr`)
-is a `str` in the schema the model is sent, with its shape checked by a
-validator. That is deliberate: a `pattern` in the schema survives the strict
-tool-schema converter and the provider rejects it, so the shape is checked here
-instead.
+A field's type is the check every save goes through: a step's result, a
+pre-fetched value, a dispatched one and a carrier fact. The values one save
+brings are checked together, and nothing is recorded unless all of them fit.
+The previous contents then stay as they were, and the model is told which field
+and what was allowed, which is what lets it correct itself on the next turn.
+
+A format or pattern rule in your types reaches the model as words in the field's
+description. The schema carries no `pattern` or `format` keyword, because a
+strict provider rejects one. The rule is still checked where the value is saved.
 
 ## Required environment
 
@@ -455,109 +463,61 @@ choose one, and `pipecat cloud regions list` to see what is available.
 - `billing`
 - `intake`
 Entry agent: `intake`.
-=== bot.py ===
-"""Generated Pipecat agent for safe-core-fixture.
-
-Compiled by `unmute`; do not edit by hand. Prompts, model routes, and the agent
-graph are baked in from the package. Secret values are read from the environment
-and never written here. The agency model uses the Pipecat workers API: a main
-PipelineWorker owns the transport + STT, each agent is an LLMWorker with its own
-LLM and voice, and agent_transfer is activate_worker(). Tasks and task groups
-run as Pipecat Flows on the owning agent: a delegate tool snapshots the shared
-context, a FlowManager walks the steps as nodes, and control returns with only
-a completed or unserved status.
-"""
+=== agents.py ===
+"""The agents, their tools, and the task steps they run as flows."""
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import functools
 import inspect
-import json
 import os
-import sys
-from dataclasses import dataclass
+from collections.abc import Callable
+from typing import Any, cast
 
 import httpx
-from dotenv import load_dotenv
 from loguru import logger
-from pydantic import BaseModel, TypeAdapter, ValidationError
-
-from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.bus import BusBridgeProcessor
-from pipecat.frames.frames import EndFrame, LLMMessagesAppendFrame, LLMRunFrame, LLMUpdateSettingsFrame, TTSSpeakFrame
+from pipecat.frames.frames import LLMRunFrame, LLMUpdateSettingsFrame
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
-from pipecat.runner.types import RunnerArguments
-from pipecat.runner.utils import create_transport
-from pipecat.services.llm_service import FunctionCallParams
-from pipecat.services.settings import LLMSettings
-from pipecat.transports.base_transport import BaseTransport, TransportParams
-from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
-from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
-from pipecat.workers.llm import LLMWorker, LLMWorkerActivationArgs, tool
-from pipecat.workers.runner import WorkerRunner
-
-from dev_metrics import install_dev_metrics
-
-from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.llm_service import FunctionCallParams, LLMService
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.settings import LLMSettings
+from pipecat.services.tts_service import TTSService
+from pipecat.workers.llm import LLMWorker, LLMWorkerActivationArgs, tool
 from pipecat_slng import SlngTTSService
 
-load_dotenv()
-
-_LOGGING_CONFIGURED = False
-
-
-def _configure_logging() -> None:
-    global _LOGGING_CONFIGURED
-    if _LOGGING_CONFIGURED:
-        return
-    logger.remove()
-    logger.add(sys.stderr, level=os.getenv("UNMUTE_LOG_LEVEL", "INFO").upper())
-    _LOGGING_CONFIGURED = True
+from call_state import CallState
+from prompts import BILLING_PROMPT, INTAKE_PROMPT
+from settings import WEBHOOK_TIMEOUT_SECS
+from utils.dev_metrics import DevReporter
 
 
-MAIN_NAME = "main"
-# Provider credentials only. The telephony route's environment (Redis, carrier
-# keys, the public URL) is required by telephony.py, not here, so a telephony
-# package still runs in the browser with nothing but model keys (V10/B3).
-REQUIRED_ENV = [
-    "DEEPGRAM_API_KEY",
-    "GET_INVOICE_URL",
-    "LOOKUP_CUSTOMER_URL",
-    "OPENAI_API_KEY",
-    "SLNG_API_KEY",
-]
-IGNORE_PHRASES = ["okay", "right", "uh-huh"]
+def _direct_tool(
+    fn: Callable[..., Any] | None = None,
+    *,
+    cancel_on_interruption: bool = True,
+    timeout_secs: float | None = None,
+) -> Any:
+    """Keep every direct function call terminal, even on malformed input.
 
+    Args:
+        fn: The handler, when used as a bare `@_direct_tool`.
+        cancel_on_interruption: Whether the caller speaking cancels the call.
+        timeout_secs: How long the framework waits for the handler.
 
-def require_env() -> None:
-    missing = [name for name in REQUIRED_ENV if not os.getenv(name)]
-    if missing:
-        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+    Returns:
+        The decorated handler, or a decorator when called with options.
+    """
 
-
-def _direct_tool(fn=None, *, cancel_on_interruption=True, timeout_secs=None):
-    """Keep every direct function call terminal, even on malformed input."""
-
-    def decorate(handler):
+    def decorate(handler: Callable[..., Any]) -> Any:
+        """Wrap one handler so a bad or failing call still resolves."""
         signature = inspect.signature(handler)
         declared = set(signature.parameters) - {"self", "params"}
 
         @functools.wraps(handler)
-        async def guarded(*args, **kwargs):
+        async def guarded(*args: Any, **kwargs: Any) -> Any:
+            """Run the handler, resolving the call itself on bad input or failure."""
             params = kwargs.get("params")
             if params is None:
                 params_index = 1 if "self" in signature.parameters else 0
@@ -578,7 +538,8 @@ def _direct_tool(fn=None, *, cancel_on_interruption=True, timeout_secs=None):
             resolved = False
             original_result_callback = params.result_callback
 
-            async def resolve(result, **callback_kwargs):
+            async def resolve(result: Any, **callback_kwargs: Any) -> Any:
+                """Record that the call was resolved, then hand the result on."""
                 nonlocal resolved
                 resolved = True
                 return await original_result_callback(result, **callback_kwargs)
@@ -611,439 +572,19 @@ def _direct_tool(fn=None, *, cancel_on_interruption=True, timeout_secs=None):
 
 
 
-# Checked at import, which is what makes the container refuse to start rather
-# than start and go quiet.
-#
-# It used to be checked only inside run_bot, once per session. The container
-# then reported healthy, the platform marked the deployment ready, the browser
-# got a valid answer to its offer — and the failure happened in a background
-# task where only the log saw it. A caller heard silence. That is the exact
-# trade Principle II calls the worst one available, and two documentation pages
-# already promised the opposite: "the container starts, checks the keys the
-# agent needs, and stops with the names it did not find" (Wave C, 2026-08-15).
-#
-# run_bot still calls it, because a session that somehow starts without them
-# should fail before the caller hears anything either.
-require_env()
 
 
-# --- a caller on a Twilio-shaped websocket ----------------------------------
-# `python bot.py -t twilio -x <public host>` serves a TwiML webhook and a Media
-# Streams websocket, the way Twilio would reach a phone route. This package has
-# no phone route, so nothing real dials it. It is here for a simulated caller,
-# such as a Coval run against this bot on your laptop.
-async def _carrier_transport(runner_args: RunnerArguments) -> BaseTransport:
-    """The carrier's stream, with the call ended by closing the socket.
+def build_billing_llm(
+    state: CallState | None = None
+) -> LLMService[Any]:
+    """Build the language model for this agent.
 
-    Used by a package that holds no carrier credentials at all, which needs a
-    transport that never asks a carrier to hang a call up.
+    Args:
+        state: The call state, read by the router for its template variables.
 
-    A package that receives calls and never places or redirects one holds no
-    carrier credentials. The framework's own telephony path cannot be used
-    for that: it always asks the serializer to hang the call up through the
-    carrier's REST API, and the serializer refuses to be built without credentials
-    for it (`auto_hang_up is enabled but missing required parameters`, verified
-    against pipecat-ai 1.5.0 on 2026-08-13). So the transport is built here, with
-    automatic hangup off.
-
-    Nothing is lost. Closing the stream ends the call, because the markup your
-    number points at has nothing after `<Connect>`. Declare a connection and this
-    function is not emitted at all: the framework's path is used, and the agent
-    ends calls through the carrier's own call control.
+    Returns:
+        The configured LLM service.
     """
-    from pipecat.runner.utils import parse_telephony_websocket
-    from pipecat.serializers.twilio import TwilioFrameSerializer
-    from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport
-
-    transport_type, call_data = await parse_telephony_websocket(runner_args.websocket)
-    # Set the same two attributes the framework's path sets, so _phone_session
-    # above reads the handshake the same way whichever path built the transport.
-    runner_args.transport_type = transport_type
-    runner_args.call_data = call_data
-    params = transport_params[transport_type]()
-    params.add_wav_header = False
-    params.serializer = TwilioFrameSerializer(
-        stream_sid=call_data["stream_id"],
-        call_sid=call_data["call_id"],
-        params=TwilioFrameSerializer.InputParams(auto_hang_up=False),
-    )
-    return FastAPIWebsocketTransport(websocket=runner_args.websocket, params=params)
-
-
-# --- declared state ----------------------------------------------------------
-# Generated from the `shapes:` and the typed `variables:` in agent.yaml. Both
-# target frameworks already depend on Pydantic, so nothing here adds one. The one
-# exception is EmailStr, which is checked by email-validator: declaring it puts
-# that package in this project's pyproject.toml, and declaring no email type
-# leaves both the import and the dependency out.
-#
-# Emitted from one place in the compiler for both targets, so the classes, the
-# checks and the refusal wording cannot differ between them.
-
-
-class _StateRefused(Exception):
-    """A value that does not fit its declared type, refused where it enters.
-
-    Carried as an exception rather than a return so the write cannot happen by
-    accident: the previous contents stay exactly as they were, and the message
-    goes back to the model, which is what lets it correct itself on the next
-    turn instead of the step recording something wrong.
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.message = message
-
-
-def _typed(field, adapter, value):
-    """Validate one value entering the declared state."""
-    try:
-        return adapter.validate_python(value)
-    except ValidationError as error:
-        first = error.errors()[0]
-        where = ".".join(str(part) for part in first["loc"])
-        named = f"{field}.{where}" if where else field
-        raise _StateRefused(f"{named}: {first['msg']}") from None
-
-
-def _append_entry(entries, value):
-    """One entry onto a declared list, unless it is already on it.
-
-    A step re-entered mid-call can read a value through an explicit prompt
-    reference and hand it straight back, which is not a second thing happening. One live call
-    entered the booking step four times and finished three of them immediately,
-    each with the same appointment it had recorded on the first, so one booking
-    became four entries and the caller's recap listed a booking four times.
-
-    An object carries its own identity, so an identical one is the same thing
-    reported twice. A plain value is not: two bookings really do give two
-    reasons of "create_booking", and both of those count. So the skip is for
-    structured entries only.
-
-    Nothing absent is added either, which is how a step that concluded nothing
-    this time finishes without inventing an entry.
-    """
-    if value is None:
-        return
-    if isinstance(value, (dict, list)) and value in entries:
-        return
-    entries.append(value)
-
-
-def _plain(value):
-    """A validated value as plain data.
-
-    Plain data is the only shape both frameworks accept back from a tool: one
-    refuses a BaseModel outright and drops the whole tool result with a log
-    line, the other cannot serialise one at all.
-    """
-    if isinstance(value, BaseModel):
-        return value.model_dump(mode="json")
-    if isinstance(value, list):
-        return [_plain(entry) for entry in value]
-    if isinstance(value, dict):
-        return {key: _plain(entry) for key, entry in value.items()}
-    return value
-
-
-def _schema(adapter):
-    """One declared type's schema, with every $ref resolved into place.
-
-    Pydantic emits $defs and a $ref for a shape that contains another shape, and
-    this is not a formatting preference. Measured on one real request to the
-    provider, three ways:
-
-    - the schema as Pydantic emits it, nested inside one tool property with no
-      strict flag: accepted with a 200, and the model invented field names for
-      the nested object because it never read the definition. Every result would
-      then have been refused where it entered, on every call.
-    - the same schema with the refs inlined: accepted, and the model filled the
-      shape's own fields exactly, the nullable one included.
-    - the shape the other target sends, with the $defs hoisted to the
-      parameters root and strict on: accepted, and correct. A $defs anywhere but
-      that root is a 400 naming the pointer.
-
-    This target nests the schema inside one property and sends no strict flag,
-    so it is the first case unless the refs are resolved here.
-    """
-    schema = adapter.json_schema()
-    defs = schema.pop("$defs", {})
-
-    def resolve(node):
-        if isinstance(node, list):
-            return [resolve(item) for item in node]
-        if not isinstance(node, dict):
-            return node
-        target = node.get("$ref")
-        if isinstance(target, str) and target.startswith("#/$defs/"):
-            found = defs.get(target.rsplit("/", 1)[1], {})
-            siblings = {key: value for key, value in node.items() if key != "$ref"}
-            return {**resolve(found), **siblings}
-        return {key: resolve(value) for key, value in node.items()}
-
-    return resolve(schema)
-
-
-_FINISH_TYPES = {
-}
-
-
-def _task_status(values):
-    return {"status": "unserved" if values.get("unserved_request") else "completed"}
-
-
-def _group_status(results):
-    return {"status": "unserved" if any(value.get("unserved_request") for value in results.values()) else "completed"}
-
-
-def _typed_result(step, values):
-    """Validate a step's declared results where they enter the state.
-
-    Refused here rather than carried into a later step that assumes it is
-    right, and refused on both targets rather than on the one whose framework
-    happens to validate tool arguments: one of them validates through Pydantic
-    and lets the model self-correct, the other splats raw JSON into the handler.
-    """
-    if values.get("unserved_request"):
-        return {"unserved_request": values["unserved_request"]}
-    adapters = _FINISH_TYPES.get(step)
-    if not adapters:
-        return values
-    out = dict(values)
-    for name, adapter in adapters.items():
-        # Absent goes through the adapter too, rather than being skipped. A
-        # field the model left out is a field with no value, and that is what a
-        # prompt telling it to leave one out asks for: a value that may be
-        # absent validates as None and the append drops it, and a value that
-        # may not is refused here with the message that lets the model correct
-        # itself. Skipping an absent field instead left the key missing from
-        # the result, and the assignment that reads it by name raised a
-        # KeyError inside the finish handler on the target whose framework
-        # validates no argument of its own.
-        out[name] = _plain(_typed(name, adapter, out.get(name)))
-    return out
-
-
-_STATE_TYPES = {
-    "customer_id": TypeAdapter(str),
-    "verified": TypeAdapter(bool),
-}
-_TASK_ASSIGNMENTS = {
-}
-_STATE_CONFIRM = {
-}
-_STATE_DEPENDENCIES = {
-}
-
-
-def _save_result(step, state, values):
-    """Validate all assignments before changing any call state."""
-    values = _typed_result(step, values)
-    if values.get("unserved_request"):
-        return values
-    pending = {}
-    for name, path, append in _TASK_ASSIGNMENTS.get(step, ()):
-        value = values
-        for part in path.split("."):
-            value = value.get(part) if isinstance(value, dict) else None
-        if append:
-            if value is None:
-                continue
-            entries = list(getattr(state, name, None) or [])
-            _append_entry(entries, value)
-            value = entries
-        pending[name] = _plain(_typed(name, _STATE_TYPES[name], value))
-    _save_batch(state, pending, step=step)
-    return values
-
-
-def _save_batch(state, values, *, step=None, inputs=None):
-    """Commit a validated batch and invalidate older results of changed inputs."""
-    if not values:
-        return
-    pending = {name: _plain(_typed(name, _STATE_TYPES[name], value)) for name, value in values.items()}
-    unconfirmed: set[str] = set(getattr(state, "_unconfirmed", ()))
-    provenance = dict(getattr(state, "_prefetch_provenance", {}))
-    affected = {name for name, value in pending.items() if getattr(state, name, None) != value}
-    while True:
-        more = {name for name, reads in provenance.items() if set(reads) & affected} - affected
-        if not more:
-            break
-        affected.update(more)
-    invalidated = affected - pending.keys()
-    for name in invalidated:
-        provenance.pop(name, None)
-    for name, value in pending.items():
-        if inputs is not None:
-            provenance[name] = tuple(inputs)
-        else:
-            provenance.pop(name, None)
-        if name in _STATE_CONFIRM:
-            if _STATE_CONFIRM[name] == step and value is not None and value != "":
-                unconfirmed.discard(name)
-            else:
-                unconfirmed.add(name)
-    def current(name):
-        return None if name in invalidated else pending.get(name, getattr(state, name, None))
-    # Dependencies are acyclic: prefetch can only read earlier entries.
-    for _ in range(len(_STATE_DEPENDENCIES) + 1):
-        before = set(unconfirmed)
-        for name, reads in _STATE_DEPENDENCIES.items():
-            if current(name) is not None and current(name) != "" and all(
-                source not in unconfirmed and current(source) is not None and current(source) != "" for source in reads
-            ):
-                unconfirmed.discard(name)
-            else:
-                unconfirmed.add(name)
-        if before == unconfirmed:
-            break
-    for name in invalidated:
-        setattr(state, name, None)
-    for name, value in pending.items():
-        setattr(state, name, value)
-    if hasattr(state, "_unconfirmed"):
-        state._unconfirmed = unconfirmed
-    if inputs is not None or hasattr(state, "_prefetch_provenance"):
-        state._prefetch_provenance = provenance
-
-
-
-_STATE_STRUCTURED = {}
-_STATE_EMPTY = "none recorded yet."
-# The bound on one rendered value, in characters. The same number the router
-# bounds a template variable by, because this is the same value travelling the
-# same way, and one number cannot be two.
-_STATE_VALUE_MAX = 4000
-
-
-def _state_text(name, value):
-    """One value as a prompt reads it.
-
-    Compact JSON for anything declared structured, never a Python repr: a repr
-    writes single quotes and None, which is not JSON and is not what any
-    provider produced. Words for a declared value with no contents, so a step
-    cannot mistake "not yet known" for "known to be nothing".
-
-    A value that was never declared structured renders exactly as it did before
-    this existed, which is what keeps every package written before it unchanged.
-    """
-    if value is None or value == "":
-        return _STATE_EMPTY
-    if not isinstance(value, str):
-        value = json.dumps(_plain(value), separators=(",", ":"), ensure_ascii=False)
-    text = str(value)
-    if len(text) > _STATE_VALUE_MAX:
-        # The length is only knowable here, at run time, so this cannot be a
-        # compile-time refusal. What it must not be is silent: a shortened value
-        # is a value the model reads as complete. An f-string rather than a
-        # placeholder, because this line is emitted into two modules that log
-        # through two different libraries and either style prints literally on
-        # the other one.
-        logger.warning(
-            f"declared state: {name} rendered {len(text)} characters and is shortened to "
-            f"{_STATE_VALUE_MAX}; a value this long also stops the prompt being cached"
-        )
-        text = text[:_STATE_VALUE_MAX]
-    return text
-
-
-def _prompt_value(state, name, site=""):
-    root, value = _state_lookup(state, name)
-    if root in getattr(state, "_unconfirmed", ()) and site != "task:" + _STATE_CONFIRM.get(root, ""):
-        return root, None
-    return root, value
-
-
-def _state_lookup(state, name):
-    """The value a placeholder names, and the declared name it belongs to.
-
-    A path is authored {{customer.status}} and emitted {{customer__status}}: one
-    flat name, because the router substitutes flat names only and both render
-    paths have to agree. Everything before the first "__" is the declared value;
-    each "__" after it starts a field, read as a dict key or an attribute and as
-    None past an absent link, so a field of a record nobody has filled renders
-    as the empty words and never raises. The root's name comes back with the
-    value because the words for an empty value belong to the root variable.
-    """
-    root, _, path = name.partition("__")
-    value = getattr(state, root, None) if state is not None else None
-    for part in path.split("__") if path else ():
-        if value is None:
-            break
-        value = value.get(part) if isinstance(value, dict) else getattr(value, part, None)
-    return root, value
-
-
-@dataclass
-class State:
-    """Typed call variables (SCHEMA 4.4), shared across agents."""
-
-    customer_id: str | None = None
-    verified: bool = False
-
-
-def _dispatched_call_start(call_context: dict | None) -> dict:
-    """Input variables arrive with the dispatch: the call context on a telephony
-    route, or UNMUTE_CALL_START for a local `unmute dev --var` session."""
-    values = dict((call_context or {}).get("call_start", {}))
-    raw = os.getenv("UNMUTE_CALL_START")
-    if raw:
-        try:
-            supplied = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("UNMUTE_CALL_START must be valid JSON") from exc
-        if not isinstance(supplied, dict):
-            raise RuntimeError("UNMUTE_CALL_START must be a JSON object")
-        # The dispatch wins: env is the local stand-in for it.
-        for name, value in supplied.items():
-            values.setdefault(name, value)
-    return values
-
-
-def build_state(call_context: dict | None = None) -> State:
-    state = State()
-    missing = []
-    call_start = _dispatched_call_start(call_context)
-    if "customer_id" in call_start:
-        setattr(state, "customer_id", call_start["customer_id"])
-    if "verified" in call_start:
-        setattr(state, "verified", call_start["verified"])
-    if missing:
-        raise RuntimeError(f"Missing call context fields: {', '.join(missing)}")
-    return state
-
-async def _end_after(worker: PipelineWorker, timeout_secs: float) -> None:
-    await asyncio.sleep(timeout_secs)
-    await worker.queue_frame(EndFrame())
-
-# --- prompts ----------------------------------------------------------------
-# Agent system instructions as module constants: one copy each, referenced by
-# the LLM builder and any Flow restore (V2).
-BILLING_PROMPT = """# Billing agent (placeholder prompt)
-
-You are the billing specialist for Acme Support. This is a phone call, so keep every answer to one or two short sentences.
-
-- The caller was handed to you because they have a billing question. The conversation so far is in your context.
-- Use `get_invoice` to look up the caller's invoices. It takes the customer id, which the earlier lookup already established.
-- Explain charges calmly and clearly, one item at a time.
-- If the caller is not satisfied, explain what a human support team would need to review.
-"""
-INTAKE_PROMPT = """# Intake agent (placeholder prompt)
-
-You are the front desk voice agent for Acme Support. This is a phone call, so keep every answer to one or two short sentences.
-
-- Greet the caller and find out what they need.
-- When they give a phone number or email, use `lookup_customer` to find their record.
-- If the caller asks about billing, an invoice, or a refund, hand off to the billing agent with `to_billing`.
-- Never guess account details. If you cannot find the customer, say so and ask again.
-"""
-
-
-# --- agents -----------------------------------------------------------------
-
-
-
-def build_billing_llm(state=None):
     return OpenAILLMService(
         api_key=os.environ["OPENAI_API_KEY"],
         settings=OpenAILLMService.Settings(
@@ -1053,19 +594,40 @@ def build_billing_llm(state=None):
     )
 
 
-def build_billing_tts():
+def build_billing_tts() -> TTSService:
+    """Build the voice for this agent.
+
+    Returns:
+        The configured TTS service.
+    """
     return SlngTTSService(
         api_key=os.environ["SLNG_API_KEY"],
         voice="aura-2-orion-en",
         model="slng/deepgram/aura:2-en",
+        world_part="eu-north",
     )
 
 
 class BillingAgent(LLMWorker):
     """Agent: billing."""
 
-    def __init__(self, state=None, context=None, call_context=None, dev_metrics=None) -> None:
-        self.state = state
+    def __init__(
+        self,
+        state: CallState | None = None,
+        context: LLMContext | None = None,
+        call_context: dict[str, Any] | None = None,
+        dev_metrics: DevReporter | None = None,
+    ) -> None:
+        """Build this agent's model and voice and join the call's shared context.
+
+        Args:
+            state: The call's typed variables, shared by every agent.
+            context: The LLM context every agent on the call shares.
+            call_context: The call's own facts and transport handles.
+            dev_metrics: The dev-page reporter, or None outside `unmute dev`.
+        """
+        # Always supplied when the package keeps state; None only in a test.
+        self.state: CallState = cast(CallState, state)
         if context is not None:
             self.context = context
 
@@ -1077,12 +639,24 @@ class BillingAgent(LLMWorker):
             self._dev.observe_tts(tts)
         super().__init__("billing", llm=llm, pipeline=Pipeline([llm, tts]), bridged=())
 
-    async def queue_frame(self, frame, *args, **kwargs) -> None:
+    async def queue_frame(self, frame: Any, *args: Any, **kwargs: Any) -> None:
+        """Stamp the frame for the dev page, then queue it as usual.
+
+        Args:
+            frame: The frame to queue.
+            *args: Passed to the base worker.
+            **kwargs: Passed to the base worker.
+        """
         if self._dev:
             self._dev.stamp(frame)
         await super().queue_frame(frame, *args, **kwargs)
 
-    async def on_activated(self, args) -> None:
+    async def on_activated(self, args: dict[str, Any] | None) -> None:
+        """Set this agent's prompt and scope, then ask for its first reply when told to.
+
+        Args:
+            args: The activation arguments the previous agent or the entry passed.
+        """
         token = self._dev.enter_activation(args) if self._dev else None
         try:
             await self.queue_frame(LLMUpdateSettingsFrame(
@@ -1101,24 +675,35 @@ class BillingAgent(LLMWorker):
 
 
     @_direct_tool
-    async def get_invoice(self, params: FunctionCallParams, customer_id: str):
+    async def get_invoice(self, params: FunctionCallParams, customer_id: str) -> None:
         """Fetch the most recent invoice for a customer id. Returns the invoice total and status.
 
         Args:
+            params (FunctionCallParams): The call handle; the result goes back through it.
             customer_id (str): The customer id from lookup_customer
         """
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 os.environ["GET_INVOICE_URL"],
                 json={"customer_id": customer_id},
-                timeout=30.0,
+                timeout=WEBHOOK_TIMEOUT_SECS,
             )
             response.raise_for_status()
             await params.result_callback(response.json())
 
 
 
-def build_intake_llm(state=None):
+def build_intake_llm(
+    state: CallState | None = None
+) -> LLMService[Any]:
+    """Build the language model for this agent.
+
+    Args:
+        state: The call state, read by the router for its template variables.
+
+    Returns:
+        The configured LLM service.
+    """
     return OpenAILLMService(
         api_key=os.environ["OPENAI_API_KEY"],
         settings=OpenAILLMService.Settings(
@@ -1129,19 +714,40 @@ def build_intake_llm(state=None):
     )
 
 
-def build_intake_tts():
+def build_intake_tts() -> TTSService:
+    """Build the voice for this agent.
+
+    Returns:
+        The configured TTS service.
+    """
     return SlngTTSService(
         api_key=os.environ["SLNG_API_KEY"],
         voice="aura-2-thalia-en",
         model="slng/deepgram/aura:2-en",
+        world_part="eu-north",
     )
 
 
 class IntakeAgent(LLMWorker):
     """Agent: intake."""
 
-    def __init__(self, state=None, context=None, call_context=None, dev_metrics=None) -> None:
-        self.state = state
+    def __init__(
+        self,
+        state: CallState | None = None,
+        context: LLMContext | None = None,
+        call_context: dict[str, Any] | None = None,
+        dev_metrics: DevReporter | None = None,
+    ) -> None:
+        """Build this agent's model and voice and join the call's shared context.
+
+        Args:
+            state: The call's typed variables, shared by every agent.
+            context: The LLM context every agent on the call shares.
+            call_context: The call's own facts and transport handles.
+            dev_metrics: The dev-page reporter, or None outside `unmute dev`.
+        """
+        # Always supplied when the package keeps state; None only in a test.
+        self.state: CallState = cast(CallState, state)
         if context is not None:
             self.context = context
 
@@ -1153,12 +759,24 @@ class IntakeAgent(LLMWorker):
             self._dev.observe_tts(tts)
         super().__init__("intake", llm=llm, pipeline=Pipeline([llm, tts]), bridged=())
 
-    async def queue_frame(self, frame, *args, **kwargs) -> None:
+    async def queue_frame(self, frame: Any, *args: Any, **kwargs: Any) -> None:
+        """Stamp the frame for the dev page, then queue it as usual.
+
+        Args:
+            frame: The frame to queue.
+            *args: Passed to the base worker.
+            **kwargs: Passed to the base worker.
+        """
         if self._dev:
             self._dev.stamp(frame)
         await super().queue_frame(frame, *args, **kwargs)
 
-    async def on_activated(self, args) -> None:
+    async def on_activated(self, args: dict[str, Any] | None) -> None:
+        """Set this agent's prompt and scope, then ask for its first reply when told to.
+
+        Args:
+            args: The activation arguments the previous agent or the entry passed.
+        """
         token = self._dev.enter_activation(args) if self._dev else None
         try:
             await self.queue_frame(LLMUpdateSettingsFrame(
@@ -1177,8 +795,12 @@ class IntakeAgent(LLMWorker):
 
 
     @_direct_tool(cancel_on_interruption=False)
-    async def to_billing(self, params: FunctionCallParams):
-        """Caller asks about billing, an invoice, or a refund."""
+    async def to_billing(self, params: FunctionCallParams) -> None:
+        """Caller asks about billing, an invoice, or a refund.
+
+        Args:
+            params (FunctionCallParams): The call handle; the result goes back through it.
+        """
         # context.history on this handoff. One LLMContext is shared for the whole
         # call, so the receiver is given the shaped list rather than a copy.
         self.context.set_messages(copy.deepcopy([m for m in self.context.get_messages() if not isinstance(m, dict) or m.get("role") in ("user", "assistant", "tool")]))
@@ -1194,10 +816,11 @@ class IntakeAgent(LLMWorker):
         )
 
     @_direct_tool
-    async def lookup_customer(self, params: FunctionCallParams, email: str = "", phone: str = ""):
+    async def lookup_customer(self, params: FunctionCallParams, email: str = "", phone: str = "") -> None:
         """Look up a customer record by phone number or email. Returns the customer id and name.
 
         Args:
+            params (FunctionCallParams): The call handle; the result goes back through it.
             email (str): Caller email address
             phone (str): Caller phone number in E.164 form
         """
@@ -1205,14 +828,155 @@ class IntakeAgent(LLMWorker):
             response = await client.post(
                 os.environ["LOOKUP_CUSTOMER_URL"],
                 json={"email": email, "phone": phone},
-                timeout=30.0,
+                timeout=WEBHOOK_TIMEOUT_SECS,
             )
             response.raise_for_status()
             await params.result_callback(response.json())
+=== bot.py ===
+"""Generated Pipecat agent for safe-core-fixture.
+
+Compiled by `unmute`; do not edit by hand. Prompts, model routes, and the agent
+graph are baked in from the package. Secret values are read from the environment
+and never written here. The agency model uses the Pipecat workers API: a main
+PipelineWorker owns the transport + STT, each agent is an LLMWorker with its own
+LLM and voice, and agent_transfer is activate_worker(). Tasks and task groups
+run as Pipecat Flows on the owning agent: a delegate tool snapshots the shared
+context, a FlowManager walks the steps as nodes, and control returns with only
+a completed or unserved status.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+from dotenv import load_dotenv
+from loguru import logger
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
+
+from call import _carrier_transport, run_bot, transport_params
+from settings import require_env
+
+load_dotenv()
+
+_LOGGING_CONFIGURED = False
 
 
-# --- transport & run --------------------------------------------------------
-transport_params: dict = {
+def _configure_logging() -> None:
+    """Send log output to stderr at UNMUTE_LOG_LEVEL, once per process."""
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+    logger.remove()
+    logger.add(sys.stderr, level=os.getenv("UNMUTE_LOG_LEVEL", "INFO").upper())
+    _LOGGING_CONFIGURED = True
+
+
+# Checked at import, so a container without its keys refuses to start rather
+# than start and go quiet.
+#
+# A check inside run_bot alone runs once per session. The container then
+# reports healthy, the platform marks the deployment ready, and the browser
+# gets a valid answer to its offer. The failure happens in a background task
+# that only the log sees, and the caller hears silence.
+#
+# run_bot still calls it, because a session that somehow starts without them
+# should fail before the caller hears anything either.
+require_env()
+
+
+async def bot(runner_args: RunnerArguments) -> None:
+    """Handle one session: build its transport, then run the agent on it.
+
+    This is the entry point the Pipecat runner and Pipecat Cloud call.
+
+    Args:
+        runner_args: The arguments the runner started this session with.
+    """
+    _configure_logging()
+
+    # A websocket session is a phone call on this route, and this package holds no
+    # carrier credentials, so it builds that transport itself (see
+    # _carrier_transport). Everything else, browser and console, is the framework's.
+    if getattr(runner_args, "websocket", None) is not None:
+        transport = await _carrier_transport(runner_args)
+    else:
+        transport = await create_transport(runner_args, transport_params)
+    await run_bot(transport, runner_args)
+
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+
+    main()
+=== call.py ===
+"""One call: its transport, pipeline, event handlers and the end of it."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from collections.abc import Callable
+from typing import Any, cast
+
+from loguru import logger
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.bus import BusBridgeProcessor
+from pipecat.frames.frames import EndFrame, LLMMessagesAppendFrame, TTSSpeakFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.runner.types import RunnerArguments
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.stt_service import STTService
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.workers.llm import LLMWorkerActivationArgs
+from pipecat.workers.runner import WorkerRunner
+
+from agents import BillingAgent, IntakeAgent
+from session import build_state
+from settings import MAIN_NAME, require_env
+from utils.dev_metrics import DevReporter, install_dev_metrics
+
+# Tasks that end the call later. A task nobody references can be collected
+# while it sleeps, so each is held here until it finishes.
+_END_TASKS: set[asyncio.Task[None]] = set()
+
+
+async def _end_after(worker: PipelineWorker, timeout_secs: float) -> None:
+    """End the call once `timeout_secs` have passed.
+
+    Args:
+        worker: The pipeline worker to send the end frame to.
+        timeout_secs: How long to wait first.
+    """
+    await asyncio.sleep(timeout_secs)
+    await worker.queue_frame(EndFrame())
+
+
+def _schedule_end_after(worker: PipelineWorker, timeout_secs: float) -> None:
+    """Schedule `_end_after` and hold its task until it finishes.
+
+    Args:
+        worker: The pipeline worker to send the end frame to.
+        timeout_secs: How long to wait first.
+    """
+    task = asyncio.create_task(_end_after(worker, timeout_secs))
+    _END_TASKS.add(task)
+    task.add_done_callback(_END_TASKS.discard)
+transport_params: dict[str, Callable[[], TransportParams]] = {
     "webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True),
     # The runner assigns an inbound call's dial-in settings and Daily credentials
     # onto whatever this returns, so on the Daily route it has to be the params
@@ -1226,7 +990,12 @@ transport_params: dict = {
 
 
 
-def build_stt():
+def build_stt() -> STTService:
+    """Build the transcriber.
+
+    Returns:
+        The configured STT service.
+    """
     return DeepgramSTTService(
         api_key=os.environ["DEEPGRAM_API_KEY"],
         settings=DeepgramSTTService.Settings(
@@ -1235,9 +1004,68 @@ def build_stt():
     )
 
 
-async def _run_bot(transport: BaseTransport, runner_args: RunnerArguments, dev) -> None:
+# --- a caller on a Twilio-shaped websocket ----------------------------------
+# `python bot.py -t twilio -x <public host>` serves a TwiML webhook and a Media
+# Streams websocket, the way Twilio would reach a phone route. This package has
+# no phone route, so nothing real dials it. It is here for a simulated caller,
+# such as a Coval run against this bot on your laptop.
+
+async def _carrier_transport(runner_args: RunnerArguments) -> BaseTransport:
+    """Build the carrier's stream, with the call ended by closing the socket.
+
+    Used by a package that holds no carrier credentials at all, which needs a
+    transport that never asks a carrier to hang a call up.
+
+    A package that receives calls and never places or redirects one holds no
+    carrier credentials. The framework's own telephony path cannot be used
+    for that: it always asks the serializer to hang the call up through the
+    carrier's REST API, and the serializer refuses to be built without credentials
+    for it (`auto_hang_up is enabled but missing required parameters`, verified
+    against pipecat-ai 1.5.0 on 2026-08-13). So the transport is built here, with
+    automatic hangup off.
+
+    Nothing is lost. Closing the stream ends the call, because the markup your
+    number points at has nothing after `<Connect>`. Declare a connection and this
+    function is not emitted at all: the framework's path is used, and the agent
+    ends calls through the carrier's own call control.
+
+    Args:
+        runner_args: The runner's arguments for a websocket session.
+
+    Returns:
+        The Twilio Media Streams transport for this call.
+    """
+    from pipecat.runner.types import WebSocketRunnerArguments
+    from pipecat.runner.utils import parse_telephony_websocket
+    from pipecat.serializers.twilio import TwilioFrameSerializer
+    from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport
+
+    # Only a websocket session reaches this function; the base type has no socket.
+    websocket_args = cast(WebSocketRunnerArguments, runner_args)
+    transport_type, call_data = await parse_telephony_websocket(websocket_args.websocket)
+    # Set the same two attributes the framework's path sets, so _phone_session
+    # above reads the handshake the same way whichever path built the transport.
+    setattr(runner_args, "transport_type", transport_type)  # noqa: B010 - not declared on RunnerArguments
+    runner_args.call_data = call_data
+    params = cast(FastAPIWebsocketParams, transport_params[transport_type]())
+    params.add_wav_header = False
+    params.serializer = TwilioFrameSerializer(
+        stream_sid=call_data["stream_id"],
+        call_sid=call_data["call_id"],
+        params=TwilioFrameSerializer.InputParams(auto_hang_up=False),
+    )
+    return FastAPIWebsocketTransport(websocket=websocket_args.websocket, params=params)
+
+async def _run_bot(transport: BaseTransport, runner_args: RunnerArguments, dev: DevReporter) -> None:
+    """Build the pipeline for one session and run it until the call ends.
+
+    Args:
+        transport: The transport the caller is connected on.
+        runner_args: The arguments the runner started this session with.
+        dev: The dev-page reporter that observes the session.
+    """
     require_env()
-    call_context = {}
+    call_context: dict[str, Any] = {}
 
     runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
 
@@ -1308,7 +1136,8 @@ async def _run_bot(transport: BaseTransport, runner_args: RunnerArguments, dev) 
 
 
     @user_aggregator.event_handler("on_user_turn_idle")
-    async def on_user_turn_idle(aggregator):
+    async def on_user_turn_idle(aggregator: Any) -> None:
+        """Nudge the caller when they have gone quiet."""
         await aggregator.push_frame(
             LLMMessagesAppendFrame(
                 [{"role": "developer", "content": "The caller has gone quiet. Politely check if they are still there."}],
@@ -1320,10 +1149,11 @@ async def _run_bot(transport: BaseTransport, runner_args: RunnerArguments, dev) 
     # second. Without it an idle call is nudged forever and never hung up, which
     # on a phone line is a billed open call. The clock starts at the first idle
     # turn and is cancelled by the caller speaking again.
-    _idle_end: asyncio.Task | None = None
+    _idle_end: asyncio.Task[None] | None = None
 
     @user_aggregator.event_handler("on_user_turn_idle")
-    async def on_user_turn_idle_end(aggregator):
+    async def on_user_turn_idle_end(aggregator: Any) -> None:
+        """Start the clock that ends an idle call."""
         nonlocal _idle_end
         if _idle_end is None or _idle_end.done():
             _idle_end = asyncio.create_task(
@@ -1331,7 +1161,8 @@ async def _run_bot(transport: BaseTransport, runner_args: RunnerArguments, dev) 
             )
 
     @user_aggregator.event_handler("on_user_turn_started")
-    async def on_user_turn_started(aggregator, strategy):
+    async def on_user_turn_started(aggregator: Any, strategy: Any) -> None:
+        """Stop the hangup clock when the caller speaks again."""
         nonlocal _idle_end
         if _idle_end is not None and not _idle_end.done():
             _idle_end.cancel()
@@ -1339,10 +1170,11 @@ async def _run_bot(transport: BaseTransport, runner_args: RunnerArguments, dev) 
 
     runner_ready = asyncio.Event()
     pipeline_started = asyncio.Event()
-    worker_start_error = None
+    worker_start_error: Exception | None = None
     entry_started = False
 
-    async def activate_entry():
+    async def activate_entry() -> None:
+        """Activate the entry agent once, when the client and the pipeline are ready."""
         nonlocal entry_started
         if entry_started or worker_start_error is not None:
             return
@@ -1355,19 +1187,21 @@ async def _run_bot(transport: BaseTransport, runner_args: RunnerArguments, dev) 
             TTSSpeakFrame("Hi, you have reached Acme Support. How can I help you today?")
         )
 
-        asyncio.create_task(_end_after(main, 1200))
+        _schedule_end_after(main, 1200)
 
     @runner.event_handler("on_ready")
-    async def on_runner_ready(runner):
+    async def on_runner_ready(runner: WorkerRunner) -> None:
+        """Note that the runner can take workers."""
         runner_ready.set()
 
     @main.event_handler("on_pipeline_started")
-    async def on_pipeline_started(worker, frame):
+    async def on_pipeline_started(worker: PipelineWorker, frame: Any) -> None:
+        """Add the agent workers once the main pipeline has started."""
         nonlocal worker_start_error
         await runner_ready.wait()
         try:
             await runner.add_workers(*agents)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - logged with its traceback, then the runner is cancelled
             worker_start_error = error
             # Logged here, where it is still known. Cancelling the runner makes
             # run() raise CancelledError, and that reaches the caller before the
@@ -1381,14 +1215,16 @@ async def _run_bot(transport: BaseTransport, runner_args: RunnerArguments, dev) 
         pipeline_started.set()
 
     @main.rtvi.event_handler("on_client_ready")
-    async def on_client_ready(rtvi):
+    async def on_client_ready(rtvi: Any) -> None:
+        """Activate the entry agent once the client and the pipeline are ready."""
         # Wait for both client media readiness and main's StartFrame before
         # activating tools or emitting the greeting (SPEC V2).
         await pipeline_started.wait()
         await activate_entry()
 
     @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
+    async def on_client_disconnected(transport: BaseTransport, client: Any) -> None:
+        """Stop the runner when the caller leaves."""
         await runner.cancel()
 
     await runner.add_workers(main)
@@ -1400,6 +1236,12 @@ async def _run_bot(transport: BaseTransport, runner_args: RunnerArguments, dev) 
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
+    """Run one session, reporting to the dev page and naming any error that stops it.
+
+    Args:
+        transport: The transport the caller is connected on.
+        runner_args: The arguments the runner started this session with.
+    """
     dev = install_dev_metrics(runner_args)
     try:
         await _run_bot(transport, runner_args, dev)
@@ -1412,25 +1254,726 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         raise
     finally:
         dev.finish()
+=== call_state.py ===
+"""The call's state: the author's State, and the one way a value is saved."""
+
+from __future__ import annotations
+
+from typing import Annotated, Any, ClassVar, Self, get_args, get_origin
+
+from loguru import logger
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    TypeAdapter,
+    ValidationError,
+    ValidationInfo,
+    create_model,
+    field_validator,
+)
+from pydantic_core import to_json
+
+from state import State
+
+# --- call state --------------------------------------------------------------
+# State is the author's own class, in state.py. CallState adds what one call
+# needs around it: the one way a value is saved, which values still wait for the
+# caller to confirm them, and how a value reads in a prompt. StepResult checks
+# what a step hands back when it finishes. Neither writes a type of its own:
+# every type here is read off State's annotations.
 
 
-async def bot(runner_args: RunnerArguments) -> None:
-    _configure_logging()
+class StateRefused(Exception):
+    """A value that does not fit its declared type, refused where it enters.
 
-    # A websocket session is a phone call on this route, and this package holds no
-    # carrier credentials, so it builds that transport itself (see
-    # _carrier_transport). Everything else, browser and console, is the framework's.
-    if getattr(runner_args, "websocket", None) is not None:
-        transport = await _carrier_transport(runner_args)
-    else:
-        transport = await create_transport(runner_args, transport_params)
-    await run_bot(transport, runner_args)
+    Carried as an exception rather than a return so the write cannot happen by
+    accident: the previous contents stay exactly as they were, and the message
+    goes back to the model, which is what lets it correct itself on the next
+    turn instead of the step recording something wrong.
+    """
+
+    def __init__(self, message: str) -> None:
+        """Keep the message the model will be shown.
+
+        Args:
+            message: What was wrong with the value, worded for the model.
+        """
+        super().__init__(message)
+        self.message = message
+
+    @classmethod
+    def from_error(cls, error: ValidationError, field: str = "") -> StateRefused:
+        """Word the first problem Pydantic found the way the model is shown it.
+
+        Args:
+            error: What Pydantic refused.
+            field: The value the error is about, when its location does not
+                already start with it.
+
+        Returns:
+            The refusal, as "record.record_id: Field required".
+        """
+        first = error.errors()[0]
+        where = ".".join(str(part) for part in (field, *first["loc"]) if part != "")
+        return cls(f"{where}: {first['msg']}")
 
 
-if __name__ == "__main__":
-    from pipecat.runner.run import main
 
-    main()
+class CallState(State):
+    """The state of one call: the author's State, and how the call keeps it."""
+
+    # A misspelt name is refused, never saved somewhere nothing reads it. A save
+    # validates the batch once, as a whole, so assignment is never checked.
+    model_config = ConfigDict(extra="forbid", frozen=False, validate_assignment=False)
+
+    # step -> what its finish saves: (state field, result path, append).
+    ASSIGNMENTS: ClassVar[dict[str, tuple[tuple[str, str, bool], ...]]] = {}
+    # step -> its finish fields: (field, state field, append, required).
+    RESULTS: ClassVar[dict[str, tuple[tuple[str, str, bool, bool], ...]]] = {}
+    # value -> the step that must hear the caller agree to it.
+    CONFIRM: ClassVar[dict[str, str]] = {}
+    # pre-fetched value -> the values it was looked up from.
+    DEPENDENCIES: ClassVar[dict[str, tuple[str, ...]]] = {}
+    # The values a dispatch may fill when the call starts.
+    CALL_START: ClassVar[tuple[str, ...]] = ("customer_id", "verified")
+    # What a value with nothing in it reads as in a prompt.
+    EMPTY_TEXT: ClassVar[str] = "none recorded yet."
+    # The bound on one rendered value, in characters. The same number the router
+    # bounds a template variable by, because this is the same value travelling
+    # the same way, and one number cannot be two.
+    VALUE_MAX: ClassVar[int] = 4000
+
+    # Facts about the values, not values: which ones still wait for the caller
+    # to confirm them, and which inputs each pre-fetched one was derived from.
+    # Private, so no save, prompt or dispatch payload can ever set them.
+    _unconfirmed: set[str] = PrivateAttr(default_factory=lambda: set(CallState.CONFIRM))
+    _prefetch_provenance: dict[str, tuple[str, ...]] = PrivateAttr(default_factory=dict)
+
+    def initial_value(self, name: str) -> object:
+        """Read the value a field starts the call with.
+
+        Args:
+            name: Name of the field.
+
+        Returns:
+            A fresh copy of the field's default.
+        """
+        return type(self).model_fields[name].get_default(call_default_factory=True)
+
+    def lookup(self, flat: str) -> tuple[str, object]:
+        """Find the value a placeholder names, and the field it belongs to.
+
+        A path is authored {{state.customer.status}} and emitted
+        customer__status: one flat name, because the router substitutes flat
+        names only. Everything before the first "__" is the field; each "__"
+        after it reads one attribute, and is None past an absent link, so a
+        field of a record nobody has filled reads as empty and never raises.
+
+        Args:
+            flat: The flat placeholder name.
+
+        Returns:
+            The field's name and the value found at the end of the path.
+        """
+        root, _, path = flat.partition("__")
+        value = getattr(self, root, None)
+        for part in path.split("__") if path else ():
+            if value is None:
+                break
+            value = getattr(value, part, None)
+        return root, value
+
+    def plain(self, flat: str) -> Any:
+        """Read the value a placeholder names as plain JSON data.
+
+        The one way a value leaves the state for a tool or a prompt. Dumped by
+        the field's own serializer, so a date reads as 2026-10-02 and a name
+        with an email as "Jo <jo@example.com>", never as a Python object.
+
+        Args:
+            flat: The flat placeholder name.
+
+        Returns:
+            The value as JSON data, or None past an absent link.
+        """
+        root, _, path = flat.partition("__")
+        value = self.model_dump(mode="json", include={root}).get(root)
+        for part in path.split("__") if path else ():
+            value = value.get(part) if isinstance(value, dict) else None
+        return value
+
+    def is_unconfirmed(self, flat: str) -> bool:
+        """Say whether the value a placeholder names still waits for the caller.
+
+        Args:
+            flat: The flat placeholder name.
+
+        Returns:
+            True while the caller has not agreed to the value.
+        """
+        return flat.partition("__")[0] in self._unconfirmed
+
+    @classmethod
+    def render(cls, state: CallState | None, flat: str, site: str = "") -> str:
+        """Render one placeholder the way a prompt reads it.
+
+        Compact JSON for anything structured, never a Python repr. Words for a
+        value with no contents, so a step cannot mistake "not yet known" for
+        "known to be nothing". A value still waiting for the caller reads as
+        empty everywhere but in the step that confirms it.
+
+        Args:
+            state: The call's state, or None before the call has begun.
+            flat: The flat placeholder name.
+            site: The prompt reading it, so the confirming step still sees it.
+
+        Returns:
+            The text, cut to the bound when it is longer.
+        """
+        if state is None:
+            return cls.EMPTY_TEXT
+        root = flat.partition("__")[0]
+        if state.is_unconfirmed(root) and site != "task:" + cls.CONFIRM.get(root, ""):
+            return cls.EMPTY_TEXT
+        value = state.plain(flat)
+        if value is None or value == "":
+            return cls.EMPTY_TEXT
+        text = value if isinstance(value, str) else to_json(value).decode()
+        if len(text) > cls.VALUE_MAX:
+            # The length is only knowable here, at run time, so this cannot be
+            # a compile-time refusal. What it must not be is silent: a shortened
+            # value is a value the model reads as complete.
+            logger.warning(
+                f"declared state: {root} rendered {len(text)} characters and is shortened to "
+                f"{cls.VALUE_MAX}; a value this long also stops the prompt being cached"
+            )
+            text = text[: cls.VALUE_MAX]
+        return text
+
+    def save_result(self, step: str, raw: dict) -> dict:
+        """Check a step's finish values, then save what it assigns, all or nothing.
+
+        Args:
+            step: Name of the step whose result is being saved.
+            raw: The finish arguments as the model or the tool sent them.
+
+        Returns:
+            The result as plain data, or the unserved request alone when the
+            step could not help.
+
+        Raises:
+            StateRefused: If a value does not fit its declared type.
+        """
+        result = STEP_RESULTS[step].parse(raw)
+        if result.unserved_request:
+            return {"unserved_request": result.unserved_request}
+        pending = {}
+        for name, path, append in self.ASSIGNMENTS.get(step, ()):
+            # A dotted path walks the result's fields, and is None past any
+            # missing link.
+            value: object = result
+            for part in path.split("."):
+                if value is None:
+                    break
+                value = getattr(value, part, None)
+            if append:
+                if value is None:
+                    continue
+                value = _appended(getattr(self, name), value)
+            pending[name] = value
+        self.save_batch(pending, step=step)
+        # Plain data for the framework: one refuses a model in a tool result and
+        # drops the whole result, the other cannot serialise one at all.
+        return result.model_dump(mode="json")
+
+    def save_batch(self, values: dict, *, step: str | None = None, inputs: list[str] | None = None) -> None:
+        """Validate one batch as a whole, then commit it and invalidate what it changed.
+
+        The batch is built into one fresh model, so each value is checked by
+        its own field's annotation, and nothing is saved until every value has
+        passed. A field the batch leaves out takes its default, which Pydantic
+        does not validate, so it never refuses a save of something else.
+
+        Args:
+            values: Field names mapped to what to save.
+            step: The step saving them, which decides whether it confirms them.
+            inputs: Fields a pre-fetch read to produce them, kept as provenance
+                so a later change to one invalidates the result.
+
+        Raises:
+            StateRefused: If a value does not fit its declared type.
+        """
+        if not values:
+            return
+        try:
+            checked = type(self).model_validate(values)
+        except ValidationError as error:
+            raise StateRefused.from_error(error) from None
+        pending = {name: getattr(checked, name) for name in values}
+        unconfirmed = set(self._unconfirmed)
+        provenance = dict(self._prefetch_provenance)
+        affected = {name for name, value in pending.items() if getattr(self, name, None) != value}
+        # Grow the changed set with everything derived from it, until nothing new joins.
+        while more := {name for name, reads in provenance.items() if set(reads) & affected} - affected:
+            affected |= more
+        invalidated = affected - pending.keys()
+        provenance = {name: reads for name, reads in provenance.items() if name not in invalidated}
+        for name, value in pending.items():
+            if inputs is not None:
+                provenance[name] = tuple(inputs)
+            else:
+                provenance.pop(name, None)
+            if name in self.CONFIRM:
+                if self.CONFIRM[name] == step and value is not None and value != "":
+                    unconfirmed.discard(name)
+                else:
+                    unconfirmed.add(name)
+
+        def current(name: str) -> object:
+            """Read a value as it will stand once this batch lands.
+
+            Args:
+                name: Name of the field.
+
+            Returns:
+                The pending value, the starting value if it was invalidated,
+                else what the state holds.
+            """
+            return self.initial_value(name) if name in invalidated else pending.get(name, getattr(self, name, None))
+
+        # Dependencies are acyclic: a pre-fetch can only read earlier entries.
+        # Each pass reads what the previous one settled, so this runs to a fixed
+        # point.
+        for _ in range(len(self.DEPENDENCIES) + 1):
+            before = set(unconfirmed)
+            for name, reads in self.DEPENDENCIES.items():
+                if current(name) is not None and current(name) != "" and all(
+                    source not in unconfirmed and current(source) is not None and current(source) != ""
+                    for source in reads
+                ):
+                    unconfirmed.discard(name)
+                else:
+                    unconfirmed.add(name)
+            if before == unconfirmed:
+                break
+        # An invalidated value goes back to what the call started with: None for
+        # a value with no default, empty for a list.
+        for name in invalidated:
+            setattr(self, name, self.initial_value(name))
+        for name, value in pending.items():
+            setattr(self, name, value)
+        self._unconfirmed = unconfirmed
+        self._prefetch_provenance = provenance
+
+    def save_call_start(self, values: dict) -> None:
+        """Save the values the dispatch sent, each checked against its type.
+
+        A value that does not fit stops the call before it starts. The dispatch
+        is the author's own payload, so a wrong value in it is a defect to fix,
+        and a call started anyway would run on a value nobody declared. Nothing
+        is saved when one value is refused.
+
+        Args:
+            values: The dispatched values, by field name.
+
+        Raises:
+            RuntimeError: If a dispatched value does not fit its type.
+        """
+        try:
+            self.save_batch({name: values[name] for name in self.CALL_START if name in values})
+        except StateRefused as refused:
+            raise RuntimeError(f"call_start: {refused.message}") from None
+
+    def save_fact(self, name: str, value: object) -> bool:
+        """Save one fact the carrier sent, unless it does not fit its type.
+
+        A caller who withholds their number arrives as "anonymous", which is not
+        a phone number and is nobody's mistake. Ending the call for it would
+        hang up on the caller, so a fact that does not fit is logged, left
+        unsaved, and treated as a fact that never arrived. Each fact is saved
+        on its own, so one odd value never drops the others.
+
+        Args:
+            name: The field the fact fills.
+            value: The fact as the carrier sent it.
+
+        Returns:
+            Whether the fact was saved.
+        """
+        try:
+            self.save_batch({name: value})
+        except StateRefused as refused:
+            logger.warning(f"call fact {name}: {refused.message}; treated as missing")
+            return False
+        return True
+
+    def is_confirmed(self, name: str) -> bool:
+        """Say whether a value is confirmed right now.
+
+        Both halves matter: a value nobody has agreed to is unconfirmed, and so
+        is one that was withdrawn. A group reads this once, as it starts, to
+        decide whether the step that confirms it has to run.
+
+        Args:
+            name: Name of the field.
+
+        Returns:
+            True when the value is filled and nobody has withdrawn its
+            confirmation.
+        """
+        value = getattr(self, name, None)
+        return name not in self._unconfirmed and value is not None and value != ""
+
+    def withdraw_confirmation(self, step: str) -> None:
+        """Withdraw what this step confirms, because the step is about to run again.
+
+        A step a group may skip cannot be trusted to have confirmed anything
+        once it is entered: the caller is correcting the value, or the step is
+        running because the confirmation had already lapsed. Values derived
+        from a withdrawn one follow it.
+
+        Args:
+            step: Name of the step being entered.
+        """
+        withdrawn = {name for name, owner in self.CONFIRM.items() if owner == step}
+        if not withdrawn:
+            return
+        unconfirmed = self._unconfirmed | withdrawn
+        # Dependencies are acyclic, so one pass per entry settles them.
+        for _ in range(len(self.DEPENDENCIES) + 1):
+            before = set(unconfirmed)
+            for name, reads in self.DEPENDENCIES.items():
+                if any(source in unconfirmed for source in reads):
+                    unconfirmed.add(name)
+            if before == unconfirmed:
+                break
+        self._unconfirmed = unconfirmed
+        logger.info("withdrew confirmation on entering " + step)
+
+
+def _task_status(values: dict) -> dict[str, str]:
+    """Say whether a step served the caller or could not.
+
+    Args:
+        values: The step's finish values.
+
+    Returns:
+        A one-key status dict for the agent that owns the step.
+    """
+    return {"status": "unserved" if values.get("unserved_request") else "completed"}
+
+
+def _group_status(results: dict) -> dict[str, str]:
+    """Say whether a group of steps served the caller or one of them could not.
+
+    Args:
+        results: Each step's finish values, by step name.
+
+    Returns:
+        A one-key status dict for the agent that owns the group.
+    """
+    unserved = any(value.get("unserved_request") for value in results.values())
+    return {"status": "unserved" if unserved else "completed"}
+
+
+def _success_word(value: object) -> str:
+    """Spell one result value the way a success pair reads it.
+
+    The pairs come out of YAML as text, so a boolean has to read as the word the
+    author wrote rather than as Python's own spelling of it: True never matches
+    the word true, and the step would silently never end.
+
+    Args:
+        value: One field of a tool result.
+
+    Returns:
+        The value as text, with booleans as true or false and none as empty.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return "" if value is None else str(value)
+
+
+def _terminal_success(result: object, success: dict) -> bool:
+    """Say whether a tool result means this step is done.
+
+    Every field is required and its value has to be one of the listed ones.
+    Anything else is an ordinary result and goes back to the model, which is
+    what keeps a failed booking a conversation rather than a saved one.
+
+    Args:
+        result: What the tool returned.
+        success: Each required result field mapped to the values that count.
+
+    Returns:
+        True when every required field holds one of its listed values.
+    """
+    if not isinstance(result, dict):
+        return False
+    return all(_success_word(result.get(name)) in values for name, values in success.items())
+
+
+def _appended(entries: list, value: object) -> list:
+    """Add one entry onto a list, unless it is already on it.
+
+    A step re-entered mid-call can read a value through an explicit prompt
+    reference and hand it straight back, which is not a second thing happening.
+    One live call entered the booking step four times and finished three of
+    them immediately, each with the same appointment, so one booking became
+    four entries. An object carries its own identity, so an identical one is
+    the same thing reported twice. A plain value is not: two bookings really do
+    give two reasons of "create_booking", and both count.
+
+    Args:
+        entries: The list as it stands.
+        value: The entry to add.
+
+    Returns:
+        A new list with the entry on the end, or the same entries.
+    """
+    if isinstance(value, (BaseModel, dict, list)) and value in entries:
+        return list(entries)
+    return [*entries, value]
+
+
+def _field_type(name: str) -> Any:
+    """The annotation one CallState field validates against, constraints included.
+
+    Args:
+        name: Name of the field.
+
+    Returns:
+        The annotation, wrapped back in Annotated when the field carries
+        constraints, because FieldInfo keeps those apart from the annotation.
+    """
+    info = CallState.model_fields[name]
+    return Annotated[(info.annotation, *info.metadata)] if info.metadata else info.annotation
+
+
+def _item_type(annotation: Any) -> Any:
+    """The entry type of a list annotation, through Annotated and | None.
+
+    Args:
+        annotation: A list annotation, possibly wrapped.
+
+    Returns:
+        The annotation one entry is checked against.
+    """
+    for candidate in (annotation, *get_args(annotation)):
+        if get_origin(candidate) is list:
+            return get_args(candidate)[0]
+    return annotation
+
+
+def _accepts_blank(annotation: Any) -> bool:
+    """Say whether an empty string is a legal value of a type.
+
+    Args:
+        annotation: The annotation a step result field is checked against.
+
+    Returns:
+        True for text, where empty is a value like any other; False for a date,
+        a number, a closed set or a model, where empty can only mean no value.
+    """
+    try:
+        TypeAdapter(annotation).validate_python("")
+    except ValidationError:
+        return False
+    return True
+
+
+# Words for the keywords a provider refuses in a tool schema. One target's
+# strict converter keeps format and pattern and the provider rejects both, so
+# each travels as prose instead: the model still reads the shape it is asked
+# for, and the value is still checked where it enters the state.
+_FORMAT_WORDS = {
+    "date": "a date written YYYY-MM-DD",
+    "date-time": "a date and time written YYYY-MM-DDTHH:MM",
+    "email": "an email address",
+    "name-email": "a name and an email address, written Jo Bloggs <jo@example.com>",
+    "phone": "a phone number with its country code, written +34600111222",
+    "time": "a time of day written HH:MM on the 24-hour clock",
+}
+
+
+def _tool_schema(node: object, defs: dict) -> object:
+    """Shape one schema node for a provider: refs inlined, format and pattern as words.
+
+    Pydantic emits $defs and a $ref for a model that holds another model. A
+    nested $ref the model cannot resolve is still accepted by the provider, and
+    the model then invents the nested field names, so every ref is inlined.
+
+    Args:
+        node: A schema node, or a list or scalar found inside one.
+        defs: The schema's $defs.
+
+    Returns:
+        The node with no $ref, no format and no pattern left in it.
+    """
+    if isinstance(node, list):
+        return [_tool_schema(item, defs) for item in node]
+    if not isinstance(node, dict):
+        return node
+    target = node.get("$ref")
+    if isinstance(target, str) and target.startswith("#/$defs/"):
+        found = _tool_schema(defs.get(target.rsplit("/", 1)[1], {}), defs)
+        siblings = {key: _tool_schema(value, defs) for key, value in node.items() if key != "$ref"}
+        return {**found, **siblings} if isinstance(found, dict) else found
+    out = {key: _tool_schema(value, defs) for key, value in node.items() if key not in ("format", "pattern", "$defs")}
+    words = []
+    if node.get("format") in _FORMAT_WORDS:
+        words.append(_FORMAT_WORDS[node["format"]])
+    if isinstance(node.get("pattern"), str):
+        words.append("text matching " + node["pattern"])
+    if words:
+        sentences = [str(out.get("description", "")), "Expected " + "; ".join(words) + "."]
+        out["description"] = " ".join(sentence for sentence in sentences if sentence)
+    return out
+
+
+class StepResult(BaseModel):
+    """What one step hands back when it finishes.
+
+    Each step has its own subclass, built from CallState's own field types, so
+    the model is asked for exactly what the save will accept. Every field is
+    optional in the schema, so a step that cannot serve the caller never has to
+    invent values; a served finish is then held to REQUIRED.
+    """
+
+    # A terminal tool's result carries more than the step assigns. Kept, so the
+    # result handed back is the whole of what came in.
+    model_config = ConfigDict(extra="allow")
+    # Fields a served finish must carry: the whole values the step assigns,
+    # less the ones its assign: marks with ?.
+    REQUIRED: ClassVar[frozenset[str]] = frozenset()
+    # Fields whose type takes an empty string as a value, so it is kept.
+    BLANK_OK: ClassVar[frozenset[str]] = frozenset()
+
+    unserved_request: str = Field("", description="Leave empty unless the caller asked for something this step cannot serve. Then put that request here in one short plain sentence, in the caller's own terms, so the agent that owns this step can take it.")
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _blank_is_absent(cls, value: object, info: ValidationInfo) -> object:
+        """Read an empty string as no value, where the type has no empty value.
+
+        Empty is what the model sends for a field it has nothing for. Refusing
+        it as a wrong value deadlocked a live call: the model had nothing else
+        to send, so every retry was refused the same way. Text keeps it, because
+        an empty name is what a tool returns for a customer it has no name for.
+
+        Args:
+            value: The raw value.
+            info: Which field it is.
+
+        Returns:
+            None for an empty string, else the value; an empty request for none.
+        """
+        if info.field_name == "unserved_request":
+            # Nothing to report may arrive as null, and reads as no request.
+            return "" if value is None else value
+        if value == "" and info.field_name not in cls.BLANK_OK:
+            return None
+        return value
+
+    @classmethod
+    def for_step(cls, step: str) -> type[StepResult]:
+        """Build the result model for one step from CallState's field types.
+
+        Args:
+            step: Name of the step.
+
+        Returns:
+            The step's own subclass.
+        """
+        fields: dict[str, Any] = {}
+        required = set()
+        blank_ok = set()
+        for field, name, append, needed in CallState.RESULTS.get(step, ()):
+            annotation = _item_type(_field_type(name)) if append else _field_type(name)
+            description = CallState.model_fields[name].description
+            fields[field] = (annotation | None, Field(None, description=description))
+            if needed:
+                required.add(field)
+            if _accepts_blank(annotation):
+                blank_ok.add(field)
+        title = "".join(part.title() for part in step.split("_")) + "Result"
+        model = create_model(title, __base__=cls, __module__=__name__, **fields)
+        model.REQUIRED = frozenset(required)
+        model.BLANK_OK = frozenset(blank_ok)
+        return model
+
+    @classmethod
+    def parse(cls, raw: dict) -> Self:
+        """Validate a finish where it enters: the one place a step's result is checked.
+
+        Args:
+            raw: The finish arguments as sent.
+
+        Returns:
+            The validated result.
+
+        Raises:
+            StateRefused: If a field does not fit its type, or a required one is
+                missing.
+        """
+        if raw.get("unserved_request"):
+            return cls(unserved_request=str(raw["unserved_request"]))
+        try:
+            result = cls.model_validate(raw)
+        except ValidationError as error:
+            raise StateRefused.from_error(error) from None
+        missing = next((name for name in sorted(cls.REQUIRED) if getattr(result, name) is None), None)
+        if missing is not None:
+            raise StateRefused(f"{missing}: Field required")
+        return result
+
+    @classmethod
+    def tool_parameters(cls) -> dict:
+        """The parameters schema the model is sent for this step's finish.
+
+        Returns:
+            A JSON Schema object with one property per field and every $ref
+            inlined. None of it is required, for the reason the class says.
+        """
+        schema = cls.model_json_schema()
+        defs = schema.get("$defs", {})
+        properties = {name: _tool_schema(node, defs) for name, node in schema.get("properties", {}).items()}
+        return {"type": "object", "properties": properties, "required": []}
+
+    @classmethod
+    def retain(cls, args: dict, retained: dict) -> dict:
+        """Put a tool's own values back into the model's finish arguments.
+
+        Reached only when a save was refused and the model is repairing it. A
+        field the tool returned validly is the authoritative one: the model
+        cannot manufacture a booking reference, and a repair that retyped one
+        would record a booking nobody made. A retained value that does not
+        validate is left to the model, because refusing here would leave the
+        step with no way out.
+
+        Args:
+            args: The model's finish arguments.
+            retained: The values the tool returned.
+
+        Returns:
+            The arguments with each validly retained value restored.
+        """
+        out = dict(args)
+        for name in cls.model_fields:
+            if name not in retained or name == "unserved_request":
+                continue
+            try:
+                cls.model_validate({name: retained[name]})
+            except ValidationError:
+                continue
+            out[name] = retained[name]
+        return out
+
+
+# One result model per step, built once at import.
+STEP_RESULTS = {step: StepResult.for_step(step) for step in CallState.RESULTS}
 === compile-report.json ===
 {
   "target": "pipecat",
@@ -1451,12 +1994,22 @@ if __name__ == "__main__":
     ".env.example",
     "Dockerfile",
     "README.md",
+    "agents.py",
     "bot.py",
+    "call.py",
+    "call_state.py",
     "compile-report.json",
     "compose.dev.yaml",
-    "dev_metrics.py",
     "pcc-deploy.toml",
-    "pyproject.toml"
+    "prompts/__init__.py",
+    "prompts/billing.md",
+    "prompts/intake.md",
+    "pyproject.toml",
+    "session.py",
+    "settings.py",
+    "state.py",
+    "utils/__init__.py",
+    "utils/dev_metrics.py"
   ],
   "required_env": [
     "DEEPGRAM_API_KEY",
@@ -1493,7 +2046,10 @@ if __name__ == "__main__":
         "provider": "slng",
         "model": "slng/deepgram/aura:2-en",
         "voice": "aura-2-thalia-en",
-        "placement": "api"
+        "placement": "api",
+        "params": {
+          "world_part": "eu-north"
+        }
       }
     },
     {
@@ -1504,7 +2060,10 @@ if __name__ == "__main__":
         "provider": "slng",
         "model": "slng/deepgram/aura:2-en",
         "voice": "aura-2-orion-en",
-        "placement": "api"
+        "placement": "api",
+        "params": {
+          "world_part": "eu-north"
+        }
       }
     },
     {
@@ -1577,7 +2136,7 @@ if __name__ == "__main__":
     "interruption ignore_phrases emitted as IGNORE_PHRASES; short phrases are also suppressed by the min-words turn-start strategy",
     "listen: deepgram via DeepgramSTTService (pipecat-ai[deepgram], verified 2026-07-15)",
     "reason: openai via OpenAILLMService (pipecat-ai[openai], verified 2026-07-15)",
-    "speak: slng via SlngTTSService (pipecat-slng\u003e=0.5.2, verified 2026-09-09)",
+    "speak: slng via SlngTTSService (pipecat-slng\u003e=0.6.0,\u003c0.7, verified 2026-10-02)",
     "turn role lowers to on-device VAD (Silero); its binding is advisory",
     "turn pace balanced (silence 0.2s from the pace, closes at 1.6s)"
   ]
@@ -1614,11 +2173,203 @@ services:
       timeout: 3s
       retries: 30
       start_period: 10s
-=== dev_metrics.py ===
+=== pcc-deploy.toml ===
+agent_name = "safe-core-fixture-pipecat"
+secret_set = "safe-core-fixture-pipecat-secrets"
+
+=== prompts/__init__.py ===
+"""The system prompts, one Markdown file each beside this module.
+
+Each file is read once, at import. A prompt's placeholders are filled from the
+call's state where it is used, never here.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+_HERE = Path(__file__).parent
+
+
+def load(name: str) -> str:
+    """Read one prompt exactly as the package wrote it.
+
+    Args:
+        name: The prompt's file name, without the `.md` suffix.
+
+    Returns:
+        The prompt text.
+    """
+    return (_HERE / f"{name}.md").read_text(encoding="utf-8")
+
+
+BILLING_PROMPT = load("billing")
+INTAKE_PROMPT = load("intake")
+=== prompts/billing.md ===
+# Billing agent (placeholder prompt)
+
+You are the billing specialist for Acme Support. This is a phone call, so keep every answer to one or two short sentences.
+
+- The caller was handed to you because they have a billing question. The conversation so far is in your context.
+- Use `get_invoice` to look up the caller's invoices. It takes the customer id, which the earlier lookup already established.
+- Explain charges calmly and clearly, one item at a time.
+- If the caller is not satisfied, explain what a human support team would need to review.
+=== prompts/intake.md ===
+# Intake agent (placeholder prompt)
+
+You are the front desk voice agent for Acme Support. This is a phone call, so keep every answer to one or two short sentences.
+
+- Greet the caller and find out what they need.
+- When they give a phone number or email, use `lookup_customer` to find their record.
+- If the caller asks about billing, an invoice, or a refund, hand off to the billing agent with `to_billing`.
+- Never guess account details. If you cannot find the customer, say so and ask again.
+=== pyproject.toml ===
+[project]
+name = "safe-core-fixture"
+version = "0.1.0"
+description = "Generated Pipecat voice agent (compiled by unmute)."
+requires-python = ">=3.11"
+dependencies = [
+    "pipecat-ai[deepgram,openai,runner,silero,webrtc,websocket]==1.10.0",
+    "pipecat-slng>=0.6.0,<0.7",
+    "python-dotenv>=1.0",
+
+    "httpx>=0.27",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = ["ruff==0.15.7", "ty"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "PERF", "FURB", "RUF", "BLE", "D", "ANN"]
+ignore = ["E501", "ANN401", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tools/*" = ["D", "ANN"]
+"logic/*" = ["D", "ANN"]
+
+[tool.ty.environment]
+python-version = "3.11"
+=== session.py ===
+"""How the call's state is filled and read: templates, refusals, pre-fetch and call start."""
+
+from __future__ import annotations
+
+import json
+import os
+from typing import Any
+
+from call_state import CallState
+
+
+def _dispatched_call_start(call_context: dict[str, Any] | None) -> dict[str, Any]:
+    """Read the input variables that arrived with the dispatch.
+
+    They come in the call context on a telephony route, or in UNMUTE_CALL_START
+    for a local `unmute dev --var` session.
+
+    Args:
+        call_context: The call's context, or None when there is none.
+
+    Returns:
+        The dispatched values, the dispatch winning over the environment.
+
+    Raises:
+        RuntimeError: When UNMUTE_CALL_START is not a JSON object.
+    """
+    values = dict((call_context or {}).get("call_start", {}))
+    raw = os.getenv("UNMUTE_CALL_START")
+    if raw:
+        try:
+            supplied = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("UNMUTE_CALL_START must be valid JSON") from exc
+        if not isinstance(supplied, dict):
+            raise RuntimeError("UNMUTE_CALL_START must be a JSON object")
+        # The dispatch wins: env is the local stand-in for it.
+        values |= {name: value for name, value in supplied.items() if name not in values}
+    return values
+
+
+def build_state(call_context: dict[str, Any] | None = None) -> CallState:
+    """Build the call's typed variables from the dispatch and the call's own facts.
+
+    Args:
+        call_context: The call's context, or None when there is none.
+
+    Returns:
+        The state every agent on the call shares.
+
+    Raises:
+        RuntimeError: When a required input variable was not dispatched, or a
+            dispatched value does not fit its declared type.
+    """
+    state = CallState()
+    call_start = _dispatched_call_start(call_context)
+    state.save_call_start(call_start)
+    return state
+=== settings.py ===
+"""Every fixed value this agent runs with, in one place.
+
+Compiled from the package: names, limits, timeouts, and the environment
+variables each kind of session needs. Nothing here reads a secret.
+"""
+
+from __future__ import annotations
+
+import os
+
+MAIN_NAME = "main"
+# The longest a webhook tool waits for its endpoint before the call fails.
+WEBHOOK_TIMEOUT_SECS = 30.0
+
+# Provider credentials only. The telephony route's environment (Redis, carrier
+# keys, the public URL) is required by telephony.py, not here, so a telephony
+# package still runs in the browser with nothing but model keys (V10/B3).
+REQUIRED_ENV = [
+    "DEEPGRAM_API_KEY",
+    "GET_INVOICE_URL",
+    "LOOKUP_CUSTOMER_URL",
+    "OPENAI_API_KEY",
+    "SLNG_API_KEY",
+]
+IGNORE_PHRASES = ["okay", "right", "uh-huh"]
+
+
+def require_env() -> None:
+    """Fail at startup, naming every required environment variable that is unset.
+
+    Raises:
+        RuntimeError: When at least one name in REQUIRED_ENV has no value.
+    """
+    missing = [name for name in REQUIRED_ENV if not os.getenv(name)]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+=== state.py ===
+"""The call state of safe_core: every value its agents and tasks share."""
+
+from pydantic import BaseModel
+
+
+class State(BaseModel):
+    """What one call knows, shared by every agent and task in it."""
+
+    customer_id: str | None = None
+    verified: bool = False
+=== utils/__init__.py ===
+"""Helpers the agent's modules share."""
+=== utils/dev_metrics.py ===
 """Call-scoped, immediate dev events. Inert outside the local dev loop."""
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import json
 import math
@@ -1626,17 +2377,20 @@ import os
 import re
 import sys
 import time
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     CancelFrame,
     ErrorFrame,
+    Frame,
     FunctionCallCancelFrame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
-    InterruptionFrame,
     InterimTranscriptionFrame,
+    InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -1644,19 +2398,27 @@ from pipecat.frames.frames import (
     MetricsFrame,
     ProposedUserStartedSpeakingFrame,
     ProposedUserStoppedSpeakingFrame,
+    TranscriptionFrame,
     TTSSpeakFrame,
     TTSStoppedFrame,
-    TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
-from pipecat.metrics.metrics import ProcessingMetricsData, TextAggregationMetricsData, TTFBMetricsData
+from pipecat.metrics.metrics import (
+    ProcessingMetricsData,
+    TextAggregationMetricsData,
+    TTFBMetricsData,
+)
 from pipecat.observers.base_observer import BaseObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
+from pipecat.runner.types import RunnerArguments
 
 SENTINEL = "UNMUTE_METRIC"
 METRICS_ENV = "UNMUTE_DEV_METRICS"
 _METADATA = "unmute_dev"
+
+# An async event handler registered on a pipecat processor.
+_Handler = Callable[..., Awaitable[None]]
 
 # Handoffs and delegate controls get a row and no duration: they hand over to
 # a task rather than returning a result.
@@ -1668,19 +2430,27 @@ HANDOFF_CONTROLS = frozenset(
 
 
 def metrics_enabled() -> bool:
+    """Report whether the dev loop asked for metric events.
+
+    Returns:
+        True when `UNMUTE_DEV_METRICS` is set to anything but "" or "0".
+    """
     return os.environ.get(METRICS_ENV, "") not in ("", "0")
 
 
-def _emit(record: dict) -> None:
-    try:
+def _emit(record: dict[str, Any]) -> None:
+    """Print one record as a sentinel-prefixed JSON line.
+
+    Args:
+        record: The entity snapshot to send to the dev server.
+    """
+    # A closed local output cannot interrupt the voice pipeline.
+    with contextlib.suppress(OSError, ValueError):
         print(f"{SENTINEL} {json.dumps(record, separators=(',', ':'))}", flush=True)
-    except (OSError, ValueError):
-        # A closed local output cannot interrupt the voice pipeline.
-        pass
 
 
-def _error_kind(text):
-    """The exception's type name, and never the message beside it.
+def _error_kind(text: object) -> str:
+    """Return the exception's type name, and never the message beside it.
 
     A provider's error text quotes the request that failed, and a handler's
     quotes whatever it was working on, so neither belongs on a page that
@@ -1688,14 +2458,32 @@ def _error_kind(text):
     cannot carry any of that: it is an identifier from the code, so it is
     returned only when it reads as one. The message itself stays in the agent's
     own log, which `unmute dev` writes beside the build.
+
+    Args:
+        text: The error, or the text of one, as the framework reported it.
+
+    Returns:
+        The type name when it reads as an identifier, otherwise "an error".
     """
     head = str(text or "").split(":", 1)[0].strip()
     return head if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", head) else "an error"
 
 
-def _separator(previous, text, previous_includes_spaces, includes_spaces):
-    # Same boundary rule as Pipecat's concatenate_aggregated_text; retain the
-    # source chunks themselves, including their leading and trailing spaces.
+def _separator(previous: str, text: str, previous_includes_spaces: bool, includes_spaces: bool) -> str:
+    """Return the text to put between two transcript chunks.
+
+    Same boundary rule as Pipecat's concatenate_aggregated_text; retain the
+    source chunks themselves, including their leading and trailing spaces.
+
+    Args:
+        previous: The chunk before this one, "" when there is none.
+        text: The chunk being joined.
+        previous_includes_spaces: Whether the previous chunk carries its own spacing.
+        includes_spaces: Whether this chunk carries its own spacing.
+
+    Returns:
+        "" or a single space.
+    """
     if not previous or not text or (previous_includes_spaces and includes_spaces):
         return ""
     if not previous_includes_spaces and not includes_spaces:
@@ -1706,7 +2494,12 @@ def _separator(previous, text, previous_includes_spaces, includes_spaces):
 class DevReporter:
     """Observe native boundaries without replacing a service or its iterator."""
 
-    def __init__(self, runner_args):
+    def __init__(self, runner_args: RunnerArguments) -> None:
+        """Start reporting when the dev loop asked for it and named the call.
+
+        Args:
+            runner_args: The runner's arguments, whose body carries the dev call identity.
+        """
         self.enabled = metrics_enabled()
         body = getattr(runner_args, "body", None)
         call_id = body.get("unmute_dev_call_id") if isinstance(body, dict) else None
@@ -1718,33 +2511,50 @@ class DevReporter:
         self.call_id = call_id
         self._closed = False
         self._error = False
-        self._handlers = []
+        self._handlers: list[tuple[Any, str, _Handler]] = []
         self._serial = 0
-        self._records = {}
-        self._scope: contextvars.ContextVar[dict | None] = contextvars.ContextVar("unmute_dev_scope", default=None)
-        self._input = None
-        self._start_frames = set()
-        self._input_messages = {}
-        self._input_segments = {}
-        self._text_spacing = {}
-        self._interim = {}
-        self._requests = {}
-        self._tools = {}
-        self._tool_frames = set()
-        self._tts_contexts = {}
-        self._latency_observer = None
-        self._attached = set()
+        self._records: dict[tuple[str, str], dict[str, Any]] = {}
+        self._scope: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+            "unmute_dev_scope", default=None
+        )
+        self._input: str | None = None
+        self._start_frames: set[tuple[Any, ...]] = set()
+        self._input_messages: dict[str, str] = {}
+        self._input_segments: dict[str, list[str]] = {}
+        self._text_spacing: dict[str, bool] = {}
+        self._interim: dict[int, str] = {}
+        self._requests: dict[str, dict[str, Any]] = {}
+        self._tools: dict[tuple[int, str], dict[str, Any]] = {}
+        self._tool_frames: set[tuple[Any, ...]] = set()
+        self._tts_contexts: dict[tuple[int, str], list[str]] = {}
+        self._latency_observer: UserBotLatencyObserver | None = None
+        self._attached: set[tuple[int, str]] = set()
         if self.enabled:
             self._put("call", "call", {
                 "target": "pipecat", "state": "open", "input_boundaries": "partial",
                 "model_calls": "known", "generated_text": "available",
             })
 
-    def _id(self, prefix):
+    def _id(self, prefix: str) -> str:
+        """Return the next identifier for an entity kind.
+
+        Args:
+            prefix: The kind the identifier names, such as "llm" or "tool".
+
+        Returns:
+            The prefix and a call-wide serial number.
+        """
         self._serial += 1
         return f"{prefix}-{self._serial}"
 
-    def _put(self, kind, identity, payload):
+    def _put(self, kind: str, identity: str, payload: dict[str, Any]) -> None:
+        """Emit an entity snapshot unless it says nothing new.
+
+        Args:
+            kind: The entity kind, which is also the payload's key in the record.
+            identity: The entity's identifier.
+            payload: The entity's whole current state.
+        """
         if not self.enabled or self._closed:
             return
         old = self._records.get((kind, identity))
@@ -1759,31 +2569,69 @@ class DevReporter:
         self._records[kind, identity] = record
         _emit(record)
 
-    def _update(self, kind, identity, **changes):
+    def _update(self, kind: str, identity: str, **changes: Any) -> None:
+        """Merge changes into an entity already recorded and emit it.
+
+        Args:
+            kind: The entity kind.
+            identity: The entity's identifier.
+            **changes: The payload fields to set.
+        """
         old = self._records.get((kind, identity))
         if old:
             self._put(kind, identity, dict(old[kind], **changes))
 
-    def _frame_scope(self, frame):
+    def _frame_scope(self, frame: Frame) -> dict[str, Any]:
+        """Read the cause a frame carries, or nothing when it is not this call's.
+
+        Args:
+            frame: The frame whose metadata to read.
+
+        Returns:
+            A copy of the captured scope, empty when there is none.
+        """
         value = frame.metadata.get(_METADATA)
         return dict(value) if isinstance(value, dict) and value.get("call_id") == self.call_id else {}
 
-    def stamp(self, frame):
-        """Carry only captured cause, preserving all other frame metadata."""
+    def stamp(self, frame: Frame) -> Frame:
+        """Carry only captured cause, preserving all other frame metadata.
+
+        Args:
+            frame: The frame to mark with the current scope.
+
+        Returns:
+            The same frame.
+        """
         if self.enabled and not self._closed and _METADATA not in frame.metadata:
             scope = self._scope.get()
             if scope:
                 frame.metadata[_METADATA] = dict(scope)
         return frame
 
-    def activation_metadata(self, existing=None):
+    def activation_metadata(self, existing: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build activation metadata that carries the current cause.
+
+        Args:
+            existing: The metadata the activation already has.
+
+        Returns:
+            A copy of it with the current scope added when there is one.
+        """
         metadata = dict(existing or {})
         scope = self._scope.get()
         if self.enabled and not self._closed and scope:
             metadata[_METADATA] = dict(scope)
         return metadata
 
-    def enter_activation(self, args):
+    def enter_activation(self, args: dict[str, Any] | None) -> contextvars.Token[dict[str, Any] | None] | None:
+        """Adopt the cause an activation was started with.
+
+        Args:
+            args: The activation arguments, whose metadata may carry a scope.
+
+        Returns:
+            The token to hand to `exit_activation`, or None when reporting is off.
+        """
         if not self.enabled or self._closed:
             return None
         metadata = (args or {}).get("metadata") or {}
@@ -1792,13 +2640,28 @@ class DevReporter:
             scope = None
         return self._scope.set(scope)
 
-    def exit_activation(self, token):
+    def exit_activation(self, token: contextvars.Token[dict[str, Any] | None] | None) -> None:
+        """Restore the scope from before `enter_activation`.
+
+        Args:
+            token: What `enter_activation` returned.
+        """
         if token is not None:
             self._scope.reset(token)
 
-    def _listen(self, source, event):
-        def register(handler):
-            async def active(*args, **kwargs):
+    def _listen(self, source: Any, event: str) -> Callable[[_Handler], _Handler]:
+        """Build a decorator that registers an event handler until `finish`.
+
+        Args:
+            source: The processor or observer to listen on.
+            event: The event name.
+
+        Returns:
+            A decorator that registers the handler and returns the wrapped one.
+        """
+
+        def register(handler: _Handler) -> _Handler:
+            async def active(*args: Any, **kwargs: Any) -> None:
                 # An event task already scheduled at cleanup can still run.
                 if not self._closed:
                     await handler(*args, **kwargs)
@@ -1808,7 +2671,12 @@ class DevReporter:
             return active
         return register
 
-    def observers(self):
+    def observers(self) -> list[BaseObserver]:
+        """Return the observers to attach to the pipeline task.
+
+        Returns:
+            The latency and speech observers, created on first use, or none when reporting is off.
+        """
         if not self.enabled or self._closed:
             return []
         if self._latency_observer is not None:
@@ -1817,16 +2685,16 @@ class DevReporter:
         self._latency_observer = observer
 
         @self._listen(observer, "on_first_bot_speech_latency")
-        async def first_speech(_observer, seconds):
+        async def first_speech(_observer: Any, seconds: float | None) -> None:
             self._measure("call:first-speech", "first_speech", seconds, "pipecat-client-connected", scope="call")
 
         @self._listen(observer, "on_latency_measured")
-        async def reply_latency(_observer, seconds):
+        async def reply_latency(_observer: Any, seconds: float | None) -> None:
             self._measure(self._id("reply-latency"), "reply_latency", seconds, "pipecat-user-bot-latency",
                           reason="The native audio callback does not identify its response.")
 
         @self._listen(observer, "on_latency_breakdown")
-        async def breakdown_ready(_observer, breakdown):
+        async def breakdown_ready(_observer: Any, breakdown: Any) -> None:
             if breakdown.user_turn_secs is not None:
                 self._measure(self._id("turn-detection"), "turn_detection", breakdown.user_turn_secs,
                               "pipecat-vad-stop-to-turn-release",
@@ -1859,40 +2727,77 @@ class DevReporter:
 
         return [observer, _SpeechObserver(self)]
 
-    def speech_measured(self, seconds, response=None):
+    def speech_measured(self, seconds: float, response: str | None = None) -> None:
         """Record how long the bot spoke, which no service reports.
 
         A synthesizer reports when it produced audio, not how long the caller
         listened to it, and a live model reports neither. The transport's own
         speaking frames are the only place the length of a reply shows up.
+
+        Args:
+            seconds: How long the bot's speech lasted.
+            response: The reply the speech belongs to, when one is known.
         """
         self._measure(self._id("speech-duration"), "speech_duration", seconds,
                       "pipecat-bot-speaking-frames",
                       scope="response" if response else "unassigned", exchange_id=response,
                       reason=None if response else "The transport reports the bot's speech without a response identity.")
 
-    def speaking_response(self):
-        """The reply whose speech is starting, when exactly one is in flight.
+    def speaking_response(self) -> str | None:
+        """Return the reply whose speech is starting, when exactly one is in flight.
 
         Read when the speech starts, because synthesis for a reply can finish
         while the caller is still hearing it. Two replies queued behind each
         other, or a live model that runs no synthesis at all, leave the speech
         unassigned rather than attached to a reply by how recent it is.
+
+        Returns:
+            The reply's identifier, or None when there is not exactly one.
         """
         if not self.enabled or self._closed:
             return None
-        responses = set()
-        for operations in self._tts_contexts.values():
-            for operation in operations:
-                record = self._records.get(("operation", operation))
-                if record and record["operation"].get("exchange_id"):
-                    responses.add(record["operation"]["exchange_id"])
+        records = (
+            self._records.get(("operation", operation))
+            for operations in self._tts_contexts.values()
+            for operation in operations
+        )
+        responses = {
+            record["operation"]["exchange_id"] for record in records if record and record["operation"].get("exchange_id")
+        }
         return responses.pop() if len(responses) == 1 else None
 
-    def _measure(self, identity, metric, value, source, *, scope="unassigned", exchange_id=None,
-                 operation_id=None, state=None, reason=None, model=None, provider=None):
+    def _measure(
+        self,
+        identity: str,
+        metric: str,
+        value: float | None,
+        source: str,
+        *,
+        scope: str = "unassigned",
+        exchange_id: str | None = None,
+        operation_id: str | None = None,
+        state: str | None = None,
+        reason: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> None:
+        """Record one timing, measured or explained as unavailable.
+
+        Args:
+            identity: The measurement's identifier.
+            metric: What was timed, such as "first_response".
+            value: The duration in seconds, or None when it is not known.
+            source: Where the number came from.
+            scope: What the timing belongs to.
+            exchange_id: The exchange it belongs to, when known.
+            operation_id: The operation it belongs to, when known.
+            state: Overrides the measured or unavailable state.
+            reason: Why the value is missing or only partly attributed.
+            model: The model the service reported.
+            provider: The service that reported it.
+        """
         valid = isinstance(value, (float, int)) and math.isfinite(value) and value >= 0
-        payload = {
+        payload: dict[str, Any] = {
             "scope": scope, "metric": metric, "unit": "seconds", "source": source,
             "state": state or ("measured" if valid else "unavailable"),
         }
@@ -1900,13 +2805,25 @@ class DevReporter:
             payload["value"] = value
         elif value is not None:
             reason = "The SDK did not provide a finite nonnegative measurement."
-        for key, field in (("exchange_id", exchange_id), ("operation_id", operation_id),
-                           ("reason", reason), ("model", model), ("provider", provider)):
-            if field:
-                payload[key] = field
+        optional = {
+            "exchange_id": exchange_id,
+            "operation_id": operation_id,
+            "reason": reason,
+            "model": model,
+            "provider": provider,
+        }
+        payload |= {key: field for key, field in optional.items() if field}
         self._put("measurement", identity, payload)
 
-    def _service_metrics(self, processor, role, frame, cause):
+    def _service_metrics(self, processor: Any, role: str, frame: Frame, cause: dict[str, Any]) -> None:
+        """Record the timings a service's metrics frame carries.
+
+        Args:
+            processor: The service whose frame this is.
+            role: The service's role, "stt", "llm" or "tts".
+            frame: The frame passing the service; anything but a metrics frame is ignored.
+            cause: The scope the frame carries, which says what the timing belongs to.
+        """
         if not isinstance(frame, MetricsFrame):
             return
         if id(processor) in frame.metadata.get("unmute_dev_metric_inputs", []):
@@ -1940,19 +2857,28 @@ class DevReporter:
             if operation and data.model:
                 self._update("operation", operation, model=data.model)
 
-    def _attach(self, processor, role):
+    def _attach(self, processor: Any, role: str) -> bool:
+        """Watch a service once.
+
+        Args:
+            processor: The service to watch.
+            role: The service's role, "stt", "llm", "tts" or "user".
+
+        Returns:
+            False when reporting is off or the service is already watched.
+        """
         key = (id(processor), role)
         if not self.enabled or self._closed or key in self._attached:
             return False
         self._attached.add(key)
         if role in ("stt", "llm", "tts"):
             @self._listen(processor, "on_before_process_frame")
-            async def metrics_input(_processor, frame):
+            async def metrics_input(_processor: Any, frame: Frame) -> None:
                 if isinstance(frame, MetricsFrame):
                     frame.metadata.setdefault("unmute_dev_metric_inputs", []).append(id(processor))
 
             @self._listen(processor, "on_error")
-            async def source_error(_processor, frame):
+            async def source_error(_processor: Any, frame: ErrorFrame) -> None:
                 if frame.fatal or not processor.is_usable:
                     self._error = True
                     # Which service stopped working, and nothing it said. A
@@ -1963,7 +2889,12 @@ class DevReporter:
                                  reason=f"{processor.name} reported a fatal error.")
         return True
 
-    def _input_boundary(self, frame):
+    def _input_boundary(self, frame: Frame) -> None:
+        """Open an input exchange when the caller starts speaking.
+
+        Args:
+            frame: A frame passing the user aggregator.
+        """
         if isinstance(frame, UserStartedSpeakingFrame):
             sibling = getattr(frame, "broadcast_sibling_id", None)
             key = tuple(sorted((frame.id, sibling))) if sibling is not None else (frame.id,)
@@ -1979,7 +2910,13 @@ class DevReporter:
         # A speech-stop SystemFrame can overtake the final transcript. The
         # user aggregator's context emission below is the commit boundary.
 
-    def _associate_text(self, identity, input_id):
+    def _associate_text(self, identity: str, input_id: str) -> None:
+        """Attach a caller's text segment to an input and re-join its segments.
+
+        Args:
+            identity: The text segment's identifier.
+            input_id: The input exchange it belongs to.
+        """
         record = self._records.get(("text", identity))
         if not record:
             return
@@ -1998,16 +2935,24 @@ class DevReporter:
                 previous = text
                 previous_includes_spaces = includes_spaces
 
-    def observe_stt(self, stt):
+    def observe_stt(self, stt: Any) -> Any:
+        """Watch a transcriber's frames and record what the caller said.
+
+        Args:
+            stt: The speech-to-text service.
+
+        Returns:
+            The same service.
+        """
         if not self._attach(stt, "stt"):
             return stt
 
         @self._listen(stt, "on_before_process_frame")
-        async def stt_before(_processor, frame):
+        async def stt_before(_processor: Any, frame: Frame) -> None:
             self._scope.set(self._frame_scope(frame) or None)
 
         @self._listen(stt, "on_before_push_frame")
-        async def text_ready(_processor, frame):
+        async def text_ready(_processor: Any, frame: Frame) -> None:
             self.stamp(frame)
             self._service_metrics(stt, "stt", frame, self._frame_scope(frame))
             if not isinstance(frame, (InterimTranscriptionFrame, TranscriptionFrame)):
@@ -2039,12 +2984,18 @@ class DevReporter:
 
         return stt
 
-    def observe_aggregators(self, user, assistant):
+    def observe_aggregators(self, user: Any, assistant: Any) -> None:
+        """Watch the context aggregators, where a caller's turn is committed.
+
+        Args:
+            user: The user aggregator.
+            assistant: The assistant aggregator.
+        """
         if not self._attach(user, "user"):
             return
 
         @self._listen(user, "on_before_process_frame")
-        async def user_before(_processor, frame):
+        async def user_before(_processor: Any, frame: Frame) -> None:
             self._input_boundary(frame)
             scope = self._frame_scope(frame)
             # A proposed turn boundary is a caller frame too: when the transcriber
@@ -2063,7 +3014,7 @@ class DevReporter:
             self._scope.set(scope or None)
 
         @self._listen(user, "on_before_push_frame")
-        async def user_push(_processor, frame):
+        async def user_push(_processor: Any, frame: Frame) -> None:
             self._input_boundary(frame)
             scope = dict(self._scope.get() or {})
             if isinstance(frame, UserStartedSpeakingFrame) and self._input:
@@ -2078,15 +3029,23 @@ class DevReporter:
                     self._input = None
 
         @self._listen(assistant, "on_before_process_frame")
-        async def assistant_before(_processor, frame):
+        async def assistant_before(_processor: Any, frame: Frame) -> None:
             # A long-lived queue without captured cause stays unassigned.
             self._scope.set(self._frame_scope(frame) or None)
 
         @self._listen(assistant, "on_before_push_frame")
-        async def assistant_push(_processor, frame):
+        async def assistant_push(_processor: Any, frame: Frame) -> None:
             self.stamp(frame)
 
-    def _response(self, scope):
+    def _response(self, scope: dict[str, Any]) -> str:
+        """Return the reply a scope belongs to, opening one when it has none.
+
+        Args:
+            scope: The cause the current work carries.
+
+        Returns:
+            The response exchange's identifier.
+        """
         response = scope.get("response_id")
         if response and ("exchange", response) in self._records:
             return response
@@ -2103,7 +3062,14 @@ class DevReporter:
                       reason="Pipecat reports audio latency without a response identity.")
         return response
 
-    def _tool_event(self, llm, frame, cause):
+    def _tool_event(self, llm: Any, frame: Frame, cause: dict[str, Any]) -> None:
+        """Track a tool call from the frames the framework pushes for it.
+
+        Args:
+            llm: The service that pushed the frame.
+            frame: A function call frame; any other frame is ignored.
+            cause: The scope the frame carries.
+        """
         if not isinstance(frame, (FunctionCallInProgressFrame, FunctionCallResultFrame, FunctionCallCancelFrame)):
             return
         # A control hands over to a task instead of returning a result, so it
@@ -2120,11 +3086,9 @@ class DevReporter:
         if isinstance(frame, FunctionCallInProgressFrame):
             kind = "handoff" if control else "tool"
             operation = self._id(kind)
-            payload = {"type": kind, "name": frame.function_name, "state": "running"}
-            for field, value in (("exchange_id", cause.get("response_id")),
-                                 ("parent_operation_id", cause.get("operation_id"))):
-                if value:
-                    payload[field] = value
+            payload: dict[str, Any] = {"type": kind, "name": frame.function_name, "state": "running"}
+            linked = {"exchange_id": cause.get("response_id"), "parent_operation_id": cause.get("operation_id")}
+            payload |= {field: value for field, value in linked.items() if value}
             self._put("operation", operation, payload)
             self._tools[key] = {"id": operation, "scope": dict(cause), "started": time.monotonic(),
                                 "ended": False, "control": control}
@@ -2161,7 +3125,14 @@ class DevReporter:
         else:
             self._end_tool(tool, "returned")
 
-    def _end_tool(self, tool, state, reason=None):
+    def _end_tool(self, tool: dict[str, Any], state: str, reason: str | None = None) -> None:
+        """Settle a tool call once and time it.
+
+        Args:
+            tool: The tool's bookkeeping entry.
+            state: The state it ended in.
+            reason: What went wrong, when something did.
+        """
         if tool["ended"]:
             return
         tool["ended"] = True
@@ -2173,13 +3144,21 @@ class DevReporter:
                       "pipecat-function-call-frames", scope="operation", operation_id=operation,
                       exchange_id=tool["scope"].get("response_id"))
 
-    def observe_llm(self, llm):
+    def observe_llm(self, llm: Any) -> Any:
+        """Watch a language model service and record its requests and text.
+
+        Args:
+            llm: The language model service.
+
+        Returns:
+            The same service.
+        """
         if not self._attach(llm, "llm"):
             return llm
-        pending = set()
+        pending: set[str] = set()
 
         @self._listen(llm, "on_before_process_frame")
-        async def llm_before(_processor, frame):
+        async def llm_before(_processor: Any, frame: Frame) -> None:
             if isinstance(frame, (InterruptionFrame, CancelFrame)):
                 for operation in tuple(pending):
                     self._end_request(operation, "cancelled")
@@ -2203,17 +3182,17 @@ class DevReporter:
             self._scope.set(scope or None)
 
         @self._listen(llm, "on_before_push_frame")
-        async def llm_push(_processor, frame):
+        async def llm_push(_processor: Any, frame: Frame) -> None:
             self.stamp(frame)
             scope = self._frame_scope(frame)
             self._service_metrics(llm, "llm", frame, scope)
             self._tool_event(llm, frame, scope)
             if isinstance(frame, ErrorFrame) and scope.get("tool_operation_id"):
-                for tool in self._tools.values():
-                    if tool["id"] == scope["tool_operation_id"]:
-                        self._end_tool(tool, "failed", reason=f"The handler raised {_error_kind(frame.error)}.")
-                        return
-            operation = scope.get("operation_id")
+                failed = next((tool for tool in self._tools.values() if tool["id"] == scope["tool_operation_id"]), None)
+                if failed is not None:
+                    self._end_tool(failed, "failed", reason=f"The handler raised {_error_kind(frame.error)}.")
+                    return
+            operation: Any = scope.get("operation_id")
             request = self._requests.get(operation)
             if isinstance(frame, LLMFullResponseStartFrame) and not request:
                 # Some services generate without a concrete context invocation.
@@ -2244,7 +3223,13 @@ class DevReporter:
 
         return llm
 
-    def _end_request(self, operation, state):
+    def _end_request(self, operation: str, state: str) -> None:
+        """Settle a model request once and close what it left open.
+
+        Args:
+            operation: The request's operation identifier.
+            state: The state it ended in, "ended", "cancelled" or "failed".
+        """
         request = self._requests.get(operation)
         if not request or request["ended"]:
             return
@@ -2260,12 +3245,20 @@ class DevReporter:
         if state in ("cancelled", "failed"):
             self._update("exchange", request["scope"]["response_id"], state="interrupted" if state == "cancelled" else "incomplete")
 
-    def observe_tts(self, tts):
+    def observe_tts(self, tts: Any) -> Any:
+        """Watch a synthesizer and record its requests.
+
+        Args:
+            tts: The text-to-speech service.
+
+        Returns:
+            The same service.
+        """
         if not self._attach(tts, "tts"):
             return tts
 
         @self._listen(tts, "on_before_process_frame")
-        async def tts_before(_processor, frame):
+        async def tts_before(_processor: Any, frame: Frame) -> None:
             scope = self._frame_scope(frame)
             if isinstance(frame, TTSSpeakFrame) and not scope.get("direct_text_id"):
                 identity = self._id("direct-text")
@@ -2279,7 +3272,7 @@ class DevReporter:
             self._scope.set(scope or None)
 
         @self._listen(tts, "on_before_push_frame")
-        async def tts_push(_processor, frame):
+        async def tts_push(_processor: Any, frame: Frame) -> None:
             self.stamp(frame)
             self._service_metrics(tts, "tts", frame, self._frame_scope(frame))
             if isinstance(frame, TTSStoppedFrame):
@@ -2287,7 +3280,7 @@ class DevReporter:
                     self._update("operation", operation, state="ended")
 
         @self._listen(tts, "on_tts_request")
-        async def tts_request(_processor, context_id, _text):
+        async def tts_request(_processor: Any, context_id: str, _text: str) -> None:
             cause = self._scope.get() or {}
             operation = self._id("tts")
             payload = {"type": "tts", "name": tts.name, "state": "running"}
@@ -2298,7 +3291,13 @@ class DevReporter:
 
         return tts
 
-    def finish(self, *, error=False, reason=None):
+    def finish(self, *, error: bool = False, reason: str | None = None) -> None:
+        """Close every open entity, end the call and stop listening.
+
+        Args:
+            error: Whether the call ended in an error.
+            reason: What ended the call, in the words of whatever raised.
+        """
         if not self.enabled or self._closed:
             return
         if reason:
@@ -2322,9 +3321,9 @@ class DevReporter:
                     final_tts.add(response)
         completed = (final_text & final_tts) - unfinished
         for (kind, identity), record in list(self._records.items()):
-            if kind == "text" and record[kind]["state"] == "provisional":
-                self._update(kind, identity, state="incomplete")
-            elif kind == "operation" and record[kind]["state"] == "running":
+            if (kind == "text" and record[kind]["state"] == "provisional") or (
+                kind == "operation" and record[kind]["state"] == "running"
+            ):
                 self._update(kind, identity, state="incomplete")
             elif kind == "exchange" and record[kind]["state"] == "open":
                 self._update(kind, identity, state="ended" if identity in completed else "incomplete")
@@ -2359,13 +3358,23 @@ class _SpeechObserver(BaseObserver):
     land on a closed stretch and are ignored.
     """
 
-    def __init__(self, reporter):
+    def __init__(self, reporter: DevReporter) -> None:
+        """Time speech on behalf of a reporter.
+
+        Args:
+            reporter: The reporter that receives each measured stretch.
+        """
         super().__init__()
         self._reporter = reporter
-        self._started = None
-        self._response = None
+        self._started: float | None = None
+        self._response: str | None = None
 
-    async def on_push_frame(self, data):
+    async def on_push_frame(self, data: Any) -> None:
+        """Open or close the speaking stretch when the bot's speaking frames pass.
+
+        Args:
+            data: The observed frame push.
+        """
         if isinstance(data.frame, BotStartedSpeakingFrame):
             if self._started is None:
                 self._started = time.monotonic()
@@ -2376,31 +3385,13 @@ class _SpeechObserver(BaseObserver):
             self._reporter.speech_measured(time.monotonic() - started, response)
 
 
-def install_dev_metrics(runner_args):
+def install_dev_metrics(runner_args: RunnerArguments) -> DevReporter:
+    """Create the call's reporter.
+
+    Args:
+        runner_args: The runner's arguments, whose body carries the dev call identity.
+
+    Returns:
+        A reporter that is inert unless the dev loop enabled it.
+    """
     return DevReporter(runner_args)
-=== pcc-deploy.toml ===
-agent_name = "safe-core-fixture-pipecat"
-secret_set = "safe-core-fixture-pipecat-secrets"
-
-=== pyproject.toml ===
-[project]
-name = "safe-core-fixture"
-version = "0.1.0"
-description = "Generated Pipecat voice agent (compiled by unmute)."
-requires-python = ">=3.11"
-dependencies = [
-    "pipecat-ai[deepgram,openai,runner,silero,webrtc,websocket]==1.10.0",
-    "pipecat-slng>=0.5.2",
-    "python-dotenv>=1.0",
-
-    "httpx>=0.27",
-]
-
-# Same checkers, same pins, same bar as the LiveKit driver: ruff is declared
-# here so a generated project can run the lint gate its README promises, and
-# it is pinned because ruff 0.16 widened its default rule selection.
-[dependency-groups]
-dev = ["ruff==0.15.7", "ty"]
-
-[tool.uv]
-package = false

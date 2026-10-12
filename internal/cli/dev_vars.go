@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/slng-ai/unmute/internal/ir"
+	"github.com/slng-ai/unmute/internal/stateschema"
 )
 
 // CallStartEnv is the environment variable a local dev run uses to stand in for
@@ -88,7 +89,7 @@ func callStartPayload(agent *ir.Agent, flags []string) (string, error) {
 		}
 		variable, declared := agent.Variables[name]
 		if !declared {
-			return "", fmt.Errorf("--var %s: no variable %q is declared in agent.yaml", flag, name)
+			return "", fmt.Errorf("--var %s: State in state.py declares no %q", flag, name)
 		}
 		// Two kinds of variable read the dispatch payload, and the flag takes
 		// both: `source: call_start`, and a variable that declares no source at
@@ -108,6 +109,14 @@ func callStartPayload(agent *ir.Agent, flags []string) (string, error) {
 			return "", fmt.Errorf("--var %s: %q has source %s, so the runtime supplies it, not you", flag, name, variable.Source)
 		}
 		value, err := parseVarValue(variable.Type, raw)
+		if schema := variable.Schema; schema != nil && (schema.Kind == stateschema.KindObject || schema.Kind == stateschema.KindArray) {
+			// An object or a list arrives as JSON, which is what the runbook and
+			// the docs tell the reader to pass. Its fields are checked by the
+			// agent where the value is saved, as a dispatched one would be.
+			if jsonErr := json.Unmarshal([]byte(raw), &value); jsonErr != nil {
+				err = fmt.Errorf("%q is not JSON for a %s: %w", raw, variable.Schema, jsonErr)
+			}
+		}
 		if err != nil {
 			return "", fmt.Errorf("--var %s: %w", flag, err)
 		}

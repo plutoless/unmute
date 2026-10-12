@@ -14,7 +14,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/slng-ai/unmute/internal/ir"
 	"github.com/slng-ai/unmute/internal/spec"
 	"github.com/slng-ai/unmute/internal/target"
 )
@@ -124,6 +123,102 @@ var newAuthoringKey = regexp.MustCompile(`(?m)^\s*(?:-\s+)?(finish|opening|skip_
 // monitor's parentless `event_loop_blocked` span, which made each of three
 // concurrent calls arrive as three traces.
 //
+// And on 2026-09-30, for the whole emitted Python surface: every module the
+// code targets write now passes the ruff rule set and ty check its own
+// pyproject.toml declares (internal/generate/pyproject.go). Type hints and
+// Google docstrings on every function, comprehensions and built-ins where a
+// loop only collected, named constants, sorted imports, and the checker block
+// at the end of every pyproject.toml. Nothing here changes what a call does;
+// the few rewrites that are not byte-for-byte equivalent (a malformed local
+// call-facts seed now logs a warning instead of raising, fire-and-forget
+// tasks are held in a set so they cannot be collected mid-flight, a hosted
+// api_request tool imports the httpx it calls) are named in the commits.
+// One changes what a model reads, and only on Pipecat: a tool whose
+// description runs to several lines (every knowledge tool) wrote those lines
+// flush left, so docstring_parser never found the Args section below them. The
+// model read the Args block as the end of the description, and the parameter
+// went out with no description at all. The lines are indented now, the section
+// parses, and the parameter carries its description. LiveKit reads the same
+// text as before, measured on salon-concierge and pharmacy-refills.
+//
+// And again on 2026-09-30, for the file layout. The one entry file per code
+// target became a small project of modules: the entry (bot.py, agent.py)
+// beside settings.py, session.py, agents.py and call.py, the helpers under
+// utils/, and each prompt as its own Markdown file under prompts/, read into
+// the same constant it used to be written as. Each module's imports are
+// computed from what it uses (pylink.go). The code moved and did not change:
+// every prompt file is byte-identical to the literal it replaced, measured on
+// customer-intake and salon-concierge on both targets, and the text harnesses
+// ran both examples through to the end on both targets.
+//
+// And on 2026-10-02, for every Pipecat package with SLNG speech: the pin moved
+// to pipecat-slng>=0.6.0,<0.7, and 0.6.0 takes world_part as a required kwarg
+// instead of a base_url host. Pipecat now emits `world_part="eu-north"` where it
+// emitted `base_url="eu-north.api.slng.ai"`, and refuses a package without one,
+// because the bot would raise TypeError at import. Fourteen fixtures under
+// internal/testdata gained `world_part: eu-north` for that reason, which also
+// moves their LiveKit bytes (slng_base_url). LiveKit output for a package that
+// did not change is the same.
+//
+// And on 2026-10-02, for every package a dispatch or a carrier can fill: a
+// call-start value and a call fact are saved through _save_batch, so the
+// declared type checks them like every other value entering the state. Before,
+// LiveKit checked only the primitive (an object or a list was refused as "must
+// be string", a Phone was never checked) and Pipecat checked nothing. A bad
+// dispatched value still stops the call start; a fact that does not fit, such
+// as "anonymous" for a Phone, is now treated as missing instead of saved.
+// The same day, the declared state moved out of session.py into its own
+// state.py on both code targets. The code moved and did not change: apart from
+// imports, module docstrings and the generated-file list, every line of every
+// golden is the same multiset of lines before and after. Then the state class
+// became a Pydantic BaseModel on both targets instead of a dataclass: the same
+// fields, one annotation rule on both (a value with a default holds its type,
+// one without may be None), list defaults written as [] because Pydantic copies
+// them per call, and the confirmation and provenance records declared as
+// private attributes rather than set onto the object at run time. Last, the
+// model became the check: _STATE_TYPES and _plain are gone, a save is checked
+// once by building the batch into the state model, the state holds models
+// rather than dicts, plain data is made only at the edges (pydantic_core's
+// to_jsonable_python for a tool result or an injected object, to_json for a
+// prompt, which renders the same bytes json.dumps did), and an invalidated
+// pre-fetched value goes back to its default instead of to None.
+//
+// Finally, the same day, the author took the state over: it is written as a
+// Pydantic state.py, copied into the project as written, and the compiler no
+// longer writes a Python type of its own. The generated half is one module,
+// call_state.py, the same text on both targets: CallState subclasses the
+// author's State and carries the save, the confirmation record and the prompt
+// rendering as methods (the helper functions _save_result, _save_batch,
+// _state_text and the rest are gone), and StepResult builds each step's finish
+// model from State's own annotations, so a LiveKit finish is one raw schema
+// rather than a signature with a parameter per field. LiveKit's Userdata and
+// Pipecat's State are both CallState now. A package with no state.py and no
+// step emits no call_state.py, and moves only by the template comments that
+// named the old helpers. Behaviour is unchanged: the same refusal wording, the
+// same bound on a rendered value, the same all-or-nothing save. A text run of
+// customer-intake on both targets completed end to end. The runbook's
+// "Declared state" and "Input variables" sections were rewritten the same day to
+// describe that: state.py as the author's own file, call_state.py, CallState,
+// the ? mark on an assign, and JSON for a model or a list in --var. That moves
+// the README bytes of every package that keeps state or runs a step, and
+// nothing else.
+//
+// And on 2026-10-05, for every traced package: tracing is one collector. A new
+// utils/telemetry.py owns the tracer provider and the one backend it exports
+// to (Langfuse, Logfire or Coval), and utils/tracing.py only shapes the spans.
+// Every backend is plain OTLP, so LiveKit no longer installs the langfuse SDK,
+// and agent.py and bot.py call one setup_tracing whatever the provider. The
+// spans and their attributes are the same as before, except that Coval's
+// tool spans on Pipecat now come from the same TracedLLMWorker as the others.
+// The same day, Backend gained two hooks that only Logfire overrides, so a
+// Langfuse package's telemetry.py grew two methods that return nothing and its
+// spans are unchanged. Later that day one of them, transparent_spans, moved out
+// of every package's telemetry.py into LiveKit's tracing.py as WRAPPER_SPANS:
+// livekit's llm_node, tts_node and the spans inside them are no longer
+// exported on Langfuse or Logfire, and their children start one level up. Each
+// only repeated a row the trace keeps, and both backends counted llm_node as a
+// second model call. Pipecat and Coval packages move only by that deleted line.
+//
 // Each is named in the pull request that ships it. A regeneration without that
 // treatment is the thing this test exists to stop.
 func TestPackagesWritingNoNewKeyEmitTheSameBytes(t *testing.T) {
@@ -141,7 +236,7 @@ func TestPackagesWritingNoNewKeyEmitTheSameBytes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: load: %v", name, err)
 		}
-		agent, err := ir.Build(pkg)
+		agent, err := buildWithState(t, pkg)
 		if err != nil {
 			t.Fatalf("%s: build: %v", name, err)
 		}

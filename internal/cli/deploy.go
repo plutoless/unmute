@@ -52,7 +52,7 @@ func newDeployCmd() *cobra.Command {
 	var opts deployOptions
 	cmd := &cobra.Command{
 		Use:   "deploy [package-dir]",
-		Short: "Compile a package and push it to SLNG.",
+		Short: "Push a package to SLNG, or point a Twilio number at a twilio target you host.",
 		Long: "Compile a package and push it to SLNG.\n\n" +
 			"Validates the package, compiles each slng target, then pushes it with " +
 			"`voiceai agents push`. Nothing on SLNG is created until every check passes, " +
@@ -61,6 +61,13 @@ func newDeployCmd() *cobra.Command {
 			target.SlngPushCredentialEnv + " and then to whatever profile `voiceai login` " +
 			"stored. The organisation a push resolved is always printed, because an " +
 			"environment key and a stored profile can belong to different ones.\n\n" +
+			"With --target naming one twilio target, deploy instead points an existing Twilio " +
+			"number at the app you already host for it. It checks the number, checks that the " +
+			"host's /healthz names this build, sends /voice one signed request and compares the " +
+			"TwiML, then sets only the number's VoiceUrl and VoiceMethod. It uploads nothing and " +
+			"places no call. The account SID, Auth Token, number SID and public URL are read from " +
+			"the environment names the connection declares. The old route is saved to a private " +
+			"file under your user config directory before anything is written.\n\n" +
 			"With no package-dir, the package is the current directory, so you can cd into " +
 			"an agent and run this with no arguments.",
 		Args: cobra.MaximumNArgs(1),
@@ -73,7 +80,7 @@ func newDeployCmd() *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.StringSliceVar(&opts.targets, "target", nil, "slng target instance name (repeatable; default: every slng target)")
+	f.StringSliceVar(&opts.targets, "target", nil, "target instance name (repeatable for slng; default: every slng target; one twilio target per run)")
 	f.BoolVar(&opts.dryRun, "dry-run", false, "check everything and report, changing nothing")
 	f.BoolVar(&opts.runSamples, "run-samples", false, "run each tool's sample against your real dependencies")
 	f.StringVar(&opts.agentID, "agent-id", "", "update this agent, when more than one has the package's name")
@@ -86,9 +93,18 @@ func newDeployCmd() *cobra.Command {
 func runDeploy(cmd *cobra.Command, dir string, opts deployOptions) error {
 	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	printHeader(out, "deploy "+displayDir(dir))
-	agent, selected, err := loadPackage(dir, opts.targets)
+	agent, selected, err := loadPackage(cmd.Context(), dir, opts.targets)
 	if err != nil {
 		return fmt.Errorf("deploy %s: %w", dir, err)
+	}
+	// A twilio target is routed, not pushed, and never needs voiceai or an SLNG
+	// key. Decided here, before either is looked up.
+	twilio, err := twilioDispatch(cmd, opts.targets, selected)
+	if err != nil {
+		return fmt.Errorf("deploy %s: %w", dir, err)
+	}
+	if twilio != nil {
+		return runTwilioDeploy(cmd, dir, agent, *twilio, opts.dryRun)
 	}
 	pushable := make([]ir.Target, 0, len(selected))
 	for _, resolved := range selected {
@@ -103,6 +119,11 @@ func runDeploy(cmd *cobra.Command, dir string, opts deployOptions) error {
 	// Local refusals first. The slng target refuses things SLNG will not run, and
 	// every one of them is cheaper to hear now than as a rejected push.
 	report, validateErr := ir.Validate(agent, pushable, target.Default())
+	// A row's scope names what validate leaves to deploy. This is deploy, and it
+	// checks all of it next, so the line would only contradict the run.
+	for i := range report.PerTarget {
+		report.PerTarget[i].Scope = ""
+	}
 	printValidationReport(out, errOut, report)
 	if validateErr != nil {
 		return fmt.Errorf("deploy %s: %w", dir, validateErr)
@@ -127,8 +148,7 @@ func runDeploy(cmd *cobra.Command, dir string, opts deployOptions) error {
 	env := packageEnv(dir, errOut)
 	key, keySource := deployCredential(env)
 	if keySource == "" {
-		warnf(errOut, "neither %s nor %s is set, so the push uses whatever profile `%s` stored; "+
-			"check the organisation printed below is the one you meant\n",
+		warnf(errOut, "neither %s nor %s is set, so the push uses whatever profile `%s` stored\n",
 			target.SlngRouterKeyEnv, target.SlngPushCredentialEnv, target.SlngLoginCommand)
 	}
 
@@ -168,7 +188,6 @@ func runDeploy(cmd *cobra.Command, dir string, opts deployOptions) error {
 		if err != nil {
 			return fmt.Errorf("deploy %s: %w", dir, err)
 		}
-		account := deployment.Account
 
 		// The refusal comes before the write, and that ordering is the promise
 		// the whole command rests on: Generate returned an artifact and
@@ -237,7 +256,7 @@ func runDeploy(cmd *cobra.Command, dir string, opts deployOptions) error {
 		// preview would be the version just attached.
 		preview := opts
 		preview.dryRun = true
-		planned, err := runResolvedPush(bin, staged, env, key, account.Account.OrgID, preview)
+		planned, err := runResolvedPush(bin, staged, env, key, preview)
 		if err != nil {
 			// A push that printed nothing readable, given the two options an
 			// older tool has never heard of, is overwhelmingly an older tool:
@@ -248,6 +267,25 @@ func runDeploy(cmd *cobra.Command, dir string, opts deployOptions) error {
 		}
 		if err := checkResolutionContract(planned); err != nil {
 			return fmt.Errorf("deploy %s: slng target %q: %w", dir, resolved.Name, err)
+		}
+		// voiceai 0.1.21 and older want --expect-org, which this run no longer
+		// sends, and answer a document without the marker.
+		if planned.OrgOptional < 1 {
+			return fmt.Errorf("deploy %s: slng target %q: cannot push, the installed `%s` is too old. "+
+				"Nothing was changed: upgrade with `brew upgrade slng-ai/tap/%s`, then deploy again",
+				dir, resolved.Name, deployPushBinary, deployPushBinary)
+		}
+		// Only a task that lists a tool needs it: a package whose tasks list
+		// none pushes the same through any push tool.
+		taskTools := false
+		for _, task := range agent.Tasks {
+			taskTools = taskTools || len(task.Tools) > 0
+		}
+		if taskTools && planned.TaskTools < 1 {
+			return fmt.Errorf("deploy %s: slng target %q: cannot push, the installed `%s` is too old for tasks. "+
+				"It sends a task's tool names where SLNG wants attachment ids, so SLNG would refuse the agent. "+
+				"Nothing was changed: upgrade with `brew upgrade slng-ai/tap/%s`, then deploy again",
+				dir, resolved.Name, deployPushBinary, deployPushBinary)
 		}
 		readBaseline(runner, cache, &deployment, planned.Agent.ID)
 
@@ -274,7 +312,7 @@ func runDeploy(cmd *cobra.Command, dir string, opts deployOptions) error {
 		// real, and its result is what actually happened.
 		result := planned
 		if !opts.dryRun && len(planned.Blockers) == 0 && planned.OK {
-			result, err = runResolvedPush(bin, staged, env, key, account.Account.OrgID, opts)
+			result, err = runResolvedPush(bin, staged, env, key, opts)
 			if err != nil {
 				return fmt.Errorf("deploy %s: %w", dir, err)
 			}
@@ -303,7 +341,7 @@ func runDeploy(cmd *cobra.Command, dir string, opts deployOptions) error {
 		if !opts.dryRun && result.OK && len(result.Blockers) == 0 {
 			printAttachedVersions(out, resolved.Name, report)
 		}
-		if err := printPushResult(out, errOut, resolved.Name, deployName, outDir, keySource, account, result); err != nil {
+		if err := printPushResult(out, errOut, resolved.Name, deployName, outDir, keySource, result); err != nil {
 			return fmt.Errorf("deploy %s: %w", dir, err)
 		}
 		// After the push and only after it succeeded, because both of these are
@@ -322,31 +360,16 @@ func runDeploy(cmd *cobra.Command, dir string, opts deployOptions) error {
 
 // runResolvedPush hands the staged body to a push running in the guarded mode.
 //
-// Two flags separate it from runPush: --require-resolved, which says attach
-// exactly what this body carries rather than resolving names again, and
-// --expect-org, which says refuse before writing if the credential belongs to
-// another organisation. A matching profile name is not evidence of that: an
-// exported key and a stored profile can resolve to different organisations, and
-// nothing else on screen would say which one was written to.
+// One flag separates it from runPush: --require-resolved, which says attach
+// exactly what this body carries rather than resolving names again. No
+// organisation is named: the key decides it, and every call gets the same key.
 //
 // runPreflight used to live here. deployResolution owns that flow now, because
 // resolving a published version, checking a binding against it and reading the
 // agent it would replace are all part of the same ordered run, and splitting
 // them across two functions made the order the thing nobody could see.
-func runResolvedPush(bin, staged string, env []string, key, organisation string, opts deployOptions) (pushResult, error) {
-	// An empty organisation is refused here rather than sent. `--expect-org`
-	// with nothing after it is a malformed command line, and the guarded push
-	// refuses the flag's absence anyway, so the useful message is this one: the
-	// account could not be identified, which is a credential problem rather than
-	// a push problem.
-	if organisation == "" {
-		return pushResult{}, fmt.Errorf(
-			"this run could not establish which organisation it resolved, and a checked deployment has to name it so the push refuses if its own credential belongs to another: check the key or the profile with `%s`",
-			target.SlngWhoami)
-	}
-	return runPushWith(bin, staged, env, key, opts, []string{
-		target.SlngRequireResolvedFlag, target.SlngExpectOrgFlag, organisation,
-	})
+func runResolvedPush(bin, staged string, env []string, key string, opts deployOptions) (pushResult, error) {
+	return runPushWith(bin, staged, env, key, opts, []string{target.SlngRequireResolvedFlag})
 }
 
 // buildDeployReport assembles the report from what the run established.
@@ -363,8 +386,8 @@ func buildDeployReport(
 	// `end_call` be reported as attached and detached in one preview.
 	attaching := append(append([]resolvedTool(nil), deployment.Resolution.Tools...), deployment.Resolution.Builtins...)
 	return deployReport{
-		Target: name, Organisation: deployment.Account.String(),
-		Agent: deployName, AgentID: agentID, Action: action,
+		Target: name,
+		Agent:  deployName, AgentID: agentID, Action: action,
 		DryRun: dryRun, Outcome: outcome,
 		Tools: compareAttachments(attaching,
 			deployment.Proposed,
@@ -395,9 +418,10 @@ func printAttachedVersions(out io.Writer, name string, report deployReport) {
 }
 
 // noSlngTargetGuidance names what the package does declare and the block that
-// would make it deployable. `deploy` pushes to SLNG and nowhere else: the other
-// two targets emit a project somebody else's platform runs, which is
-// `unmute compile` plus that platform's own deploy step.
+// would make it deployable. `deploy` pushes to SLNG and nowhere else: livekit
+// and pipecat emit a project somebody else's platform runs, which is
+// `unmute compile` plus that platform's own deploy step. A twilio target is
+// hosted by the author, and deploy only routes a number to it when named.
 func noSlngTargetGuidance(selected []ir.Target) string {
 	declared := make([]string, 0, len(selected))
 	for _, resolved := range selected {
@@ -410,7 +434,10 @@ func noSlngTargetGuidance(selected []ir.Target) string {
 	return fmt.Sprintf("no slng target to deploy; this package declares %s\n"+
 		"  deploy pushes to SLNG, which hosts the agent itself. Add a target to targets.yaml:\n"+
 		"    targets:\n      slng:\n        provider: slng\n        deployment_region: eu-north\n"+
-		"  a livekit or pipecat target is compiled with `unmute compile` and deployed by that platform's own tool. An agora target is compiled with `unmute compile`; follow its generated README.md to run the browser service.", have)
+		"  a livekit or pipecat target is compiled with `unmute compile` and deployed by that platform's own tool.\n"+
+		"  a twilio target is compiled with `unmute compile` and hosted by you; then\n"+
+		"  `unmute deploy --target <name>` points your Twilio number at it.\n"+
+		"  an agora target is compiled with `unmute compile`; follow its generated README.md to run the browser service.", have)
 }
 
 func missingPushToolGuidance() string {
@@ -460,11 +487,6 @@ type pushResult struct {
 	Changed bool   `json:"changed"`
 	Error   string `json:"error"`
 
-	Organisation struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	} `json:"organisation"`
-
 	// Agent carries no name: `voiceai agents push --json` reports the id and the
 	// action only, and prints the name on its human stream alone. A Name field
 	// here decoded as "" on every run, and "" compares equal to a free trunk's
@@ -513,7 +535,27 @@ type pushResult struct {
 	// that does not honour `--require-resolved` resolves every name again and
 	// attaches whatever is newest, which is not the version this run checked.
 	ResolutionContract int `json:"resolution_contract"`
+
+	// TaskTools is 1 when the push writes the attachment ids it chose into the
+	// body's tasks. Zero is an older tool, which sends a task's tool names
+	// as they are, and SLNG refuses an agent whose task names a tool by name.
+	// A task with no tools is unaffected.
+	TaskTools int `json:"task_tools"`
+
+	// OrgOptional is 1 from voiceai 0.1.22, which takes no --expect-org. Zero
+	// is an older tool, which refuses a guarded push that names no
+	// organisation.
+	OrgOptional int `json:"org_optional"`
+
+	// InboundNotReady holds the push's stderr lines that say the agent saved
+	// but phone calls will not reach it (voiceai 0.1.21). They are the only
+	// stderr lines kept: the rest is progress, and the result is in the JSON.
+	InboundNotReady []string `json:"-"`
 }
+
+// inboundNotReadyPrefix starts the stderr line voiceai prints when the saved
+// agent's inbound dispatch refresh failed.
+const inboundNotReadyPrefix = "inbound calls are not ready"
 
 // runPush shells out and returns the parsed document. A non-zero exit is not an
 // error here: the tool exits 1 whenever it refuses, and the reason is in the
@@ -571,26 +613,18 @@ func runPushWith(bin, dir string, env []string, key string, opts deployOptions, 
 		return result, fmt.Errorf("`%s %s` produced no readable result: %s",
 			deployPushBinary, strings.Join(args, " "), detail)
 	}
+	for line := range strings.Lines(stderr.String()) {
+		if line = strings.TrimSpace(line); strings.HasPrefix(line, inboundNotReadyPrefix) {
+			result.InboundNotReady = append(result.InboundNotReady, line)
+		}
+	}
 	return result, nil
 }
 
 // printPushResult renders one push. Facts go to stdout in the `name: fact` form
 // the rest of the CLI uses; anything the author has to act on goes to stderr and
 // comes back as an error, so the exit code matches what was printed.
-func printPushResult(out, errOut io.Writer, name, deployName, outDir, keySource string, named slngAccount, result pushResult) error {
-	// The organisation is named once per target, by the preflight, before any
-	// finding: a finding is a statement about one account, so the reader needs
-	// the account first. Restating it here was a second identical line.
-	//
-	// What is worth saying is a *difference*. The preflight reads with the
-	// resolved credential and the push runs as its own process; if those ever
-	// land in different organisations, every check just performed was about
-	// somewhere else, and that is a warning rather than a duplicate.
-	if org := organisationLine(result); org != "" && !sameOrganisation(named, result) {
-		warnf(errOut, "%s: the checks ran against %s and the push reported %s. "+
-			"Those are different organisations, so what was checked is not what was written\n",
-			name, named, org)
-	}
+func printPushResult(out, errOut io.Writer, name, deployName, outDir, keySource string, result pushResult) error {
 	// Pushing REPLACES: a reference or field the package no longer names is
 	// removed, not merged. Which agent gets replaced is decided by the name in
 	// the body, so the warning quotes that name and not this target's: they were
@@ -613,28 +647,10 @@ func printPushResult(out, errOut io.Writer, name, deployName, outDir, keySource 
 	default:
 		printPushOutcome(out, name, result)
 	}
+	for _, line := range result.InboundNotReady {
+		warnf(errOut, "%s: the agent is saved, but %s\n", name, line)
+	}
 	return nil
-}
-
-// sameOrganisation compares by id, because that is the identity; a workspace can
-// be renamed. A push that reported no id at all cannot be compared, and an
-// unanswerable question is not a mismatch.
-func sameOrganisation(named slngAccount, result pushResult) bool {
-	if result.Organisation.ID == "" || named.Account.OrgID == "" {
-		return true
-	}
-	return named.Account.OrgID == result.Organisation.ID
-}
-
-func organisationLine(result pushResult) string {
-	switch {
-	case result.Organisation.Name != "" && result.Organisation.ID != "":
-		return fmt.Sprintf("%s (%s)", result.Organisation.Name, result.Organisation.ID)
-	case result.Organisation.Name != "":
-		return result.Organisation.Name
-	default:
-		return result.Organisation.ID
-	}
 }
 
 // printPushBlockers relays each blocker as the push tool stated it: the items,

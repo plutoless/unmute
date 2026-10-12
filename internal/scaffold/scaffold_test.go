@@ -171,9 +171,9 @@ func TestScaffoldAgreesWithItsOwnBuild(t *testing.T) {
 				if err := json.Unmarshal(files["compile-report.json"], &report); err != nil {
 					t.Fatal(err)
 				}
-				startupEnv := regexp.MustCompile(`(?s)REQUIRED_ENV = \[.*?\]`).Find(files["agent.py"])
+				startupEnv := regexp.MustCompile(`(?s)REQUIRED_ENV = \[.*?\]`).Find(files["settings.py"])
 				if startupEnv == nil {
-					t.Fatal("agent.py has no REQUIRED_ENV startup check")
+					t.Fatal("settings.py has no REQUIRED_ENV startup check")
 				}
 				for _, platform := range []string{"LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "LIVEKIT_URL"} {
 					if !slices.Contains(report.RequiredEnv, platform) {
@@ -449,10 +449,21 @@ func TestWriteVariablesAndTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"customer_id:", "source: call_start", "- lookup_customer"} {
+	for _, want := range []string{"- name: customer_id", "source: call_start", "- lookup_customer"} {
 		if !strings.Contains(string(agent), want) {
 			t.Errorf("agent.yaml missing %q:\n%s", want, agent)
 		}
+	}
+	// The type and the default live in state.py, not in agent.yaml.
+	if strings.Contains(string(agent), "type:") && strings.Contains(string(agent), "guest") {
+		t.Errorf("agent.yaml carries a type or default that belongs in state.py:\n%s", agent)
+	}
+	state, err := os.ReadFile(filepath.Join(dir, "state.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(state), `customer_id: str = "guest"`) {
+		t.Errorf("state.py missing customer_id with its default:\n%s", state)
 	}
 	tool, err := os.ReadFile(filepath.Join(dir, "tools", "lookup_customer.yaml"))
 	if err != nil {

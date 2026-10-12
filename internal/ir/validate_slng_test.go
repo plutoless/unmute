@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	packagespec "github.com/slng-ai/unmute/internal/spec"
+	"github.com/slng-ai/unmute/internal/stateschema"
 	targetcap "github.com/slng-ai/unmute/internal/target"
 )
 
@@ -15,7 +16,7 @@ import (
 // the error came from the thing it broke.
 func loadSlngCore(t *testing.T) *packagespec.Package {
 	t.Helper()
-	pkg, err := packagespec.Load(filepath.Join("..", "testdata", "slng_core"))
+	pkg, err := loadRecorded(filepath.Join("..", "testdata", "slng_core"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -602,83 +603,76 @@ func TestSlngRequiresAnExplicitMCPToolList(t *testing.T) {
 	}
 }
 
-// TestSlngRefusesADeclaredShape is FR-010 on the one target that cannot express
-// declared state, and the message has to say what to write instead.
-//
-// A shape is a generated Pydantic class with a validator, and the validation
-// runs where the value enters the state, which is inside a module this target
-// never writes. So the refusal is about the missing module, not about the
-// missing tasks: an author who flattens the shape into primitives gets a
-// package that deploys.
-func TestSlngRefusesADeclaredShape(t *testing.T) {
-	agent := slngAgent(t)
-	agent.Shapes = map[string]Shape{"Appointment": {
-		Name:   "Appointment",
-		Fields: []Field{{Name: "scheduled_date", Type: &TypeRef{Shaped: ShapedDate}}},
+// TestSlngRefusesAStructuredDispatchValue: SLNG checks a typed runtime
+// variable, but a value the dispatch fills is a template variable, held as
+// text. A type there would be checked by nothing, so it is refused and the
+// message says the two ways out.
+func TestSlngRefusesAStructuredDispatchValue(t *testing.T) {
+	model := &stateschema.Type{Kind: stateschema.KindObject, Model: "Contact", Fields: []stateschema.Field{
+		{Name: "name", Type: stringType},
 	}}
-	variable := agent.Variables["caller_phone"]
-	variable.Shape = &TypeRef{List: &TypeRef{Shape: "Appointment"}}
-	agent.Variables["caller_phone"] = variable
-
-	row := validateSlng(t, agent)
-	wantSlngError(t, row, "slng target pushes a spec and emits no module of its own",
-		"has nowhere to be declared or checked", "compile to livekit or pipecat")
-}
-
-// TestSlngRefusesAShapedTextType is the second row, refused for the same reason
-// and fixed differently: this one asks the author to give up a check rather
-// than to flatten a group of fields, so it says so separately.
-func TestSlngRefusesAShapedTextType(t *testing.T) {
-	agent := slngAgent(t)
-	variable := agent.Variables["caller_phone"]
-	variable.Shape = &TypeRef{Shaped: ShapedPhone}
-	agent.Variables["caller_phone"] = variable
-
-	row := validateSlng(t, agent)
-	wantSlngError(t, row, "a value whose text has a validated shape",
-		"declare the value as one of the primitive types")
-}
-
-// TestSlngRefusesAnEmailType is the same pair of rows reached by the two email
-// types, and it is separate because each arrives by its own route.
-//
-// EmailStr is a text type with a validated shape, so it rides the shaped row.
-// NameEmail is a shape the compiler supplies, and the only reason it rides the
-// declared-shape row is that internal/ir seeds it into the catalog when a type
-// names it: a reference with no entry there would leave the catalog empty, and
-// the row that starts from whether the catalog is empty would pass a package
-// this target cannot emit.
-func TestSlngRefusesAnEmailType(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		shapes  map[string]Shape
-		ref     *TypeRef
-		phrases []string
+		name string
+		typ  *stateschema.Type
 	}{
-		{
-			name:    "the plain address",
-			ref:     &TypeRef{Shaped: ShapedEmail},
-			phrases: []string{"a value whose text has a validated shape", "declare the value as one of the primitive types"},
-		},
-		{
-			name:    "the name and address pair",
-			shapes:  map[string]Shape{"NameEmail": builtinShapes["NameEmail"]},
-			ref:     &TypeRef{Shape: "NameEmail"},
-			phrases: []string{"a value with a declared shape", "compile to livekit or pipecat"},
-		},
+		{"a model", model},
+		{"a list", listOf(stringType)},
+		{"a closed set", &stateschema.Type{Kind: stateschema.KindString, Enum: []string{"a", "b"}}},
+		{"a checked text type", &stateschema.Type{Kind: stateschema.KindString, Format: "email"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := slngAgent(t)
-			if tc.shapes != nil {
-				agent.Shapes = tc.shapes
-			}
 			variable := agent.Variables["caller_phone"]
-			variable.Shape = tc.ref
+			variable.Schema = tc.typ
 			agent.Variables["caller_phone"] = variable
 
 			row := validateSlng(t, agent)
-			wantSlngError(t, row, tc.phrases...)
+			wantSlngError(t, row, `variable "caller_phone"`, "filled by the dispatch", "save it with a task's assign:")
 		})
+	}
+}
+
+// TestSlngTypeSpellsEachStateType is the grammar SLNG's parse_variable_type
+// reads, one row per kind, and the refusals for the kinds it has no word for.
+func TestSlngTypeSpellsEachStateType(t *testing.T) {
+	for _, tc := range []struct {
+		typ  *stateschema.Type
+		want string
+	}{
+		{&stateschema.Type{Kind: stateschema.KindString}, "str"},
+		{&stateschema.Type{Kind: stateschema.KindNumber, Nullable: true}, "float | None"},
+		{&stateschema.Type{Kind: stateschema.KindString, Format: "phone", Nullable: true}, "Phone | None"},
+		{&stateschema.Type{Kind: stateschema.KindString, Format: "name-email"}, "NameEmail"},
+		{&stateschema.Type{Kind: stateschema.KindString, Pattern: slngIDPattern}, "Id"},
+		{&stateschema.Type{Kind: stateschema.KindString, Enum: []string{"a", "b"}}, `Literal["a", "b"]`},
+		{listOf(&stateschema.Type{Kind: stateschema.KindObject, Model: "Contact"}), "list[Contact]"},
+	} {
+		if got, err := SlngType(tc.typ); err != nil || got != tc.want {
+			t.Errorf("SlngType(%s) = %q, %v; want %q", tc.typ, got, err, tc.want)
+		}
+	}
+	for _, typ := range []*stateschema.Type{
+		{Kind: stateschema.KindString, Format: "date-time"},
+		{Kind: stateschema.KindString, Pattern: "^[0-9]+$"},
+		{Kind: stateschema.KindObject},
+	} {
+		if got, err := SlngType(typ); err == nil {
+			t.Errorf("SlngType(%s) = %q, want a refusal", typ, got)
+		}
+	}
+}
+
+// TestSlngAcceptsAPlainValueThatMayBeNone: None on a plain field is only "no
+// value yet", which a hosted agent renders as it renders an empty string.
+func TestSlngAcceptsAPlainValueThatMayBeNone(t *testing.T) {
+	agent := slngAgent(t)
+	variable := agent.Variables["caller_phone"]
+	variable.Schema = nullable(stringType)
+	agent.Variables["caller_phone"] = variable
+	for _, message := range validateSlng(t, agent).Errors {
+		if strings.Contains(message, "filled by the dispatch") {
+			t.Errorf("a plain str | None was refused: %q", message)
+		}
 	}
 }
 
@@ -688,7 +682,7 @@ func TestSlngRefusesAnEmailType(t *testing.T) {
 func TestSlngAcceptsAPackageDeclaringNothingStructured(t *testing.T) {
 	row := validateSlng(t, slngAgent(t))
 	for _, message := range row.Errors {
-		if strings.Contains(message, "emits no module of its own") {
+		if strings.Contains(message, "filled by the dispatch") {
 			t.Errorf("a package declaring nothing structured was refused: %q", message)
 		}
 	}
@@ -784,7 +778,7 @@ func TestSlngAcceptsTheValuesAnOverrideIsMadeOf(t *testing.T) {
 // package targeting a code target could write, which is the opposite of what
 // this feature is for.
 func TestCodeTargetsKeepTheirOwnExpressionRules(t *testing.T) {
-	pkg, err := packagespec.Load(filepath.Join("..", "testdata", "slng_hosted_code"))
+	pkg, err := loadRecorded(filepath.Join("..", "testdata", "slng_hosted_code"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -811,38 +805,88 @@ func TestCodeTargetsKeepTheirOwnExpressionRules(t *testing.T) {
 	}
 }
 
-// The three keys spec 010 adds are code-target keys, for the same reason every
-// other task key is: the slng target writes one agent with one prompt, so there
-// is no step to end, no step to skip, and no step opening to choose.
-//
-// Each is its own row because each is fixed differently, and a row that said
-// "tasks are refused" would be the refusal the author already had.
-func TestSlngRefusesFinish(t *testing.T) {
-	agent := slngAgent(t)
-	if agent.Tasks == nil {
-		agent.Tasks = map[string]Task{}
+// slngTasksAgent is the fixture that uses every task feature the slng target
+// writes, and validates clean.
+func slngTasksAgent(t *testing.T) *Agent {
+	t.Helper()
+	pkg, err := loadRecorded(filepath.Join("..", "testdata", "slng_tasks"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	agent.Tasks["take_booking"] = Task{
-		Instructions: "Book the caller in.",
-		Finish:       []TerminalTool{{Tool: "book_it", Success: map[string][]string{"status": {"booked"}}}},
+	agent, err := Build(pkg)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	row := validateSlng(t, agent)
-	wantSlngError(t, row, "a step that ends on its tool", "compile to livekit or pipecat")
+	return agent
 }
 
-func TestSlngRefusesAGroupSkip(t *testing.T) {
-	agent := slngAgent(t)
-	if agent.TaskGroups == nil {
-		agent.TaskGroups = map[string]TaskGroup{}
+func TestSlngTasksValidatesClean(t *testing.T) {
+	row := validateSlng(t, slngTasksAgent(t))
+	if len(row.Errors) > 0 || len(row.Warnings) > 0 {
+		t.Fatalf("the slng tasks fixture must be clean: errors=%#v warnings=%#v", row.Errors, row.Warnings)
 	}
-	agent.TaskGroups["book"] = TaskGroup{
-		Steps:        []GroupStep{{Task: "verify", SkipWhenConfirmed: "caller_phone"}},
-		ContextScope: ContextShared, Then: GroupReturn, Merge: GroupMergeResults,
-	}
+}
 
-	row := validateSlng(t, agent)
-	wantSlngError(t, row, "a skippable group step", "compile to livekit or pipecat")
+// TestSlngRefusesWhatItsTaskContractRefuses: each value SLNG's task contract
+// does not accept, one row each, because each one is fixed differently.
+func TestSlngRefusesWhatItsTaskContractRefuses(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		edit  func(*Agent)
+		wants []string
+	}{
+		{"a finish rule", func(a *Agent) {
+			task := a.Tasks["take_booking"]
+			task.Finish = []TerminalTool{{Tool: "check_availability", Success: map[string][]string{"status": {"free"}}}}
+			a.Tasks["take_booking"] = task
+		}, []string{"cannot check a step's tool result", "compile to livekit or pipecat"}},
+		{"a per-task model", func(a *Agent) {
+			task := a.Tasks["take_booking"]
+			task.Model = "reasoning"
+			a.Tasks["take_booking"] = task
+		}, []string{"agent's one model"}},
+		{"a summary history", func(a *Agent) {
+			task := a.Tasks["take_booking"]
+			task.Context = TaskContext{History: HistorySummary, Summarizer: "reasoning"}
+			a.Tasks["take_booking"] = task
+		}, []string{"does not summarize a context"}},
+		{"two announce lines", func(a *Agent) {
+			task := a.Tasks["take_booking"]
+			task.Announce = []string{"One sec.", "Let me look."}
+			a.Tasks["take_booking"] = task
+		}, []string{`task "take_booking" has 2 announce lines`}},
+		{"an optional assign", func(a *Agent) {
+			task := a.Tasks["take_booking"]
+			task.Assign = []AssignTo{{Var: "booking", Field: "booking", Optional: true}}
+			a.Tasks["take_booking"] = task
+		}, []string{"assigns result.booking?", "no optional marker"}},
+		{"a group that ends the call", func(a *Agent) {
+			group := a.TaskGroups["book"]
+			group.Then = GroupEnd
+			a.TaskGroups["book"] = group
+		}, []string{`task group "book" ends with then: end`}},
+		{"a confirming step with no when", func(a *Agent) {
+			variable := a.Variables["phone_number"]
+			variable.Confirm = "take_booking"
+			a.Variables["phone_number"] = variable
+		}, []string{`confirmed by "take_booking"`, "own when: sentence"}},
+		{"a saved value with no description", func(a *Agent) {
+			variable := a.Variables["notes"]
+			variable.Description = ""
+			a.Variables["notes"] = variable
+		}, []string{`variable "notes" has no description`}},
+		{"a saved type SLNG has no word for", func(a *Agent) {
+			variable := a.Variables["notes"]
+			variable.Schema = listOf(&stateschema.Type{Kind: stateschema.KindString, Format: "date-time"})
+			a.Variables["notes"] = variable
+		}, []string{`variable "notes"`, "has no SLNG type"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := slngTasksAgent(t)
+			tc.edit(agent)
+			wantSlngError(t, validateSlng(t, agent), tc.wants...)
+		})
+	}
 }
 
 // A tool announcement compiles to the attachment's one pre_action_message, so
@@ -873,15 +917,4 @@ func TestSlngKeepsOneAnnounceLine(t *testing.T) {
 	if joined := strings.Join(row.Errors, "\n"); strings.Contains(joined, "announce:") {
 		t.Errorf("one announce line was refused:\n%s", joined)
 	}
-}
-
-func TestSlngRefusesAListeningOpening(t *testing.T) {
-	agent := slngAgent(t)
-	if agent.Tasks == nil {
-		agent.Tasks = map[string]Task{}
-	}
-	agent.Tasks["take_note"] = Task{Instructions: "Take a note.", Opening: OpeningListen, Announce: []string{"What shall I pass on?"}}
-
-	row := validateSlng(t, agent)
-	wantSlngError(t, row, "a step opening", "compile to livekit or pipecat")
 }

@@ -85,11 +85,31 @@ def prompt_of(agent_obj) -> str:
     return (getattr(agent_obj, "instructions", "") or "").replace("\n", " | ")
 
 
+ENDED: list[str] = []
+
+
+class TextJob:
+    """The job a text run does not have, for end_call to close.
+
+    LiveKit's EndCallTool closes the job once the session closes, and with no
+    job it raised "no job context found" and the run hung until settle() timed
+    out. This records the end instead, so the run stops the way a call does.
+    """
+
+    def add_shutdown_callback(self, callback) -> None:
+        """Drop it: there is no room to delete."""
+
+    def shutdown(self, reason: str = "") -> None:
+        ENDED.append(reason)
+
+
 async def settle(session, timeout: float = 60.0) -> None:
-    """Wait until the agent has replied and is listening again."""
+    """Wait until the agent has replied and is listening again, or has hung up."""
     quiet = 0
     for _ in range(int(timeout / 0.1)):
         await asyncio.sleep(0.1)
+        if ENDED:
+            return
         quiet = quiet + 1 if session.agent_state == "listening" else 0
         if quiet >= 10:
             return
@@ -97,11 +117,9 @@ async def settle(session, timeout: float = 60.0) -> None:
 
 
 def state_of(userdata) -> str:
-    public = {
-        name: value
-        for name, value in vars(userdata).items()
-        if not name.startswith("_")
-    }
+    # The state is a Pydantic model holding models, so dump it in JSON mode
+    # rather than printing each saved object's repr.
+    public = userdata.model_dump(mode="json")
     public["_unconfirmed"] = sorted(getattr(userdata, "_unconfirmed", set()))
     return json.dumps(public, ensure_ascii=False, default=str)
 
@@ -156,8 +174,32 @@ async def run(args: argparse.Namespace) -> None:
     os.environ["UNMUTE_CALL_FACTS"] = json.dumps({"from_number": args.from_number})
     seed_unused_env(package, build)
 
-    import agent as generated  # noqa: PLC0415 - after sys.path and cwd are set
+    # The entry module first: importing it loads the package's .env and runs
+    # the startup check, the way `start agent.py` does. The agents, the call
+    # state and the model constructor each live in their own module beside it.
+    import agent  # noqa: F401, PLC0415 - after sys.path and cwd are set
+    import agents as generated  # noqa: PLC0415
+    import call  # noqa: PLC0415
+    import session as state  # noqa: PLC0415
     from livekit.agents import AgentSession  # noqa: PLC0415
+    from livekit.agents.beta.tools import end_call as end_call_tool  # noqa: PLC0415
+    from livekit.agents.utils import http_context  # noqa: PLC0415
+
+    try:
+        import call_state  # noqa: PLC0415
+
+        userdata = call_state.CallState()
+    except ModuleNotFoundError:
+        # A package with no state.py emits no call_state and keeps nothing.
+        from pydantic import BaseModel  # noqa: PLC0415
+
+        class NoState(BaseModel):
+            pass
+
+        userdata = NoState()
+
+    # The tool imported the name itself, so this is where it is replaced.
+    end_call_tool.get_job_context = TextJob
 
     entry = getattr(generated, "ENTRY_AGENT_CLASS", None)
     if entry is None:
@@ -169,8 +211,8 @@ async def run(args: argparse.Namespace) -> None:
             # those are C-level types inspect.signature refuses outright: a
             # package declaring an EmailStr imports email_validator, whose
             # EmailNotValidError raised ValueError here and killed the run before
-            # the first turn. The entry agent is defined in the generated module,
-            # so anything from elsewhere is not it.
+            # the first turn. The entry agent is defined in the generated agents
+            # module, so anything from elsewhere is not it.
             if getattr(cls, "__module__", None) != generated.__name__:
                 return False
             try:
@@ -186,10 +228,23 @@ async def run(args: argparse.Namespace) -> None:
             api_key=os.environ["OPENAI_API_KEY"], model=args.model, reasoning_effort="none"
         )
     else:
-        llm = compiled_llm(build / "agent.py", vars(generated))
-    async with AgentSession(userdata=generated.Userdata(), llm=llm) as session:
+        llm = compiled_llm(build / "call.py", vars(call))
+    # Every agent and step shares this one LLM, so its per-request metrics are
+    # the whole call. Total is what Langfuse shows: cached input counts in full.
+    usage = {"requests": 0, "prompt": 0, "cached": 0, "completion": 0}
+
+    def count(m) -> None:
+        usage["requests"] += 1
+        usage["prompt"] += m.prompt_tokens
+        usage["cached"] += m.prompt_cached_tokens
+        usage["completion"] += m.completion_tokens
+
+    llm.on("metrics_collected", count)
+    # The worker opens this HTTP context on a deployed call. The Responses
+    # websocket transport (`use_websocket: true`) refuses to run without it.
+    async with http_context.open(), AgentSession(userdata=userdata, llm=llm) as session:
         # A package that declares no `prefetch:` emits no _prefetch at all.
-        prefetch = getattr(generated, "_prefetch", None)
+        prefetch = getattr(state, "_prefetch", None)
         if prefetch is not None:
             await prefetch(session.userdata, None)
             print("prefetch:", state_of(session.userdata))
@@ -235,8 +290,14 @@ async def run(args: argparse.Namespace) -> None:
             print("   active agent:", type(current).__name__)
             print("   active prompt:", prompt_of(current))
             print("   state:", state_of(session.userdata))
+            if ENDED:
+                left = len(args.line) - i
+                print(f"   [end] the agent ended the call; {left} caller line(s) not sent")
+                break
         print("\n=== final state")
         print(state_of(session.userdata))
+        total = usage["prompt"] + usage["completion"]
+        print("\n=== usage", "  ".join(f"{k}={v}" for k, v in usage.items()), f"total={total}")
 
 
 def compiled_llm(module: Path, namespace: dict):

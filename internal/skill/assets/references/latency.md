@@ -103,7 +103,7 @@ is no models listing endpoint, so a route has to be tried.
 ### 3. Hold the TTS socket open
 
 Both targets. LiveKit since the SLNG plugin shipped it, Pipecat since
-`pipecat-slng` 0.5.2, which is the catalog floor.
+`pipecat-slng` 0.5.2. The catalog floor is now 0.6.0.
 
 Off by default. It removes the provider's session setup from the front of every
 segment, which shows up most on the first segment of a call and on the fastest
@@ -173,7 +173,7 @@ in every compiled package whether or not it was asked for), and then the turn
 waits for the transcriber to mark the transcript final. `endpointing_delay` sets
 the first stage and `pace` sets the second.
 
-Both stages are spelled `stop_secs` in the emitted `bot.py` and they are
+Both stages are spelled `stop_secs` in the emitted `call.py` and they are
 different fields: `VADParams(stop_secs=...)` is the silence window,
 `SmartTurnParams(stop_secs=...)` is the classifier's ceiling.
 
@@ -187,7 +187,7 @@ with LiveKit's column; the inconsistency is the finding.
 That third stage was the largest until recently. A transcriber that never marks a
 transcript final leaves Pipecat waiting out a safety-net timer, one second by
 default, however fast the transcript arrived. Every Unmute package hit that until
-`pipecat-slng` 0.5.0; the Pipecat catalog rows now require 0.5.2 or newer. If you are
+`pipecat-slng` 0.5.0; the Pipecat catalog rows now require 0.6.0 or newer. If you are
 reading old advice that says `stop_secs` is the real window on Pipecat, that was
 true of the setting and not of the wait.
 
@@ -231,8 +231,8 @@ three spellings across three hosts (2026-08-27, nine requests) and answers only 
 its own `/no_think` directive in the prompt. For a model like that, use
 `prompt_suffix` on the think entry, which the compiler appends to every system
 prompt that binding sends. It is prompt text, so it works wherever the model reads
-its instructions, and you can read what it did in the emitted `*_PROMPT`
-constants.
+its instructions, and you can read what it did in the emitted `prompts/*.md`
+files.
 
 Read the number, not the setting. `usage.completion_tokens_details.reasoning_tokens`
 on a live response is what says whether thinking is actually off: 0 or 1 means it

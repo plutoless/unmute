@@ -21,7 +21,7 @@ import (
 var updatePipecatV1 = flag.Bool("update-pipecat", false, "rewrite the pipecat v1 golden")
 
 func TestPipecatV1LoggingIsConfiguredAtFirstBot(t *testing.T) {
-	bot := artifactFile(t, exampleArtifact(t, "simple-prompt", ir.ProviderPipecat), "bot.py")
+	bot := artifactFile(t, exampleArtifact(t, "simple-prompt", ir.ProviderPipecat), agentSource)
 	for _, want := range []string{
 		"import sys",
 		"from loguru import logger",
@@ -34,12 +34,21 @@ func TestPipecatV1LoggingIsConfiguredAtFirstBot(t *testing.T) {
 	if got := strings.Count(bot, "logger.remove()"); got != 1 {
 		t.Errorf("bot.py removes Loguru sinks %d times, want one guarded call", got)
 	}
-	if !strings.Contains(bot, "_LOGGING_CONFIGURED = False\n\n\ndef _configure_logging() -> None:\n    global _LOGGING_CONFIGURED\n    if _LOGGING_CONFIGURED:\n        return") {
+	if !strings.Contains(bot, "_LOGGING_CONFIGURED = False\n\n\ndef _configure_logging() -> None:\n    \"\"\"Send log output to stderr at UNMUTE_LOG_LEVEL, once per process.\"\"\"\n    global _LOGGING_CONFIGURED\n    if _LOGGING_CONFIGURED:\n        return") {
 		t.Error("bot.py does not guard process-wide logging configuration")
 	}
 	const entry = "async def bot(runner_args: RunnerArguments) -> None:"
 	entryAt := strings.Index(bot, entry)
-	if entryAt < 0 || !strings.HasPrefix(strings.TrimSpace(bot[entryAt+len(entry):]), "_configure_logging()") {
+	// The docstring opens the function; the first statement after it must be
+	// the logging call.
+	body := ""
+	if entryAt >= 0 {
+		body = bot[entryAt+len(entry):]
+		if _, after, ok := strings.Cut(body, "\n    \"\"\"\n"); ok {
+			body = after
+		}
+	}
+	if entryAt < 0 || !strings.HasPrefix(strings.TrimSpace(body), "_configure_logging()") {
 		t.Error("bot.py does not configure logging at the first bot entry")
 	}
 }
@@ -52,7 +61,7 @@ func TestPipecatV1BuiltinEndCallTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,9 +81,9 @@ func TestPipecatV1BuiltinEndCallTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
-		"async def end_call(self, params: FunctionCallParams):",
+		"async def end_call(self, params: FunctionCallParams) -> None:",
 		`"content": "Thank the caller and say goodbye."`,
 		"await params.result_callback({\"ended\": True})\n        await params.pipeline_worker.end()",
 	} {
@@ -86,7 +95,8 @@ func TestPipecatV1BuiltinEndCallTool(t *testing.T) {
 		t.Error("builtin tool must not emit a webhook POST")
 	}
 	body := bot[strings.Index(bot, "async def end_call("):]
-	if end := strings.Index(body, "\n\n"); end >= 0 {
+	// The method ends at two blank lines; a docstring holds single blank ones.
+	if end := strings.Index(body, "\n\n\n"); end >= 0 {
 		body = body[:end]
 	}
 	if !strings.Contains(body, "run_llm=False") || strings.Contains(body, "run_llm=True") {
@@ -102,7 +112,7 @@ func mcpPipecatAgent(t *testing.T, tool ir.Tool) *ir.Agent {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +153,7 @@ func TestPipecatV1MCPToolSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"from mcp.client.session_group import StreamableHttpParameters",
 		"from pipecat.services.mcp_service import MCPClient",
@@ -184,7 +194,7 @@ func TestPipecatV1MCPToolSource(t *testing.T) {
 	}
 	// Both env names are named before anything dials (FR-009).
 	for _, env := range []string{"FIRECRAWL_MCP_URL", "FIRECRAWL_API_KEY"} {
-		for _, file := range []string{".env.example", "bot.py"} {
+		for _, file := range []string{".env.example", agentSource} {
 			if !strings.Contains(artifactFile(t, artifact, file), env) {
 				t.Errorf("%s missing %s", file, env)
 			}
@@ -213,10 +223,10 @@ func TestPipecatV1MCPTransportChooser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"from mcp.client.session_group import SseServerParameters, StreamableHttpParameters",
-		"def _mcp_params(url: str, headers: dict[str, str] | None = None):",
+		"def _mcp_params(\n    url: str, headers: dict[str, str] | None = None\n) -> StreamableHttpParameters | SseServerParameters:",
 		`params_cls = StreamableHttpParameters if url.rstrip("/").endswith("/mcp") else SseServerParameters`,
 		`server_params=_mcp_params(os.environ["NOTES_MCP_URL"]),`,
 	} {
@@ -242,7 +252,7 @@ func TestPipecatV1WebhookAuth(t *testing.T) {
 			if err != nil {
 				t.Fatalf("generate: %v", err)
 			}
-			bot := artifactFile(t, artifact, "bot.py")
+			bot := artifactFile(t, artifact, agentSource)
 			for _, want := range []string{fixture.CallSite, fixture.Helper} {
 				if !strings.Contains(bot, want) {
 					t.Errorf("bot.py missing %q:\n%s", want, bot)
@@ -251,7 +261,7 @@ func TestPipecatV1WebhookAuth(t *testing.T) {
 			if strings.Count(bot, "headers=") != 1 {
 				t.Errorf("exactly one tool must send headers:\n%s", bot)
 			}
-			for _, file := range []string{".env.example", "bot.py"} {
+			for _, file := range []string{".env.example", agentSource} {
 				// bot.py carries REQUIRED_ENV, so a missing secret fails at startup.
 				if !strings.Contains(artifactFile(t, artifact, file), fixture.Env) {
 					t.Errorf("%s missing %s", file, fixture.Env)
@@ -268,7 +278,7 @@ func TestPipecatV1NoAuthHelpersWithoutAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +286,7 @@ func TestPipecatV1NoAuthHelpersWithoutAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, unwanted := range []string{"_bearer", "_api_key"} {
 		if strings.Contains(bot, unwanted) {
 			t.Errorf("bot.py emits %q with no auth tool", unwanted)
@@ -291,7 +301,7 @@ func TestPipecatV1Golden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +343,7 @@ func TestV32PipecatGreetingModes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +405,7 @@ func TestV32PipecatGreetingModes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			bot := artifactFile(t, artifact, "bot.py")
+			bot := artifactFile(t, artifact, agentSource)
 			for _, want := range tc.want {
 				if !strings.Contains(bot, want) {
 					t.Errorf("bot.py missing %q", want)
@@ -415,7 +425,7 @@ func TestV16PipecatRequestTracingWiring(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,19 +435,17 @@ func TestV16PipecatRequestTracingWiring(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bot := artifactFile(t, artifact, "bot.py")
-	tracing := artifactFile(t, artifact, "tracing.py")
+	bot := artifactFile(t, artifact, agentSource)
+	tracing := artifactFile(t, artifact, tracingSource)
 	for _, want := range []string{
-		"from tracing import (",
-		"trace_provider = setup_langfuse_tracing()",
-		`trace_attributes = {"langfuse.trace.name": TRACE_NAME}`,
-		"if runner_args.session_id is not None:",
-		`trace_attributes["langfuse.session.id"] = runner_args.session_id`,
+		"from utils.tracing import ",
+		"telemetry = setup_tracing()",
+		"trace_attributes = start_call(telemetry, runner_args)",
 		"conversation_id=runner_args.session_id",
 		"enable_tracing=True",
 		"additional_span_attributes=trace_attributes",
 		"enable_agent_tracing(main, agents)",
-		"await asyncio.to_thread(flush_tracing, trace_provider)",
+		`await asyncio.to_thread(flush_tracing, telemetry, runner_args.session_id or "")`,
 		"primary_error = sys.exception()",
 		"Tracing flush failed while preserving the primary error ({})",
 	} {
@@ -446,35 +454,35 @@ func TestV16PipecatRequestTracingWiring(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"_TRACE_PROVIDER: TracerProvider | None = None",
-		"def setup_langfuse_tracing() -> TracerProvider:",
-		"if _TRACE_PROVIDER is not None:",
-		"existing_provider = trace.get_tracer_provider()",
-		"if isinstance(existing_provider, TracerProvider):",
+		"_TELEMETRY: Telemetry | None = None",
+		"def setup_tracing() -> Telemetry:",
+		"if _TELEMETRY is None:",
+		"telemetry = Telemetry.install(resource=_resource())",
+		"if isinstance(trace.get_tracer_provider(), TracerProvider):",
 		"OpenTelemetry already has a TracerProvider",
-		`f"{base_url.rstrip('/')}/api/public/otel"`,
-		"setup_tracing(service_name=TRACE_NAME, exporter=OTLPSpanExporter())",
+		`endpoint=f"{self.base_url.rstrip('/')}/api/public/otel/v1/traces"`,
+		"trace.set_tracer_provider(telemetry.provider)",
 		"def enable_agent_tracing(main: PipelineWorker, agents: Sequence[LLMWorker]) -> None:",
 		"agent._tracing_context = main._tracing_context",
-		"def flush_tracing(provider: TracerProvider) -> None:",
-		"provider.force_flush()",
+		`def flush_tracing(telemetry: Telemetry, session_id: str = "") -> None:`,
+		"return self.provider.force_flush()",
 	} {
 		if !strings.Contains(tracing, want) {
 			t.Errorf("tracing.py missing %q", want)
 		}
 	}
-	if !strings.Contains(tracing, "if not public_key or not secret_key or not base_url:") {
+	if !strings.Contains(tracing, "if not all(values):") {
 		t.Error("configured tracing must reject missing credentials, including all three")
 	}
-	guardAt := strings.Index(tracing, "if isinstance(existing_provider, TracerProvider):")
-	setupAt := strings.Index(tracing, "setup_tracing(service_name=TRACE_NAME")
+	guardAt := strings.Index(tracing, "if isinstance(trace.get_tracer_provider(), TracerProvider):")
+	setupAt := strings.Index(tracing, "trace.set_tracer_provider(telemetry.provider)")
 	if guardAt < 0 || setupAt < 0 || guardAt > setupAt {
-		t.Error("preinstalled OpenTelemetry provider must fail before Pipecat setup")
+		t.Error("preinstalled OpenTelemetry provider must fail before ours is set")
 	}
 	if strings.Contains(bot, "tracing_enabled") {
 		t.Error("configured tracing must not keep an impossible disabled branch")
 	}
-	if strings.Contains(bot, "\n        flush_tracing(trace_provider)\n") {
+	if strings.Contains(bot, "\n        flush_tracing(telemetry") {
 		t.Error("provider flush must not block Pipecat's event loop")
 	}
 	addAt := strings.Index(bot, "await runner.add_workers(main)")
@@ -506,7 +514,7 @@ func TestV31PipecatTracingIsIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,8 +524,8 @@ func TestV31PipecatTracingIsIsolated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bot := artifactFile(t, artifact, "bot.py")
-	if !strings.Contains(bot, "from tracing import (") {
+	bot := artifactFile(t, artifact, agentSource)
+	if !strings.Contains(bot, "from utils.tracing import ") {
 		t.Fatal("bot.py missing tracing import")
 	}
 	for _, forbidden := range []string{"def setup_langfuse_tracing", "def _patch_pipecat_tracing", "class TracedLLMWorker"} {
@@ -525,7 +533,7 @@ func TestV31PipecatTracingIsIsolated(t *testing.T) {
 			t.Errorf("bot.py contains tracing implementation %q", forbidden)
 		}
 	}
-	_ = artifactFile(t, artifact, "tracing.py")
+	_ = artifactFile(t, artifact, tracingSource)
 }
 
 func TestV21PipecatUsesNativeTracing(t *testing.T) {
@@ -533,7 +541,7 @@ func TestV21PipecatUsesNativeTracing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +551,7 @@ func TestV21PipecatUsesNativeTracing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tracing := artifactFile(t, artifact, "tracing.py")
+	tracing := artifactFile(t, artifact, tracingSource)
 	// The retired LangfuseAttributeProcessor rewrote Pipecat's own span
 	// attributes from inside on_start, by reassigning span.set_attribute. That
 	// job belongs to _patch_pipecat_tracing, which patches Pipecat's decorators
@@ -559,7 +567,7 @@ func TestV21PipecatUsesNativeTracing(t *testing.T) {
 			t.Errorf("tracing.py contains custom tracing hook %q", forbidden)
 		}
 	}
-	if got := strings.Count(tracing, "SpanProcessor"); got != 2 {
+	if got := strings.Count(artifactFile(t, artifact, "utils/tracing.py"), "SpanProcessor"); got != 2 {
 		t.Errorf("tracing.py names SpanProcessor %d times, want 2: the import and the one CallTrace", got)
 	}
 	// Exactly one place swaps a span's setter, and it is the decorator patch.
@@ -574,7 +582,7 @@ func TestV23PipecatSpeechObservationsAreRich(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,12 +592,15 @@ func TestV23PipecatSpeechObservationsAreRich(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bot := artifactFile(t, artifact, "bot.py")
-	tracing := artifactFile(t, artifact, "tracing.py")
+	bot := artifactFile(t, artifact, agentSource)
+	tracing := artifactFile(t, artifact, tracingSource)
 	for _, want := range []string{
-		"def _patch_pipecat_tracing() -> None:",
+		"def _patch_pipecat_tracing(backend: Backend) -> None:",
 		"service_decorators.add_stt_span_attributes",
 		"service_decorators.add_tts_span_attributes",
+		`set_attributes(backend.observation(output_value=encoded))`,
+		`set_attributes(backend.observation(input_value=encoded))`,
+		`set_attributes(backend.speech_metric(kind, key, value))`,
 		`"langfuse.observation.input"`,
 		`"langfuse.observation.output"`,
 		// Langfuse v4 has no trace input or output: the call's overall pair goes
@@ -600,7 +611,7 @@ func TestV23PipecatSpeechObservationsAreRich(t *testing.T) {
 		`"langfuse.observation.usage_details"`,
 		`"langfuse.observation.metadata.ttfb_seconds"`,
 		`"langfuse.observation.metadata.character_count"`,
-		"_patch_pipecat_tracing()",
+		"_patch_pipecat_tracing(telemetry.backend)",
 	} {
 		if !strings.Contains(tracing, want) {
 			t.Errorf("tracing.py missing %q", want)
@@ -624,7 +635,7 @@ func TestV24PipecatStaticCheckSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -640,10 +651,10 @@ func TestV24PipecatStaticCheckSurface(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bot := artifactFile(t, artifact, "bot.py")
-	tracing := artifactFile(t, artifact, "tracing.py")
+	bot := artifactFile(t, artifact, agentSource)
+	tracing := artifactFile(t, artifact, tracingSource)
 	for _, want := range []string{
-		"from tracing import (",
+		"from utils.tracing import ",
 		"from pipecat.transcriptions.language import Language",
 		`Language("en")`,
 	} {
@@ -652,33 +663,36 @@ func TestV24PipecatStaticCheckSurface(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"from collections.abc import Mapping, Sequence",
-		"from opentelemetry.sdk.trace import Span, SpanProcessor, TracerProvider",
+		"from opentelemetry.sdk.trace import Span, SpanProcessor",
 		"def on_start(self, span: Span, parent_context: Context | None = None) -> None:",
 		// Mapping, not dict: ty 0.0.40 reads the caller's literal as dict[str, str]
 		// and dict is invariant in its value type.
-		"def start_call(attributes: Mapping[str, AttributeValue]) -> None:",
+		"def start_call(self, attributes: Mapping[str, AttributeValue], telemetry: Telemetry) -> None:",
 		"def said(self, role: str, text: str) -> None:",
-		"_TRACE_PROVIDER: TracerProvider | None = None",
-		`setattr(patched, "__langfuse_patch__", True)`,
+		"_TELEMETRY: Telemetry | None = None",
+		`setattr(patched, "__unmute_patch__", True)`,
 		`setattr(service_decorators, "add_llm_span_attributes", patched_llm)`,
-		"if not public_key or not secret_key or not base_url:",
-		"def setup_langfuse_tracing() -> TracerProvider:",
-		"global _TRACE_PROVIDER",
-		"if _TRACE_PROVIDER is not None:",
-		"if not isinstance(provider, TracerProvider):",
+		"if not all(values):",
+		"def setup_tracing() -> Telemetry:",
+		"global _TELEMETRY",
+		"if _TELEMETRY is None:",
 		"def enable_agent_tracing(main: PipelineWorker, agents: Sequence[LLMWorker]) -> None:",
 		"context = self._tracing_context",
-		"if not self._enable_tracing or context is None:",
-		"def flush_tracing(provider: TracerProvider) -> None:",
+		"if not self._enable_tracing or context is None or telemetry is None:",
+		`def flush_tracing(telemetry: Telemetry, session_id: str = "") -> None:`,
 	} {
 		if !strings.Contains(tracing, want) {
 			t.Errorf("tracing.py missing static-check-safe form %q", want)
 		}
 	}
+	for _, name := range []string{"Mapping", "Sequence"} {
+		if !pyImports(tracing, "collections.abc", name) {
+			t.Errorf("tracing.py missing static-check-safe import of %s from collections.abc", name)
+		}
+	}
 	for _, forbidden := range []string{
-		"patched.__langfuse_patch__",
-		"append_to_audio_context.__langfuse_patch__",
+		"patched.__unmute_patch__",
+		"append_to_audio_context.__unmute_patch__",
 		"TTSService.append_to_audio_context =",
 		"trace.get_tracer_provider().force_flush()",
 		"TTSAudioRawFrame",
@@ -701,7 +715,7 @@ func TestV25PipecatTracesConfiguredSystemInstruction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -710,13 +724,13 @@ func TestV25PipecatTracesConfiguredSystemInstruction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tracing := artifactFile(t, artifact, "tracing.py")
+	tracing := artifactFile(t, artifact, tracingSource)
 	for _, want := range []string{
 		"service_decorators.add_llm_span_attributes",
 		`kwargs.get("system_instructions")`,
 		`{"role": "system", "content": system_instruction}`,
 		`span.set_attribute("input", encoded)`,
-		`span.set_attribute("langfuse.observation.input", encoded)`,
+		`span.set_attributes(backend.observation(input_value=encoded))`,
 	} {
 		if !strings.Contains(tracing, want) {
 			t.Errorf("tracing.py missing system-instruction tracing form %q", want)
@@ -729,7 +743,7 @@ func TestV22PipecatToolCallsAreTraced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -739,12 +753,13 @@ func TestV22PipecatToolCallsAreTraced(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bot := artifactFile(t, artifact, "bot.py")
-	tracing := artifactFile(t, artifact, "tracing.py")
+	bot := artifactFile(t, artifact, agentSource)
+	tracing := artifactFile(t, artifact, tracingSource)
 	for _, want := range []string{
 		"class TracedLLMWorker(LLMWorker):",
 		"start_as_current_span(",
-		`name, context=parent`,
+		`span_name, context=parent, attributes=attributes`,
+		`backend.tool_span(name, json.dumps(arguments, default=str), tool_call_id)`,
 		// The pair that makes this a tool call and not an unlabelled span.
 		// Langfuse v4 turns an observation carrying them into a TOOL named
 		// after gen_ai.tool.name, which is what livekit-agents sets, so one
@@ -752,8 +767,8 @@ func TestV22PipecatToolCallsAreTraced(t *testing.T) {
 		// 2026-09-16: the LiveKit tool observation was a TOOL named
 		// `create_booking`, the Pipecat one a plain span named
 		// `tool:create_booking`.
-		`span.set_attribute("gen_ai.operation.name", "execute_tool")`,
-		`span.set_attribute("gen_ai.tool.name", name)`,
+		`"gen_ai.operation.name": "execute_tool"`,
+		`"gen_ai.tool.name": name`,
 		`"langfuse.observation.input"`,
 		`"langfuse.observation.output"`,
 		`"tool.function_name"`,
@@ -776,7 +791,7 @@ func TestV22PipecatMCPToolCallsAreTraced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -795,8 +810,8 @@ func TestV22PipecatMCPToolCallsAreTraced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
-	tracing := artifactFile(t, artifact, "tracing.py")
+	bot := artifactFile(t, artifact, agentSource)
+	tracing := artifactFile(t, artifact, tracingSource)
 	for _, want := range []string{
 		"class TracedLLMWorker(LLMWorker):",
 		"import functools",
@@ -806,7 +821,7 @@ func TestV22PipecatMCPToolCallsAreTraced(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"    TracedLLMWorker,",
+		"from utils.tracing import TracedLLMWorker",
 		"class AppointmentDeskAgent(TracedLLMWorker):",
 		"tools = await client.get_tools_schema()",
 		"await client.register_tools_schema(tools, llm)",
@@ -841,13 +856,13 @@ func TestPipecatV1MCPLifecycleAndCollisionsFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
-		"async def _close_mcp(awaitables, *, suppress: bool = False) -> None:",
+		"async def _close_mcp(awaitables: Iterable[Awaitable[None]], *, suppress: bool = False) -> None:",
 		"for awaitable in awaitables:",
 		"await awaitable",
 		"except BaseException as failure:",
-		"async def _register_mcp_tools(clients, llm, reserved_names",
+		"async def _register_mcp_tools(\n    clients: list[MCPClient],\n    llm: Any,\n    reserved_names: set[str],\n) -> list[Any]:",
 		"tools = await client.get_tools_schema()",
 		"if schema.name in names:",
 		"MCP tool name collision",
@@ -892,7 +907,7 @@ func TestPipecatV1MCPReservesFlowFunctionNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -913,7 +928,7 @@ func TestPipecatV1MCPReservesFlowFunctionNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		`{tool.__name__ for tool in super().build_tools()} | {`,
 		`"finish_run_verify_complete",`,
@@ -927,7 +942,7 @@ func TestPipecatV1MCPReservesFlowFunctionNames(t *testing.T) {
 	}
 	worker := pipecatMethodBody(t, bot, "class IntakeAgent(", "\nclass BillingAgent(")
 	initAt := strings.Index(worker, "self._mcp_clients = [")
-	activationAt := strings.Index(worker, "async def on_activated(self, args) -> None:")
+	activationAt := strings.Index(worker, "async def on_activated(self, args: dict[str, Any] | None) -> None:")
 	if initAt < 0 || activationAt < 0 || initAt > activationAt {
 		t.Error("a Flow-owning MCP worker must construct its clients before on_activated")
 	}
@@ -938,14 +953,14 @@ func addPipecatTaskTransferFixture(agent *ir.Agent) {
 		Instructions: "Verify the caller, unless they need billing help.",
 		Tools:        []string{"to_billing"},
 		Result: map[string]ir.ResultField{
-			"verified": {Type: ir.PrimitiveBoolean},
-			"label":    {Type: ir.PrimitiveString},
+			"verified": {Type: boolType(), Var: "verified"},
+			"label":    {Type: stringType(), Var: "customer_id"},
 		},
 		Context: ir.TaskContext{History: ir.HistoryFull},
 	}
 	agent.Tasks["complete"] = ir.Task{
 		Instructions: "Complete verification.",
-		Result:       map[string]ir.ResultField{"complete": {Type: ir.PrimitiveBoolean}},
+		Result:       map[string]ir.ResultField{"complete": {Type: boolType(), Var: "verified"}},
 		Context:      ir.TaskContext{History: ir.HistoryFull},
 	}
 	agent.TaskGroups["verification"] = ir.TaskGroup{
@@ -971,39 +986,43 @@ func TestPipecatV1TaskTransferStopsFlowAndPreservesFullHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	addPipecatTaskTransferFixture(agent)
 	verify := agent.Tasks["verify"]
-	verify.Result["details"] = ir.ResultField{Schema: map[string]any{"type": "object"}}
+	verify.Result["details"] = ir.ResultField{Type: objectType(), Var: "customer_id"}
 	agent.Tasks["verify"] = verify
 
 	artifact, err := GeneratePipecat(agent, targetByProvider(t, agent, ir.ProviderPipecat), nil, nil)
 	if err != nil {
 		t.Fatalf("generate task transfer: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
-		"from pipecat.flows import FlowManager, FlowsFunctionSchema, NodeConfig, NO_RESPONSE",
 		`name="to_billing"`,
 		"handler=_flow_visit(self, \"run_verify\"",
-		"async def _run_verify_transfer_verify_to_billing(self, args, flow_manager):",
+		"async def _run_verify_transfer_verify_to_billing(\n        self, args: Any, flow_manager: FlowManager\n    ) -> tuple[dict[str, Any], Any]:",
 		`self._run_verify_active_step = "verify"`,
 		`if self._run_verify_active_step != "verify":`,
 		`return {"status": "already handled"}, NO_RESPONSE`,
-		`async def on_activated(self, args) -> None:`,
+		`async def on_activated(self, args: dict[str, Any] | None) -> None:`,
 		`self.context.set_messages(copy.deepcopy([m for m in self.context.get_messages() if not isinstance(m, dict) or m.get("role") in ("user", "assistant", "tool")]))`,
 		`return {"transferred": True}, NO_RESPONSE`,
 		// The chain is a plan now, decided as the flow starts, because a group
 		// may skip a step whose confirmation holds and stops when one ends
 		// unserved. The next step is looked up rather than named.
 		`return _task_status(self._run_verify_results["verify"]), await self._run_verify_node(_next)`,
-		`def _run_verify_next(self, name):`,
+		`def _run_verify_next(self, name: str) -> str | None:`,
 	} {
 		if !strings.Contains(bot, want) {
 			t.Errorf("bot.py missing task-transfer invariant %q", want)
+		}
+	}
+	for _, name := range []string{"FlowManager", "FlowsFunctionSchema", "NodeConfig", "NO_RESPONSE"} {
+		if !pyImports(bot, "pipecat.flows", name) {
+			t.Errorf("bot.py missing task-transfer invariant: import of %s from pipecat.flows", name)
 		}
 	}
 	transferAt := strings.Index(bot, "async def _run_verify_transfer_verify_to_billing")
@@ -1040,25 +1059,16 @@ func TestPipecatV1TaskTransferStopsFlowAndPreservesFullHistory(t *testing.T) {
 	finalBody := bot[nextFinishAt:]
 	for _, want := range []string{
 		`return await self._run_verify_complete_complete()`,
-		`async def _run_verify_complete_complete(self):`,
-		// The prompt continues with the compiler's finish contract, so match its
-		// opening rather than the whole literal.
-		`delta=LLMSettings(system_instruction="Complete verification.`,
+		`async def _run_verify_complete_complete(self) -> tuple[dict[str, Any], Any]:`,
+		// The step's own prompt, from prompts/, not the owner's.
+		`delta=LLMSettings(system_instruction=RUN_VERIFY_COMPLETE_TASK_PROMPT`,
 	} {
 		if !strings.Contains(finalBody, want) {
 			t.Errorf("final task rollback missing %q", want)
 		}
 	}
 
-	if _, err := exec.LookPath("python3"); err == nil {
-		path := filepath.Join(t.TempDir(), "bot.py")
-		if err := os.WriteFile(path, []byte(bot), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if out, err := exec.Command("python3", "-m", "py_compile", path).CombinedOutput(); err != nil {
-			t.Fatalf("task-transfer bot.py is not valid Python:\n%s", out)
-		}
-	}
+	assertModulesCompile(t, artifact, "task-transfer bot.py")
 }
 
 // TestPipecatV1TasksGolden exercises tasks, task groups, and delegates that
@@ -1068,7 +1078,7 @@ func TestPipecatV1TasksGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1081,8 +1091,8 @@ func TestPipecatV1TasksGolden(t *testing.T) {
 		Instructions: "Ask for the caller's email, look them up, and confirm their account tier.",
 		Tools:        []string{"lookup_customer"},
 		Result: map[string]ir.ResultField{
-			"verified_flag": {Type: ir.PrimitiveBoolean},
-			"tier":          {Type: ir.PrimitiveString, Enum: []string{"free", "pro"}},
+			"verified_flag": {Type: boolType()},
+			"tier":          {Type: stringType("free", "pro")},
 		},
 		Context: ir.TaskContext{History: ir.HistoryFull},
 	}
@@ -1104,27 +1114,27 @@ func TestPipecatV1TasksGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	var bot string
-	for _, file := range artifact.Files {
-		if file.Path == "bot.py" {
-			bot = string(file.Content)
+	bot := artifactFile(t, artifact, agentSource)
+	for _, name := range []string{"EndFrame", "FunctionCallResultProperties", "LLMMessagesAppendFrame", "LLMRunFrame", "LLMUpdateSettingsFrame", "TTSSpeakFrame"} {
+		if !pyImports(bot, "pipecat.frames.frames", name) {
+			t.Errorf("bot.py missing task role boundary: import of %s from pipecat.frames.frames", name)
 		}
 	}
-	if bot == "" {
-		t.Fatal("bot.py not emitted")
-	}
 	for _, want := range []string{
-		"from pipecat.frames.frames import EndFrame, FunctionCallResultProperties, LLMMessagesAppendFrame, LLMRunFrame, LLMUpdateSettingsFrame, TTSSpeakFrame",
 		"from pipecat.services.settings import LLMSettings",
+		// The step's own prompt, read from prompts/tasks/ like every other.
+		`role_message=RUN_COLLECT_COLLECT_TASK_PROMPT,`,
 		// The compiler appends its finish contract, so this matches the
 		// authored opening only.
-		`role_message="Ask for the caller's email, look them up, and confirm their account tier.`,
+		"Ask for the caller's email, look them up, and confirm their account tier.",
 		`task_messages=[{"role": "developer", "content": "Begin this step. Work from what the caller has already said."}]`,
 		// The delegate resolves its call with run_llm=False so only the flow node
 		// responds — no double assistant turn (V7/B4).
 		`properties=FunctionCallResultProperties(run_llm=False),`,
-		// The agent prompt is one module constant, referenced by builder + restore (V2).
-		`INTAKE_PROMPT = """# Intake agent`,
+		// The agent prompt is one constant, read from its file and referenced
+		// by builder + restore (V2).
+		`INTAKE_PROMPT = load("intake")`,
+		"# Intake agent",
 		`delta=LLMSettings(system_instruction=INTAKE_PROMPT)`,
 		`_settle_task_call(messages, "run_collect", _group_status(self._run_collect_results))`,
 	} {
@@ -1135,7 +1145,7 @@ func TestPipecatV1TasksGolden(t *testing.T) {
 	if strings.Contains(bot, `task_messages=[{"role": "system"`) {
 		t.Error("bot.py still sends task instructions as a second system message")
 	}
-	activation := strings.Index(bot, "async def on_activated(self, args) -> None:")
+	activation := strings.Index(bot, "async def on_activated(self, args: dict[str, Any] | None) -> None:")
 	if activation < 0 {
 		t.Fatal("bot.py missing the flow owner's activation hook")
 	}
@@ -1153,7 +1163,7 @@ func TestPipecatV1TasksGolden(t *testing.T) {
 		t.Errorf("bot.py drains delegate results and owner role updates %d times, want 4", got)
 	}
 
-	path := filepath.Join("testdata", "golden", "pipecat_v1_tasks_bot.py")
+	path := filepath.Join("testdata", "golden", "pipecat_v1_tasks_bot.txt")
 	if *updatePipecatV1 {
 		if err := os.WriteFile(path, []byte(bot), 0o644); err != nil {
 			t.Fatal(err)
@@ -1181,7 +1191,7 @@ func TestPipecatV1TasksGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate transfer task group: %v", err)
 	}
-	transferBot := artifactFile(t, transferArtifact, "bot.py")
+	transferBot := artifactFile(t, transferArtifact, agentSource)
 	finish := strings.Index(transferBot, "async def _run_triage_finish_collect")
 	if finish < 0 {
 		t.Fatal("transfer task group missing final handler")
@@ -1201,7 +1211,7 @@ func TestPipecatV1TasksGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate end-only task group: %v", err)
 	}
-	endBot := artifactFile(t, endArtifact, "bot.py")
+	endBot := artifactFile(t, endArtifact, agentSource)
 	// then: end lowers to the Flows end_conversation post-action on a terminal
 	// node, not a raw EndFrame in the finish handler (V4/B2, dp§V2 doc-wins).
 	if !strings.Contains(endBot, `post_actions=[{"type": "end_conversation"}]`) {
@@ -1230,13 +1240,13 @@ func TestPipecatV1TasksGolden(t *testing.T) {
 }
 
 func TestV2_PipecatDelegateSnapshotsCompletedOwnerCall(t *testing.T) {
-	bot, err := os.ReadFile(filepath.Join("testdata", "golden", "pipecat_v1_tasks_bot.py"))
+	bot, err := os.ReadFile(filepath.Join("testdata", "golden", "pipecat_v1_tasks_bot.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for _, name := range []string{"run_collect", "run_triage"} {
-		start := bytes.Index(bot, []byte("    async def "+name+"(self, params: FunctionCallParams):"))
+		start := bytes.Index(bot, []byte("    async def "+name+"(self, params: FunctionCallParams) -> None:"))
 		if start < 0 {
 			t.Fatalf("missing generated delegate %q", name)
 		}
@@ -1272,7 +1282,7 @@ func TestV2_PipecatDelegateSnapshotsCompletedOwnerCall(t *testing.T) {
 // 2026-08-21: the session died half a second in and the only line it left
 // behind was a failed trace flush, which says nothing about the cause.
 func TestPipecatWorkerStartFailureSaysWhy(t *testing.T) {
-	bot, err := os.ReadFile(filepath.Join("testdata", "golden", "pipecat_v1_tasks_bot.py"))
+	bot, err := os.ReadFile(filepath.Join("testdata", "golden", "pipecat_v1_tasks_bot.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1300,14 +1310,14 @@ func TestV3PipecatToolsResolveCallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	agent.Tasks["collect"] = ir.Task{
 		Instructions: "Ask for the caller's email and confirm their tier.",
 		Tools:        []string{"lookup_customer"},
-		Result:       map[string]ir.ResultField{"tier": {Type: ir.PrimitiveString}},
+		Result:       map[string]ir.ResultField{"tier": {Type: stringType()}},
 		Context:      ir.TaskContext{History: ir.HistoryFull},
 	}
 	agent.Controls["run_collect"] = &ir.Delegate{Kind: ir.ControlDelegate, Task: "collect", When: "Collect account details."}
@@ -1319,7 +1329,7 @@ func TestV3PipecatToolsResolveCallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 
 	// A @tool method has the signature `(self, params: FunctionCallParams …)`.
 	// Flow-internal handlers take `(args, flow_manager)` / `(self, args, …)` and
@@ -1355,14 +1365,14 @@ func TestPipecatV1DirectToolGuard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	agent.Tasks["collect"] = ir.Task{
 		Instructions: "Collect the caller's email.",
 		Tools:        []string{"lookup_customer"},
-		Result:       map[string]ir.ResultField{"email": {Type: ir.PrimitiveString}},
+		Result:       map[string]ir.ResultField{"email": {Type: stringType()}},
 		Context:      ir.TaskContext{History: ir.HistoryFull},
 	}
 	agent.Controls["run_collect"] = &ir.Delegate{
@@ -1375,10 +1385,10 @@ func TestPipecatV1DirectToolGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 
 	for _, want := range []string{
-		"def _direct_tool(fn=None, *, cancel_on_interruption=True, timeout_secs=None):",
+		"def _direct_tool(\n    fn: Callable[..., Any] | None = None,\n    *,\n    cancel_on_interruption: bool = True,\n    timeout_secs: float | None = None,\n) -> Any:",
 		"@functools.wraps(handler)",
 		"unexpected = sorted(set(kwargs) - declared - {\"params\"})",
 		"original_result_callback = params.result_callback",
@@ -1399,7 +1409,7 @@ func TestPipecatV1DirectToolGuard(t *testing.T) {
 	if regexp.MustCompile(`(?m)^\s*@tool(?:\(|$)`).MatchString(bot) {
 		t.Error("a generated direct tool bypasses the shared guard")
 	}
-	if !strings.Contains(bot, `async def lookup_customer(self, params: FunctionCallParams, email: str = "", phone: str = ""):`) {
+	if !strings.Contains(bot, `async def lookup_customer(self, params: FunctionCallParams, email: str = "", phone: str = "") -> None:`) {
 		t.Error("guard changed the generated tool's declared signature")
 	}
 }
@@ -1409,7 +1419,7 @@ func TestV2PipecatV1AgentTransferAnnouncementWaitsForSourcePlayout(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1421,7 +1431,7 @@ func TestV2PipecatV1AgentTransferAnnouncementWaitsForSourcePlayout(t *testing.T)
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	start := strings.Index(bot, "    async def to_billing(")
 	if start < 0 {
 		t.Fatal("to_billing transfer method not emitted")
@@ -1445,10 +1455,11 @@ func TestV2PipecatV1AgentTransferAnnouncementWaitsForSourcePlayout(t *testing.T)
 		"class _HandoffWorker(",
 		"async def _announce_handoff(self, announcement: str) -> None:",
 		"await PipelineWorker.queue_frame(self, TTSSpeakFrame(announcement))",
-		"await asyncio.wait_for(self._handoff_finished.wait(), timeout=30.0)",
+		"HANDOFF_CUE_TIMEOUT_SECS = 30.0",
+		"await asyncio.wait_for(\n                self._handoff_finished.wait(), timeout=HANDOFF_CUE_TIMEOUT_SECS\n            )",
 		"isinstance(frame, BotStartedSpeakingFrame)",
 		"isinstance(frame, BotStoppedSpeakingFrame)",
-		"async def process_deferred_tool_frames(self, frames):",
+		"async def process_deferred_tool_frames(self, frames: list[Any]) -> list[Any]:",
 		"if not self.active:",
 		"return []",
 		"class IntakeAgent(_HandoffWorker):",
@@ -1457,8 +1468,10 @@ func TestV2PipecatV1AgentTransferAnnouncementWaitsForSourcePlayout(t *testing.T)
 			t.Errorf("announced handoff is missing source playout step %q", want)
 		}
 	}
-	if !regexp.MustCompile(`(?m)^from pipecat\.frames\.frames import .*BotStartedSpeakingFrame.*BotStoppedSpeakingFrame.*TTSSpeakFrame`).MatchString(bot) {
-		t.Error("an announced handoff must import playout and speech frames even without a text greeting")
+	for _, name := range []string{"BotStartedSpeakingFrame", "BotStoppedSpeakingFrame", "TTSSpeakFrame"} {
+		if !pyImports(bot, "pipecat.frames.frames", name) {
+			t.Errorf("an announced handoff must import playout and speech frames even without a text greeting: %s not imported", name)
+		}
 	}
 	if !strings.Contains(body, "run_llm=True") {
 		t.Error("receiver must answer normally after source playout completes")
@@ -1475,7 +1488,7 @@ func TestV2PipecatV1AgentTransferAnnouncementWaitsForSourcePlayout(t *testing.T)
 	if err != nil {
 		t.Fatalf("generate silent transfer: %v", err)
 	}
-	silentBot := artifactFile(t, silent, "bot.py")
+	silentBot := artifactFile(t, silent, agentSource)
 	silentStart := strings.Index(silentBot, "    async def to_billing(")
 	silentBody := silentBot[silentStart:]
 	if end := strings.Index(silentBody[1:], "\n    async def "); end >= 0 {
@@ -1498,13 +1511,13 @@ func TestF3PipecatSingleAgentInline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	agent.Tracing = nil // simple-prompt ships tracing; the inline path is scoped to no-tracing
 
-	bot := artifactFile(t, mustGeneratePipecatInline(t, agent), "bot.py")
+	bot := artifactFile(t, mustGeneratePipecatInline(t, agent), agentSource)
 
 	for _, absent := range []string{
 		"BusBridgeProcessor",
@@ -1528,15 +1541,7 @@ func TestF3PipecatSingleAgentInline(t *testing.T) {
 		}
 	}
 
-	if _, err := exec.LookPath("python3"); err == nil {
-		f := filepath.Join(t.TempDir(), "bot.py")
-		if err := os.WriteFile(f, []byte(bot), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if out, err := exec.Command("python3", "-m", "py_compile", f).CombinedOutput(); err != nil {
-			t.Fatalf("inline bot.py is not valid Python:\n%s", out)
-		}
-	}
+	assertModulesCompile(t, mustGeneratePipecatInline(t, agent), "inline bot.py")
 }
 
 // MCP always uses the worker topology, even with one untraced agent. Keeping one
@@ -1547,7 +1552,7 @@ func TestPipecatV1MCPUsesWorkerTopology(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1566,7 +1571,7 @@ func TestPipecatV1MCPUsesWorkerTopology(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"from pipecat.bus import BusBridgeProcessor",
 		"class AppointmentDeskAgent(LLMWorker):",
@@ -1586,15 +1591,7 @@ func TestPipecatV1MCPUsesWorkerTopology(t *testing.T) {
 			t.Errorf("MCP package must not use the retired inline path %q", absent)
 		}
 	}
-	if _, err := exec.LookPath("python3"); err == nil {
-		f := filepath.Join(t.TempDir(), "bot.py")
-		if err := os.WriteFile(f, []byte(bot), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if out, err := exec.Command("python3", "-m", "py_compile", f).CombinedOutput(); err != nil {
-			t.Fatalf("MCP worker bot.py is not valid Python:\n%s", out)
-		}
-	}
+	assertModulesCompile(t, artifact, "MCP worker bot.py")
 }
 
 func mustGeneratePipecatInline(t *testing.T, agent *ir.Agent) Artifact {
@@ -1617,7 +1614,7 @@ func TestV1PipecatAgentToolCarriesSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1641,7 +1638,7 @@ func TestV1PipecatAgentToolCarriesSchema(t *testing.T) {
 	agent.Tasks["book"] = ir.Task{
 		Instructions: "Book the caller's chosen service.",
 		Tools:        []string{"book_service"},
-		Result:       map[string]ir.ResultField{"ok": {Type: ir.PrimitiveBoolean}},
+		Result:       map[string]ir.ResultField{"ok": {Type: boolType()}},
 		Context:      ir.TaskContext{History: ir.HistoryFull},
 	}
 	agent.Controls["run_book"] = &ir.Delegate{Kind: ir.ControlDelegate, Task: "book", When: "Book a service."}
@@ -1653,11 +1650,11 @@ func TestV1PipecatAgentToolCarriesSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 
 	for _, want := range []string{
 		// Agent-level @tool: required first, typed, then optional with defaults.
-		"async def book_service(self, params: FunctionCallParams, service: str, notes: str = \"\", party_size: int = 0):",
+		"async def book_service(self, params: FunctionCallParams, service: str, notes: str = \"\", party_size: int = 0) -> None:",
 		// Google Args docstring carries descriptions + enum prose + real types.
 		"            service (str): Which service One of: haircut, hair-color, blowout.",
 		"            notes (str): Extra notes",
@@ -1671,15 +1668,7 @@ func TestV1PipecatAgentToolCarriesSchema(t *testing.T) {
 	}
 
 	// The emitted signature must be valid Python (required-before-optional, B3).
-	if _, err := exec.LookPath("python3"); err == nil {
-		f := filepath.Join(t.TempDir(), "bot.py")
-		if err := os.WriteFile(f, []byte(bot), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if out, err := exec.Command("python3", "-m", "py_compile", f).CombinedOutput(); err != nil {
-			t.Fatalf("emitted bot.py is not valid Python:\n%s", out)
-		}
-	}
+	assertModulesCompile(t, artifact, "emitted bot.py")
 }
 
 // TestPipecatRuffCheckClean: the raw generator output (template-only, before the
@@ -1694,7 +1683,7 @@ func TestPipecatRuffCheckClean(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1702,7 +1691,7 @@ func TestPipecatRuffCheckClean(t *testing.T) {
 	agent.Tasks["collect"] = ir.Task{
 		Instructions: "Ask for the caller's email and confirm their tier.",
 		Tools:        []string{"lookup_customer"},
-		Result:       map[string]ir.ResultField{"tier": {Type: ir.PrimitiveString, Enum: []string{"free", "pro"}}},
+		Result:       map[string]ir.ResultField{"tier": {Type: stringType("free", "pro")}},
 		Context:      ir.TaskContext{History: ir.HistoryFull},
 	}
 	agent.Controls["run_collect"] = &ir.Delegate{Kind: ir.ControlDelegate, Task: "collect", When: "Collect account details."}
@@ -1714,10 +1703,13 @@ func TestPipecatRuffCheckClean(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	cmd := exec.Command("ruff", "check", "--select", "F", "-")
-	cmd.Stdin = strings.NewReader(artifactFile(t, artifact, "bot.py"))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("raw generated bot.py is not `ruff check --select F` clean:\n%s", out)
+	dir := writeProject(t, artifact)
+	args := []string{"check", "--isolated", "--select", "F"}
+	for _, module := range agentModules(t, artifact) {
+		args = append(args, filepath.Join(dir, filepath.FromSlash(module.Path)))
+	}
+	if out, err := exec.Command("ruff", args...).CombinedOutput(); err != nil {
+		t.Fatalf("raw generated modules are not `ruff check --select F` clean:\n%s", out)
 	}
 }
 
@@ -1726,13 +1718,13 @@ func TestPipecatRejectsBlankTaskInstructions(t *testing.T) { // V27
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	agent.Tasks["blank"] = ir.Task{
 		Instructions: " \n\t",
-		Result:       map[string]ir.ResultField{"done": {Type: ir.PrimitiveBoolean}},
+		Result:       map[string]ir.ResultField{"done": {Type: boolType()}},
 		Context:      ir.TaskContext{History: ir.HistoryFull},
 	}
 	agent.Controls["run_blank"] = &ir.Delegate{Kind: ir.ControlDelegate, Task: "blank", When: "Run the blank task."}
@@ -1751,7 +1743,7 @@ func TestPipecatV1OmitsTracingUnlessConfigured(t *testing.T) { // V19, V31
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1759,11 +1751,11 @@ func TestPipecatV1OmitsTracingUnlessConfigured(t *testing.T) { // V19, V31
 	if err != nil {
 		t.Fatal(err)
 	}
-	if artifactHasFile(artifact, "tracing.py") {
+	if artifactHasFile(artifact, "utils/tracing.py") {
 		t.Fatal("unconfigured artifact emitted tracing.py")
 	}
 	for path, forbidden := range map[string][]string{
-		"bot.py":         {"Langfuse", "LANGFUSE_", "setup_tracing", "enable_tracing"},
+		agentSource:      {"Langfuse", "LANGFUSE_", "setup_tracing", "enable_tracing"},
 		"pyproject.toml": {"opentelemetry"},
 		".env.example":   {"LANGFUSE_"},
 		"README.md":      {"Trace with Langfuse"},
@@ -1810,7 +1802,7 @@ func TestPipecatV1LocalTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1824,7 +1816,7 @@ func TestPipecatV1LocalTool(t *testing.T) {
 	agent.Tasks["collect"] = ir.Task{
 		Instructions: "Ask what the caller needs, then pull their notes.",
 		Tools:        []string{"fetch_notes"},
-		Result:       map[string]ir.ResultField{"summary": {Type: ir.PrimitiveString}},
+		Result:       map[string]ir.ResultField{"summary": {Type: stringType()}},
 		Context:      ir.TaskContext{History: ir.HistoryFull},
 	}
 	agent.Controls["run_collect"] = &ir.Delegate{Kind: ir.ControlDelegate, Task: "collect", When: "Collect the caller's request."}
@@ -1836,11 +1828,11 @@ func TestPipecatV1LocalTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"import inspect",
 		"import tools.fetch_notes",
-		"async def fetch_notes(self, params: FunctionCallParams, topic: str):",
+		"async def fetch_notes(  # noqa: D417\n        self, params: FunctionCallParams, topic: str) -> None:",
 		"result = tools.fetch_notes.fetch_notes(topic=topic)",
 		"if inspect.isawaitable(result):",
 		"await params.result_callback(result)",
@@ -1878,7 +1870,7 @@ func TestPipecatWithoutWarmTransferEmitsNoBridge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, forbidden := range []string{"_HoldMixer", "_AudioBridge", "_warm_transfer", "MixerEnableFrame", "ContextVar"} {
 		if strings.Contains(bot, forbidden) {
 			t.Errorf("bot.py emits warm-transfer machinery %q without a warm transfer", forbidden)
@@ -1898,7 +1890,7 @@ func TestPipecatWarmHumanTransferFailsEverywhere(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1919,7 +1911,7 @@ func TestPipecatCarrierlessHumanTransferFailsBeforeLowering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1975,7 +1967,7 @@ func TestPipecatListenAssemblyAI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1985,7 +1977,7 @@ func TestPipecatListenAssemblyAI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"from pipecat.services.assemblyai.stt import AssemblyAISTTService",
 		"settings=AssemblyAISTTService.Settings(\n            model=\"universal-3-5-pro\",",
@@ -2058,7 +2050,7 @@ func TestUS1_DailyTransportAcceptsInboundCallFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2070,7 +2062,7 @@ func TestUS1_DailyTransportAcceptsInboundCallFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 
 	daily := transportParamsClass(t, bot, "daily")
 	generic := transportParamsClass(t, bot, "webrtc")
@@ -2104,7 +2096,7 @@ func TestUS1_NonDailyRouteKeepsGenericTransportParams(t *testing.T) {
 	configured.Connection = "primary_phone"
 	setConnectionRoute(pkg, "primary_phone", "cloud-websocket", "twilio")
 	pkg.Targets = map[string]spec.Target{"pipecat": configured}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2112,7 +2104,7 @@ func TestUS1_NonDailyRouteKeepsGenericTransportParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	generic := transportParamsClass(t, bot, "webrtc")
 	if got := transportParamsClass(t, bot, "daily"); got != generic {
 		t.Errorf("carrier-websocket route builds %s for the daily key, want the generic %s: "+
@@ -2130,7 +2122,7 @@ func plainPipecatArtifact(t *testing.T) Artifact {
 		t.Fatal(err)
 	}
 	pkg.Targets = map[string]spec.Target{"pipecat": pkg.Targets["pipecat"]}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2160,9 +2152,9 @@ func TestPipecatMutableCallStateIsRunLocal(t *testing.T) {
 	}{
 		{
 			name: "daily transfer",
-			bot:  artifactFile(t, dailyCarrierArtifact(t, "twilio", false), "bot.py"),
+			bot:  artifactFile(t, dailyCarrierArtifact(t, "twilio", false), agentSource),
 			want: []string{
-				"call_context = {}",
+				"call_context: dict[str, Any] = {}",
 				`call_context["_transport"] = transport`,
 				`self.call_context.get("_transfer_result")`,
 				`self.call_context.get("_transport")`,
@@ -2172,9 +2164,9 @@ func TestPipecatMutableCallStateIsRunLocal(t *testing.T) {
 			name: "cloud websocket phone call",
 			bot: artifactFile(t, cloudWebsocketArtifact(t, cloudWebsocketOptions{
 				inbound: true, transfer: true, connection: true,
-			}), "bot.py"),
+			}), agentSource),
 			want: []string{
-				"call_context = {}",
+				"call_context: dict[str, Any] = {}",
 				`call_context["_phone_call"] = phone_call`,
 				"_pipeline_audio_rates(phone_call)",
 				`self.call_context.get("_phone_call")`,
@@ -2183,9 +2175,9 @@ func TestPipecatMutableCallStateIsRunLocal(t *testing.T) {
 		},
 		{
 			name: "daily carrier forward",
-			bot:  artifactFile(t, dailyCarrierArtifact(t, "twilio", false), "bot.py"),
+			bot:  artifactFile(t, dailyCarrierArtifact(t, "twilio", false), agentSource),
 			want: []string{
-				"call_context = {}",
+				"call_context: dict[str, Any] = {}",
 				"call_forwarded = False",
 				"nonlocal call_forwarded",
 			},
@@ -2194,7 +2186,7 @@ func TestPipecatMutableCallStateIsRunLocal(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if strings.Count(tc.bot, "    call_context = {}") != 1 {
+			if strings.Count(tc.bot, "    call_context: dict[str, Any] = {}") != 1 {
 				t.Error("run_bot must create exactly one fresh call context")
 			}
 			if !strings.Contains(tc.bot, "call_context=call_context") {
@@ -2225,7 +2217,7 @@ func TestPipecatMutableCallStateIsRunLocal(t *testing.T) {
 // Before this feature there was no guard at all on this route: two requests in
 // one call fired two platform transfers.
 func TestUS2_DailyTransferAttemptsOnce(t *testing.T) {
-	bot := artifactFile(t, dailyCarrierArtifact(t, "twilio", false), "bot.py")
+	bot := artifactFile(t, dailyCarrierArtifact(t, "twilio", false), agentSource)
 	primitive := strings.Index(bot, "sip_call_transfer(")
 	if primitive < 0 {
 		t.Fatal("fixture emits no Daily transfer")
@@ -2301,7 +2293,7 @@ func TestUS2_DailyCarrierPlanBelongsToTheHelperNotTheAgent(t *testing.T) {
 	if !strings.Contains(report, "UNMUTE_PUBLIC_URL") {
 		t.Error("the carrier build does not require the exact public helper origin used for signature validation")
 	}
-	if bot := artifactFile(t, artifact, "bot.py"); strings.Contains(bot, "UNMUTE_PUBLIC_URL") {
+	if bot := artifactFile(t, artifact, agentSource); strings.Contains(bot, "UNMUTE_PUBLIC_URL") {
 		t.Error("the deployed agent reads the helper-only public origin")
 	}
 }
@@ -2342,7 +2334,7 @@ func TestUS3_NoPrerequisiteWithoutTheCapability(t *testing.T) {
 	configured := pkg.Targets["pipecat"]
 	configured.Connection = ""
 	pkg.Targets = map[string]spec.Target{"pipecat": configured}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2370,7 +2362,7 @@ func TestUS3_TransferDestinationIsInTheStartupCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2378,7 +2370,7 @@ func TestUS3_TransferDestinationIsInTheStartupCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	env := artifactFile(t, artifact, ".env.example")
 	for _, content := range []string{bot, env} {
 		if !strings.Contains(content, "BILLING_PHONE_NUMBER") {
@@ -2405,7 +2397,7 @@ func pipecatArtifactWithRegion(t *testing.T, region string) Artifact {
 		configured.DeploymentRegion = spec.Regions{region}
 	}
 	pkg.Targets = map[string]spec.Target{"pipecat": configured}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2536,7 +2528,7 @@ func TestV14_ActivationGatedOnPipelineStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2544,11 +2536,11 @@ func TestV14_ActivationGatedOnPipelineStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
 		"runner_ready = asyncio.Event()",
 		"pipeline_started = asyncio.Event()",
-		"worker_start_error = None",
+		"worker_start_error: Exception | None = None",
 		"entry_started = False",
 		"nonlocal entry_started",
 		"if entry_started or worker_start_error is not None:",
@@ -2568,7 +2560,7 @@ func TestV14_ActivationGatedOnPipelineStart(t *testing.T) {
 	// on_pipeline_started (post-start by definition). Assert the client-connected
 	// handler waits before invoking the helper — refactor-stable, unlike an
 	// absolute source order (agent-transfer handoffs also call activate_worker).
-	if !strings.Contains(bot, "async def activate_entry():") {
+	if !strings.Contains(bot, "async def activate_entry() -> None:") {
 		t.Errorf("bot.py missing activate_entry helper (entry activation must be centralised)")
 	}
 	started := strings.Index(bot, `@main.event_handler("on_pipeline_started")`)
@@ -2614,7 +2606,7 @@ func TestPipecatWebWaitsForRTVIClientReady(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2629,7 +2621,7 @@ func TestPipecatWebWaitsForRTVIClientReady(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 
 	if strings.Contains(bot, `@transport.event_handler("on_client_connected")`) {
 		t.Error("web bot must not greet from on_client_connected")
@@ -2655,7 +2647,7 @@ func TestV1_DailyColdTransferHandlesPrimitiveFailures(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		agent, err := ir.Build(pkg)
+		agent, err := buildWithState(t, pkg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2665,7 +2657,7 @@ func TestV1_DailyColdTransferHandlesPrimitiveFailures(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return artifactFile(t, artifact, "bot.py")
+		return artifactFile(t, artifact, agentSource)
 	}
 
 	returned := build(ir.OnUnavailableReturn)
@@ -2680,7 +2672,7 @@ func TestV1_DailyColdTransferHandlesPrimitiveFailures(t *testing.T) {
 		"this session is not a phone call, so it cannot be transferred",
 		`self.call_context.pop("_transfer_result", None)`,
 		"try:\n            error = await transport.sip_call_transfer(",
-		"except Exception as exc:\n            error = exc",
+		"except Exception as exc:  # noqa: BLE001 - the transport may raise or return a failure; both are handled below\n            error = exc",
 		"if error is not None:",
 		"Tell the caller and keep helping them.",
 	} {
@@ -2703,7 +2695,7 @@ func TestV1_DailyColdTransferHandlesPrimitiveFailures(t *testing.T) {
 		"daily": build(ir.OnUnavailableHangup),
 		"cloud": artifactFile(t, cloudWebsocketArtifact(t, cloudWebsocketOptions{
 			inbound: true, transfer: true, connection: true,
-		}), "bot.py"),
+		}), agentSource),
 	} {
 		t.Run(name, func(t *testing.T) {
 			for _, want := range []string{
@@ -2767,7 +2759,7 @@ func TestPipecatV1TaskToolAnnounceQueuesFrameFromFlowManager(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		agent, err := ir.Build(pkg)
+		agent, err := buildWithState(t, pkg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2780,7 +2772,7 @@ func TestPipecatV1TaskToolAnnounceQueuesFrameFromFlowManager(t *testing.T) {
 		if err != nil {
 			t.Fatalf("generate with announce %q: %v", announce, err)
 		}
-		return artifactFile(t, artifact, "bot.py")
+		return artifactFile(t, artifact, agentSource)
 	}
 
 	bot := load(t, "Let me check the calendar.")
@@ -2788,7 +2780,7 @@ func TestPipecatV1TaskToolAnnounceQueuesFrameFromFlowManager(t *testing.T) {
 	if !strings.Contains(bot, want) {
 		t.Errorf("a task tool must announce through FlowManager.worker: want %s", want)
 	}
-	if !regexp.MustCompile(`(?m)^from pipecat\.frames\.frames import .*TTSSpeakFrame`).MatchString(bot) {
+	if !pyImports(bot, "pipecat.frames.frames", "TTSSpeakFrame") {
 		t.Error("an announcing task tool must import TTSSpeakFrame")
 	}
 	// The line is queued, never awaited for playout: the whole point is that
@@ -2824,7 +2816,7 @@ func TestPipecatV1ToolAnnounceQueuesFrameWithoutWaiting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2835,7 +2827,7 @@ func TestPipecatV1ToolAnnounceQueuesFrameWithoutWaiting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate without announce: %v", err)
 	}
-	before := artifactFile(t, silent, "bot.py")
+	before := artifactFile(t, silent, agentSource)
 	if strings.Contains(before, "announce") {
 		t.Errorf("a package that announces nothing must not mention announce at all")
 	}
@@ -2855,9 +2847,9 @@ func TestPipecatV1ToolAnnounceQueuesFrameWithoutWaiting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	for _, want := range []string{
-		"def _direct_tool(fn=None, *, cancel_on_interruption=True, timeout_secs=None, announce=None):",
+		"def _direct_tool(\n    fn: Callable[..., Any] | None = None,\n    *,\n    cancel_on_interruption: bool = True,\n    timeout_secs: float | None = None,\n    announce: str | None = None,\n) -> Any:",
 		"await params.llm.push_frame(TTSSpeakFrame(announce))",
 		`    @_direct_tool(announce="Let me pull that invoice up.")`,
 		`    @_direct_tool(cancel_on_interruption=False, announce="Give me one second to find you.")`,
@@ -2866,7 +2858,7 @@ func TestPipecatV1ToolAnnounceQueuesFrameWithoutWaiting(t *testing.T) {
 			t.Errorf("announcing package missing %q", want)
 		}
 	}
-	if !regexp.MustCompile(`(?m)^from pipecat\.frames\.frames import .*TTSSpeakFrame`).MatchString(bot) {
+	if !pyImports(bot, "pipecat.frames.frames", "TTSSpeakFrame") {
 		t.Error("an announcing tool must import TTSSpeakFrame")
 	}
 	// The announcement is queued, never waited on: no handle await, and none of
@@ -2900,7 +2892,7 @@ func TestPipecatV1ToolAnnounceOnInlinePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2909,7 +2901,7 @@ func TestPipecatV1ToolAnnounceOnInlinePath(t *testing.T) {
 	tool.Announce = []string{"Let me look that up."}
 	agent.Tools["lookup_customer"] = tool
 
-	bot := artifactFile(t, mustGeneratePipecatInline(t, agent), "bot.py")
+	bot := artifactFile(t, mustGeneratePipecatInline(t, agent), agentSource)
 	if !strings.Contains(bot, `@_direct_tool(announce="Let me look that up.")`) {
 		t.Error("the inline emission site lost the announcement")
 	}
@@ -2933,18 +2925,24 @@ func pipecatDirectToolBody(t *testing.T, bot string) string {
 	return body
 }
 
-// pipecatHistoryBot compiles the history fixture and returns its bot.py.
+// pipecatHistoryBot compiles the history fixture and returns its agent source.
 //
 // The fixture exists because no other package in the tree authors a non-`full`
 // history on Pipecat, so before it there was nothing to compile as proof that
 // the driver reads ir.TaskContext.History at all.
 func pipecatHistoryBot(t *testing.T) string {
 	t.Helper()
+	return artifactFile(t, pipecatHistoryArtifact(t), agentSource)
+}
+
+// pipecatHistoryArtifact compiles the history fixture.
+func pipecatHistoryArtifact(t *testing.T) Artifact {
+	t.Helper()
 	pkg, err := spec.Load(filepath.Join("..", "testdata", "history_core"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2952,7 +2950,7 @@ func pipecatHistoryBot(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("generate history fixture: %v", err)
 	}
-	return artifactFile(t, artifact, "bot.py")
+	return artifact
 }
 
 // Each `context.history` value lowers to its own message list at the task
@@ -2996,15 +2994,7 @@ func TestPipecatLowersEveryTaskHistoryValue(t *testing.T) {
 	// sites and an import gated on two conditions, and a missed import is a
 	// NameError at worker start rather than anything a string assertion sees.
 	// Skipped where python3 is absent, so the default suite still needs none.
-	if _, err := exec.LookPath("python3"); err == nil {
-		path := filepath.Join(t.TempDir(), "bot.py")
-		if err := os.WriteFile(path, []byte(bot), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if out, err := exec.Command("python3", "-m", "py_compile", path).CombinedOutput(); err != nil {
-			t.Fatalf("the shaped bot.py is not valid Python:\n%s", out)
-		}
-	}
+	assertModulesCompile(t, pipecatHistoryArtifact(t), "the shaped agent")
 }
 
 // The last_n helper cuts at the front and then drops what the cut orphaned
@@ -3024,7 +3014,7 @@ func TestPipecatLastNLeavesNoOrphanedToolResult(t *testing.T) {
 	helper := pipecatMethodBody(t, bot, "def _last_n(", "\n\n\n")
 	for _, want := range []string{
 		`messages[-limit:]`,
-		`if leading and message.get("role") == "tool":`,
+		`if i >= first or not (isinstance(message, dict) and message.get("role") == "tool")`,
 	} {
 		if !containsCollapsed(helper, want) {
 			t.Errorf("the _last_n helper is missing %q:\n%s", want, helper)
@@ -3058,10 +3048,10 @@ func TestPipecatMessagesLeavesNoOrphanedToolCall(t *testing.T) {
 	}
 	helper := pipecatMethodBody(t, bot, "def _speech_only(", "\n\n\n")
 	for _, want := range []string{
-		`message.get("role") not in ("user", "assistant")`,
-		`if not message.get("tool_calls"):`,
+		`isinstance(message, dict) and message.get("role") in ("user", "assistant")`,
+		`if message.get("tool_calls") else message`,
 		`if key != "tool_calls"`,
-		`if spoken.get("content"):`,
+		`if not message.get("tool_calls") or message.get("content")`,
 	} {
 		if !containsCollapsed(helper, want) {
 			t.Errorf("the _speech_only helper is missing %q:\n%s", want, helper)
@@ -3075,7 +3065,7 @@ func TestPipecatMessagesLeavesNoOrphanedToolCall(t *testing.T) {
 		return
 	}
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "helper.py"), []byte(helper), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "helper.py"), []byte("from typing import Any\n\n"+helper), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// The live context, in order: the greeting, the caller, the delegate call,
@@ -3124,7 +3114,7 @@ assert mixed == [{"role": "assistant", "content": "Let me look."}], mixed
 // II forbids by name.
 func TestPipecatShapesAHandoffByTheSameValues(t *testing.T) {
 	bot := pipecatHistoryBot(t)
-	handoff := pipecatMethodBody(t, bot, "async def to_billing(self, params: FunctionCallParams):", "\n    @_direct_tool")
+	handoff := pipecatMethodBody(t, bot, "async def to_billing(self, params: FunctionCallParams) -> None:", "\n    @_direct_tool")
 	shapeAt := strings.Index(handoff, "self.context.set_messages([])")
 	activateAt := strings.Index(handoff, "await self.activate_worker(")
 	if shapeAt < 0 {
@@ -3156,7 +3146,7 @@ func TestPipecatRestoresTheOwnerContextAtEveryHistoryValue(t *testing.T) {
 	// restored from whatever the step was given rather than from what it had.
 	// read_back is the case that can get this wrong: it is the one whose entry
 	// both snapshots and shapes.
-	entry := pipecatMethodBody(t, bot, "async def read_back(self, params: FunctionCallParams):", "def _read_back_node_read_back")
+	entry := pipecatMethodBody(t, bot, "async def read_back(self, params: FunctionCallParams) -> None:", "def _read_back_node_read_back")
 	snapshotAt := strings.Index(entry, "self._read_back_snapshot = (")
 	shapeAt := strings.Index(entry, "self.context.set_messages(")
 	if snapshotAt < 0 || shapeAt < 0 || snapshotAt > shapeAt {
@@ -3202,7 +3192,7 @@ func TestPipecatTaskGroupStillGovernsItsMembersContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3219,7 +3209,7 @@ func TestPipecatTaskGroupStillGovernsItsMembersContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate task group: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	if !strings.Contains(bot, "_last_n(self.context.get_messages(), 2)") {
 		t.Error("the later group member does not apply its own last_n policy")
 	}
@@ -3241,7 +3231,7 @@ func TestPipecatFullOnlyPackageEmitsNoShaping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3256,7 +3246,7 @@ func TestPipecatFullOnlyPackageEmitsNoShaping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate full-only package: %v", err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	if strings.Contains(bot, "def _last_n(") {
 		t.Error("a full-only package emits the _last_n helper, so the gate on it is not working")
 	}
@@ -3268,7 +3258,7 @@ func TestPipecatFullOnlyPackageEmitsNoShaping(t *testing.T) {
 	if !strings.Contains(entry, `m.get("role") in ("user", "assistant", "tool")`) {
 		t.Errorf("history: full does not strip old instructions on task entry:\n%s", entry)
 	}
-	handoff := pipecatMethodBody(t, bot, "async def to_billing(self, params: FunctionCallParams):", "\n    @_direct_tool")
+	handoff := pipecatMethodBody(t, bot, "async def to_billing(self, params: FunctionCallParams) -> None:", "\n    @_direct_tool")
 	if !strings.Contains(handoff, `m.get("role") in ("user", "assistant", "tool")`) {
 		t.Errorf("history: full does not strip old instructions on handoff:\n%s", handoff)
 	}
@@ -3293,7 +3283,7 @@ func TestAParamReachesTheSettingsByName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot := artifactFile(t, artifact, "bot.py")
+	bot := artifactFile(t, artifact, agentSource)
 	settings := bot[strings.Index(bot, "DeepgramSTTService("):]
 	if end := strings.Index(settings, "\n    )\n"); end > 0 {
 		settings = settings[:end]

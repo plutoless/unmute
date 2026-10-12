@@ -88,24 +88,28 @@ livekit: LiveKit client tools are not proven by its driver
 pipecat: Pipecat provider-hosted tools are not proven by its driver
 ```
 
-They are listed here so you know the names mean nothing yet, and so a refusal you
-meet reads as a decision rather than a bug.
+These blocks are unsupported. Use a supported tool execution type instead.
 
 Both blocks have no fields, but YAML still needs an explicit body: write
 `client: {}` or `provider_hosted: {}`.
 
 ## How each target treats a tool
 
-| Tool kind | LiveKit | Pipecat | SLNG |
-|---|---|---|---|
-| `webhook:` | yes | yes | yes |
-| `local:` | yes | yes | **no** |
-| `builtin:` | yes | yes | yes |
-| `mcp:` | yes | yes | yes |
-| `slng:` | yes | yes | yes |
-| `knowledge:` | yes | yes | **no** |
-| `client:` | no | no | no |
-| `provider_hosted:` | no | no | no |
+| Tool kind | SLNG | LiveKit | Pipecat | Twilio |
+|---|---|---|---|---|
+| `webhook:` | yes | yes | yes | **no** |
+| `local:` | **no** | yes | yes | yes |
+| `builtin:` | yes | yes | yes | yes |
+| `mcp:` | yes | yes | yes | **no** |
+| `slng:` | yes | yes | yes | **no** |
+| `knowledge:` | **no** | yes | yes | **no** |
+| `client:` | no | no | no | no |
+| `provider_hosted:` | no | no | no | no |
+
+On Twilio, a `local:` tool needs flat `input` and `output` schemas, and the only
+builtin is `end_call`. The target runs one agent with no tasks, and it refuses
+`announce` and `interruption: cancel`. [The Twilio target](/targets/twilio#what-the-package-may-carry)
+lists every refusal.
 
 The same tool file compiles to three different runtimes, and they do not all
 support the same things. This table is the capability table, which is what the
@@ -119,8 +123,8 @@ code, version and gate pipeline, and unmute creates no tool there. A tool your
 SLNG organisation already has is reached with `slng:`; a brand new one starts in
 the SLNG dashboard. Both blocks work exactly as before on LiveKit and Pipecat.
 
-**`slng:` needs nothing local, and works everywhere because the definition
-travels when it has to.** SLNG resolves a hosted reference by name at deploy
+**`slng:` works on SLNG, LiveKit, and Pipecat; Twilio refuses it.**
+SLNG resolves a hosted reference by name at deploy
 time: no mirror, no hash, no `unmute pull`. LiveKit and Pipecat build and run
 the tool themselves, so they need a real copy; `unmute pull` is what fetches
 one, and for a code tool its module, into your package, with no network
@@ -141,27 +145,28 @@ a decision rather than a bug.
 
 ### Attaching a tool to a task
 
-| Tool kind on a task | LiveKit | Pipecat | SLNG |
+| Tool kind on a task | SLNG | LiveKit | Pipecat |
 |---|---|---|---|
-| `mcp:` | yes | **no**, list it on the agent | yes |
-| `knowledge:` | yes | **no**, list it on the agent | **no** |
-| everything else | yes | yes | no tasks at all |
+| `mcp:` | yes | yes | **no**, list it on the agent |
+| `knowledge:` | **no** | yes | **no**, list it on the agent |
+| everything else | yes | yes | yes |
 
 A tool listed on a task rather than on an agent is a narrower thing, and two kinds
 are not available everywhere.
 
 Pipecat's reason is the same for both: a task tool there is a flows handler holding
-a `FlowManager`, not a decorated function holding `FunctionCallParams`. The SLNG
-target writes one agent with one prompt, so it has no tasks to scope anything to.
+a `FlowManager`, not a decorated function holding `FunctionCallParams`. SLNG takes
+no `knowledge:` tool anywhere. On SLNG a tool that only a task lists is attached
+hidden from the main agent.
 
 ### The behavior fields
 
-| Field | LiveKit | Pipecat | SLNG |
+| Field | SLNG | LiveKit | Pipecat |
 |---|---|---|---|
 | `announce` | yes | yes | yes |
 | `inject` | yes | yes | yes |
 | `auth` | yes | yes | yes |
-| `interruption` other than `provider_default` | warns | yes | **no** |
+| `interruption` other than `provider_default` | **no** | warns | yes |
 
 LiveKit runs a tool to completion, so a per-tool interruption value has nothing to
 act on and it says so. SLNG owns its own turn taking and has no per-tool setting at
@@ -233,7 +238,7 @@ The contract fields are shared, with one exception that matters:
 </ParamField>
 
 <ParamField path="inject" type="list of one-key pairs">
-  Hidden argument/value pairs. Values are scalars or strings with `{{variable}}`
+  Hidden argument/value pairs. Values are scalars or strings with `{{state.variable}}`
   placeholders. Omit to inject nothing. Legal on local, webhook, and hosted `slng` tools;
   builtin `send_sms` requires its literal `from_number` setting.
 </ParamField>

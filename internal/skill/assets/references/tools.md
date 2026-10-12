@@ -152,9 +152,18 @@ write it into a new tool file; write the scalar name instead.
 ### Why this block exists
 
 The SLNG platform owns a tool's code, version and gate pipeline. So on an slng
-target `local:` and `webhook:` are refused: unmute creates no tool there, and a
-brand new tool starts in the SLNG dashboard. `slng:` is how a package reaches
-one that is already there.
+target `local:` and `webhook:` are refused: unmute creates no tool there. A new
+code tool starts from a Python file with `voiceai tool create`, and a new
+request tool in the SLNG dashboard. `slng:` is how a package reaches one that is
+already there.
+
+```sh
+voiceai tool create hosted/check_availability.py --description "..."   # Input, Output, handler
+voiceai tool run check_availability --input sample.json --confirm-side-effects
+voiceai tool publish check_availability    # a push attaches only a published version
+```
+
+`voiceai tool update <name> --file <path>` changes it later.
 
 It costs no portability, for a package that wants livekit or pipecat too. A
 pulled mirror carries the platform's own introspected schema and, for a code
@@ -343,12 +352,12 @@ input:
   properties: {}
 
 inject:
-  - customer_id: "{{customer_id}}"
+  - customer_id: "{{state.customer_id}}"
   - channel: phone
 
 webhook:
   url_env: SALON_API_URL
-  path: /customers/{{customer_id}}/appointments/confirm
+  path: /customers/{{state.customer_id}}/appointments/confirm
   auth:
     type: bearer
     token_env: SALON_API_TOKEN
@@ -360,7 +369,7 @@ interruption: provider_default
 | Field | Required | What it is |
 |---|---|---|
 | `url_env` | yes | the `UPPER_SNAKE` name of a variable holding the base URL |
-| `path` | no | starts with `/`, is appended to that base URL, and may carry `{{variable}}` tokens |
+| `path` | no | starts with `/`, is appended to that base URL, and may carry `{{state.variable}}` tokens |
 | `auth` | no | `bearer` or `api_key`; an API key may name a custom `header` |
 
 `webhook:` runs on LiveKit and Pipecat. For SLNG, create the request tool in
@@ -392,7 +401,7 @@ input:
 
 webhook:
   url_env: COURIER_API_URL
-  path: /tracking/{{tracking_number}}   # WRONG: that is an input property
+  path: /tracking/{{state.tracking_number}}   # WRONG: that is an input property
 ```
 
 ```
@@ -410,7 +419,7 @@ webhook:
 ```
 
 The API then receives `{"tracking_number": "..."}` in the body. Only put a
-`{{name}}` in the path when `name` is in the package's top-level `variables:`
+`{{state.name}}` in the path when `name` is in the package's top-level `variables:`
 block, and say to the user which shape the request ended up with, because they
 may need to change their endpoint to match.
 
@@ -441,7 +450,7 @@ input:
   properties: {}
 
 inject:
-  - customer_id: "{{customer_id}}"
+  - customer_id: "{{state.customer_id}}"
 
 output:
   type: object
@@ -615,11 +624,15 @@ registry default is used.
 Add `end_call` to every agent that answers a phone. `unmute init` scaffolds it
 for exactly that reason.
 
+On `slng`, `end_call` says its own goodbye before it hangs up, "Thanks for
+calling. Goodbye!" by default. Set your own with `announce:` (see "When to write
+`announce:`" below), and do not tell the model to say goodbye too.
+
 ## Hidden values the model cannot see
 
 ```yaml
 inject:
-  - customer_id: "{{customer_id}}"
+  - customer_id: "{{state.customer_id}}"
   - channel: phone
 ```
 
@@ -696,7 +709,10 @@ line, rather than quietly narrowed to the first entry.
 
 **On `slng`, a `builtin:` takes one too.** A curated capability is an
 attachment like any other, so `tools/current_datetime.yaml` can speak before it
-reads the clock and `tools/end_call.yaml` can say goodbye before hanging up. A
+reads the clock. On `tools/end_call.yaml` the line is the goodbye: SLNG's
+`end_call` always says one before it hangs up, "Thanks for calling. Goodbye!"
+by default, and `announce:` replaces it. Do not also tell the model to say
+goodbye before it calls `end_call`, or the caller hears two. A
 code target refuses it by name: it builds the prebuilt from its own SDK and has
 no seam in front of it.
 

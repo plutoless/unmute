@@ -173,7 +173,7 @@ func TestDev_help(t *testing.T) {
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
 	cmd.SetArgs([]string{"dev", "--help"})
-	if err := cmd.Execute(); err != nil {
+	if err := cmd.ExecuteContext(recordedCtx(t)); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"--no-open", "--bot-port", "--target", "--var", "UNMUTE_DEV_PORT", "talk to it"} {
@@ -238,6 +238,7 @@ func TestSelectDevTargetAutoSelectsSoleInstance(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := newRootCmd()
+	cmd.SetContext(recordedCtx(t))
 	cmd.SetIn(strings.NewReader(""))
 	cmd.SetOut(&bytes.Buffer{})
 	name, err := selectDevTarget(cmd, dir, "")
@@ -252,6 +253,7 @@ func TestSelectDevTargetAutoSelectsSoleInstance(t *testing.T) {
 func TestSelectDevTargetRequiresNameForMultipleWithoutTTY(t *testing.T) {
 	dir := copySafeCore(t)
 	cmd := newRootCmd()
+	cmd.SetContext(recordedCtx(t))
 	cmd.SetIn(strings.NewReader(""))
 	cmd.SetOut(&bytes.Buffer{})
 	_, err := selectDevTarget(cmd, dir, "")
@@ -322,6 +324,7 @@ func TestDevLocalTelephonyFlagsAreRemoved(t *testing.T) {
 func TestSelectDevTargetRejectsUnknownInstance(t *testing.T) {
 	dir := copySafeCore(t)
 	cmd := newRootCmd()
+	cmd.SetContext(recordedCtx(t))
 	cmd.SetIn(strings.NewReader(""))
 	cmd.SetOut(&bytes.Buffer{})
 	_, err := selectDevTarget(cmd, dir, "missing")
@@ -353,7 +356,7 @@ func TestDevWithNoArgumentResolvesTheCurrentDirectory(t *testing.T) {
 	// An undeclared target is rejected just after the directory is resolved, so
 	// this error means dev accepted the zero-argument form.
 	cmd.SetArgs([]string{"dev", "--target", "nope"})
-	err := cmd.Execute()
+	err := cmd.ExecuteContext(recordedCtx(t))
 	if err == nil || !strings.Contains(err.Error(), `target instance "nope" is not declared`) {
 		t.Fatalf("dev with no directory did not reach target selection: %v", err)
 	}
@@ -366,11 +369,25 @@ func TestDevWithNoArgumentOutsideAPackageExplainsItself(t *testing.T) {
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
 	cmd.SetArgs([]string{"dev"})
-	err := cmd.Execute()
+	err := cmd.ExecuteContext(recordedCtx(t))
 	if err == nil {
 		t.Fatal("dev outside a package must fail")
 	}
 	if !strings.Contains(err.Error(), "agent.yaml") || strings.Contains(err.Error(), "accepts 1 arg") {
 		t.Fatalf("dev must explain itself, not print the cobra arity error: %v", err)
+	}
+}
+
+// A twilio target has no browser loop, and `dev` says so before it writes or
+// starts anything, naming the runbook to follow instead.
+func TestDevRefusesATwilioTargetTruthfully(t *testing.T) {
+	_, err := run(t, "dev", filepath.Join("..", "testdata", "twilio"), "--target", "twilio", "--no-open")
+	if err == nil {
+		t.Fatal("dev accepted a twilio target")
+	}
+	for _, want := range []string{"no local browser loop", "public https origin", "build/twilio/README.md"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("dev refusal does not say %q: %v", want, err)
+		}
 	}
 }

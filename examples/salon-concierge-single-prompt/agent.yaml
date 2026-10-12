@@ -10,15 +10,11 @@ agents:
     think: reasoning
     speak: voice
     tools:
-      - get_current_date
       - look_up_salon_info
       - look_up_refund_policy
       - find_or_create_customer
-      - list_bookings
-      - check_availability
-      - create_booking
-      - modify_booking
-      - cancel_booking
+      - find_slots
+      - save_booking
       - record_complaint
       - end_call
     escalations:
@@ -32,8 +28,27 @@ escalations:
       ring_timeout: 30s
       on_unavailable: hangup
 
+# The same two reads as salon-concierge, so neither package spends a model
+# request on what day it is. No `variables:` entry confirms the caller's number:
+# that needs a task, and this package has none. The prompt reads it back instead
+# and the model passes the agreed number to each tool itself.
+prefetch:
+  - name: today
+    clock: now
+    timezone: Europe/Madrid
+    assign:
+      - booking_date: result.date
+      - booking_weekday: result.day_of_week
+      - salon_local_time: result.time
+
+  - name: caller
+    source: from_number
+    assign:
+      - customer_phone: result.value
+
 secrets:
   - OPENAI_API_KEY
+  - GOOGLE_API_KEY
   - SLNG_API_KEY
   - LANGFUSE_SECRET_KEY
   - LANGFUSE_PUBLIC_KEY
@@ -61,12 +76,13 @@ knowledge:
 models:
   think:
     reasoning:
-      provider: openai
-      model: gpt-5.6-luna
+      provider: google
+      model: gemini-3.1-flash-lite
       params:
-        api: responses
-        reasoning_effort: "none"
-        use_websocket: true
+        vertexai: true
+        location: eu
+        thinking_config:
+          thinking_level: MINIMAL
   speak:
     voice:
       provider: slng
@@ -90,16 +106,12 @@ models:
       pace: snappy
 
 tools:
-  - get_current_date
   - find_or_create_customer
+  - find_slots
+  - save_booking
+  - record_complaint
   - look_up_refund_policy
   - look_up_salon_info
-  - list_bookings
-  - check_availability
-  - create_booking
-  - modify_booking
-  - cancel_booking
-  - record_complaint
   - end_call
 
 conversation:

@@ -42,7 +42,7 @@ spec.Load -> ir.Build -> ir.Validate -> generate.Generate
                                   Target-native project
                                               |
                                               v
-                                      LiveKit or Pipecat
+                                LiveKit, Pipecat, SLNG or Twilio
 ```
 
 Four rules hold the boundary:
@@ -62,8 +62,11 @@ package differently.
 1. `internal/spec.Load` reads `agent.yaml`, `targets.yaml`, prompts, tools,
    connections, local handlers, and the linked package-root `manifest`.
    Strict decoding rejects unknown fields.
+   A package's call state is the author's own Pydantic `state.py`.
+   `internal/stateschema` runs it through uv with pinned Pydantic and reads the
+   JSON Schema Pydantic writes for `State`. Go never parses a Python type.
 2. `internal/ir.Build` resolves names, model bindings, controls, connections,
-   overrides, and routes into target-independent IR.
+   overrides, the state schema, and routes into target-independent IR.
 3. `internal/ir.Validate` checks the IR against the selected target's
    capability table. Unsupported behavior fails before generation. Safe
    target differences can produce warnings. A package manifest additionally
@@ -85,14 +88,26 @@ records its company name, revision and language or region verification gaps.
 The source package describes durable behavior. A target driver owns how that
 behavior is expressed in one framework.
 
-- **LiveKit** emits `agent.py` and uses a separate LiveKit Server for media,
+- **LiveKit** emits `agent.py` (the entry point, with `call.py`, `agents.py`,
+  `session.py`, `state.py`, `call_state.py`, `settings.py`, `prompts/` and `utils/` beside it) and uses a separate LiveKit Server for media,
   rooms, and job dispatch.
-- **Pipecat** emits `bot.py`. The generated process owns both its network
+- **Pipecat** emits `bot.py` (the entry point, with the same modules beside
+  it). The generated process owns both its network
   endpoint and conversation pipeline.
+- **Twilio** emits `app.py` (the entry point, with `call.py`, `brain.py`,
+  `handoff.py`, `tool_runner.py`, `settings.py` and `prompts/` beside it), a
+  web app on no agent framework. Twilio
+  ConversationRelay owns speech and turn taking; the app owns the history, the
+  tools and call admission. Its facts and refusals live in
+  `internal/target/twilio_target.go` and `internal/ir/validate_twilio.go`.
+- **SLNG** emits a deployment body and a runbook, not a project. The platform
+  runs the agent.
 
-Both outputs are normal Python projects with pinned dependencies, a
-Dockerfile, a compile report, and a generated runbook. They can run without
-Unmute after compilation.
+The three project outputs are normal Python projects with pinned dependencies,
+a Dockerfile, a compile report, and a generated runbook. They can run without
+Unmute after compilation. `target.EmitsProject` answers "is there a project";
+`target.IsCode` answers "is it built on LiveKit or Pipecat", which is what a
+framework version, author pins and a worker per session need.
 
 ## Runtime topology
 
@@ -138,17 +153,45 @@ and WebSocket front door. Routes that need shared call coordination use Redis
 for bounded records such as call correlation, idempotency, transfers, and
 admission counters.
 
+### Twilio ConversationRelay
+
+```text
+Caller --PSTN--> Twilio ConversationRelay <--WSS text--> generated app.py
+                  (speech, turn taking)                   |- signed routes
+                                                          |- history and tools
+                                                          `- OpenAI or Gemini
+```
+
+One process and one replica. Admission is an in-process counter bounded by
+`capacity.max_sessions`, so there is no Redis and no shared store. Every
+request is checked against Twilio's signature, built from the configured
+public origin rather than request headers. The app keeps one reader and one
+response owner per call; a generation number drops speech an interrupt made
+obsolete. A tool handler is never cancelled, and its call slot stays taken
+until it really ends. The app embeds an `artifact_id`, a hash of the files
+that decide behaviour, and `/healthz` returns it.
+
+The number's webhook is set by `unmute deploy --target <name>`, or by the
+operator in the Console. Deploy reads the number, compares the host's
+`artifact_id`, sends `/voice` one signed request, then writes `VoiceUrl` and
+`VoiceMethod` directly over the Twilio REST API and reads them back. It uploads
+nothing and places no call.
+
 ### Where a phone call is exercised
 
 Nowhere on the developer's machine. A phone call reaches an agent that is
-deployed, and every telephony route this compiler emits deploys to a managed
-platform:
+deployed:
 
 ```text
 LiveKit `sip`        LiveKit `connector`      LiveKit Cloud
 Pipecat `cloud-websocket`                     Pipecat Cloud
 Pipecat `daily-sip`                           Pipecat Cloud
+Twilio `conversation-relay`                   a public HTTPS host you run
 ```
+
+The twilio target has no browser loop at all: Twilio does its speech, and only
+reaches a public origin. `scripts/text_run_twilio.py` drives its protocol with a
+signed fake ConversationRelay client instead.
 
 So there is one local loop, the browser, and it is the whole of `unmute dev`. It
 exercises the prompt, the tools, the models and the turn-taking, and it stops
@@ -180,7 +223,7 @@ path, including an interrupt during a build.
 The emitted agent prints a flushed, framed stdout line whenever recognized or
 generated text, activity, or a measurement changes. The line is the boundary:
 `internal/devmetrics` owns the typed Go contract and decoder; each target's
-`dev_metrics.py` produces it. Agreement fixtures and SDK smoke tests hold the
+`utils/dev_metrics.py` produces it. Agreement fixtures and SDK smoke tests hold the
 two languages to the same contract.
 
 V2 records are full snapshots of calls, exchanges, text segments, operations,
@@ -231,7 +274,9 @@ entries it needs, and its compile report names those as deferred rather than
 silently skipping them. Resolving a reference to a published tool, checking
 it, and discovering Vault requirements happen once, in `internal/cli`, when
 an author runs `unmute deploy`; that is the only place a credential is read
-or an account write happens. A committed mirror is the one exception, and it
+or an account write happens. SLNG writes always go through the `voiceai` CLI.
+The twilio target is the one direct write: `internal/cli/deploy_twilio.go`
+sets two fields of one Twilio number, with the author's Auth Token. A committed mirror is the one exception, and it
 narrows rather than widens the boundary: `internal/ir` checks it offline for
 a selected code target only, because that target builds and runs the tool
 itself, and a `slng`-only compile needs none.

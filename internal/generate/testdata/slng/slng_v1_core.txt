@@ -41,11 +41,10 @@ One SLNG key serves every SLNG role, so this is the same key a generated livekit
 or pipecat project reads at run time. `VOICEAI_API_KEY` is the name the push
 tool itself reads, and either works.
 
-The organisation the push resolved is printed on every run. That matters because
-an exported key and a stored profile can belong to **different** organisations,
-and nothing else on screen would tell you which one you just wrote to.
+The key decides the organisation. An exported key wins over a stored profile,
+and the `credential from` line names the key a deploy used.
 
-Deployment requires a compatible `voiceai`; this flow was verified with 0.1.18.
+Deployment requires `voiceai` 0.1.22 or later.
 Use `--dry-run` to preview checked versions and attachment changes without
 changing SLNG. Future session inputs remain runtime checks. The result is saved
 in `deploy-report.json` beside these files.
@@ -109,8 +108,9 @@ organisation already holds. Nothing here is yours to edit by hand.
 
 **A curated capability is no exception.** A builtin such as `end_call` needs
 nothing *created*, and its `tool_id` still has to be filled in, which the push
-does. A setting the package pinned with `inject:` rides the attachment as
-`config_overrides`, so it is this agent's and does not change the shared tool.
+does. A setting the package pinned with `inject:`, and the `announce:` on
+`end_call`, which is its goodbye, ride the attachment as `config_overrides`, so
+they are this agent's and do not change the shared tool.
 
 This package's curated references: `end_call`.
 
@@ -127,8 +127,8 @@ For your own LiveKit client, use the agent id step 2 printed and the same accoun
 export VOICEAI_API_KEY="$SLNG_API_KEY"
 ```
 
-Supply a request body with `--file`. Write a `session.json`, filling in any
-required session arguments:
+The command below takes every default, and needs `voiceai` 0.1.22 or later. To
+set session arguments, write a `session.json` and add `--file session.json`:
 
 ```json
 {"arguments": {}, "participant_name": "you"}
@@ -138,13 +138,13 @@ required session arguments:
 takes strings only, at most 32 of them.
 
 This agent declares: `customer_name`.
-A declared default can fill an omitted value. Supply any value a required
+A default in `state.py` can fill an omitted value. Supply any value a required
 tool binding uses when it has no default; otherwise session creation is refused.
 Inbound phone calls supply no session arguments. Every required injected input
 needs a valid default before SLNG can attach an inbound trunk.
 
 ```bash
-voiceai agents web-sessions create <agent_id> --file session.json
+voiceai agents web-sessions create <agent_id>
 ```
 
 That returns LiveKit connection details and requests a worker. Connect a
@@ -289,7 +289,10 @@ Compile from the package instead. That is the shape this file is.
     "customer_name": {
       "required": true
     }
-  }
+  },
+  "shapes": [],
+  "tasks": [],
+  "task_groups": []
 }
 === compile-report.json ===
 {

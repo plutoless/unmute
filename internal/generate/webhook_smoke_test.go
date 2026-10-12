@@ -68,7 +68,7 @@ os.environ["UNMUTE_CALL_START"] = json.dumps(
 const pipecatWebhookSmokeScript = echoServerPreamble + `
 import asyncio
 
-import bot  # noqa: E402
+bot = _project("bot")
 
 
 class _Params:
@@ -83,10 +83,7 @@ state = bot.build_state()
 # Set here, not hydrated: this pipecat target has no telephony plane.
 state.dialed_number = "+15551230000"
 # verify_customer assigns both fields, and the status is a required Literal.
-bot._save_result(
-    "verify_customer",
-    state,
-    {"customer_phone": state.customer_phone, "customer_status": "existing"},
+state.save_result("verify_customer", {"customer_phone": state.customer_phone, "customer_status": "existing"},
 )
 agent = bot.ConciergeAgent(state=state, context=None, call_context=None)
 
@@ -135,16 +132,13 @@ const livekitWebhookSmokeScript = echoServerPreamble + `
 import asyncio
 from types import SimpleNamespace
 
-import agent as generated  # noqa: E402
+generated = _project("agent")
 
-userdata = generated.Userdata()
+userdata = generated.CallState()
 generated._hydrate_call_start(userdata, generated._dispatched_call_start({}))
 userdata.dialed_number = "+15551230000"
 # verify_customer assigns both fields, and the status is a required Literal.
-generated._save_result(
-    "verify_customer",
-    userdata,
-    {"customer_phone": userdata.customer_phone, "customer_status": "existing"},
+userdata.save_result("verify_customer", {"customer_phone": userdata.customer_phone, "customer_status": "existing"},
 )
 ctx = SimpleNamespace(userdata=userdata)
 desk = generated.Concierge()
@@ -192,7 +186,7 @@ func TestSmokeLiveKitWebhookSendsInjectedBodyPathAndToken(t *testing.T) {
 const pipecatAPIKeySmokeScript = echoServerPreamble + `
 import asyncio
 
-import bot  # noqa: E402
+bot = _project("bot")
 
 
 class _Params:
@@ -207,10 +201,7 @@ state = bot.build_state()
 # Set here, not hydrated: this pipecat target has no telephony plane.
 state.dialed_number = "+15551230000"
 # verify_customer assigns both fields, and the status is a required Literal.
-bot._save_result(
-    "verify_customer",
-    state,
-    {"customer_phone": state.customer_phone, "customer_status": "existing"},
+state.save_result("verify_customer", {"customer_phone": state.customer_phone, "customer_status": "existing"},
 )
 agent = bot.ConciergeAgent(state=state, context=None, call_context=None)
 asyncio.run(agent.confirm_appointment(_Params()))
@@ -243,16 +234,13 @@ const livekitAPIKeySmokeScript = echoServerPreamble + `
 import asyncio
 from types import SimpleNamespace
 
-import agent as generated  # noqa: E402
+generated = _project("agent")
 
-userdata = generated.Userdata()
+userdata = generated.CallState()
 generated._hydrate_call_start(userdata, generated._dispatched_call_start({}))
 userdata.dialed_number = "+15551230000"
 # verify_customer assigns both fields, and the status is a required Literal.
-generated._save_result(
-    "verify_customer",
-    userdata,
-    {"customer_phone": userdata.customer_phone, "customer_status": "existing"},
+userdata.save_result("verify_customer", {"customer_phone": userdata.customer_phone, "customer_status": "existing"},
 )
 asyncio.run(generated.Concierge().confirm_appointment(SimpleNamespace(userdata=userdata)))
 

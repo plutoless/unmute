@@ -44,22 +44,33 @@ type slngBody struct {
 	ToolMode      string     `json:"tool_mode"`
 	ToolRefs      []slngRef  `json:"tool_refs"`
 	MCPRefs       []slngMCP  `json:"mcp_refs"`
-	// RuntimeVars are the package's `source: conversation` variables: values the
-	// model records during the call through the platform's own
-	// set_runtime_variables tool. Never nil, so a package with none says [] and
-	// not null (see the comment where the body is built).
+	// RuntimeVars are the values saved during the call: what a task's assign:
+	// writes, and the package's `source: conversation` variables, which the
+	// model records through the platform's own set_runtime_variables tool.
+	// Never nil, so a package with none says [] and not null (see the comment
+	// where the body is built).
 	RuntimeVars []slngRuntimeVar `json:"runtime_variables"`
 	Defaults    slngStrings      `json:"template_defaults"`
 	Variables   slngOptions      `json:"template_variable_options"`
+	// Never nil either, and for a reason of the platform's: a replace that
+	// leaves out both tasks and task_groups keeps the stored ones
+	// (app/services/agent_config.py OmittedTaskFields), so [] is the only way
+	// a push can say "this agent has none".
+	Shapes     []slngShape `json:"shapes"`
+	Tasks      []slngTask  `json:"tasks"`
+	TaskGroups []slngGroup `json:"task_groups"`
 }
 
-// slngRuntimeVar is RuntimeVariableDefinition (agent_config.py): a name and a
-// description the model reads, nothing else. A runtime variable has no default
-// and no required flag, and its name may not collide with a template variable,
-// which the two loops in buildSlng keep apart by construction.
+// slngRuntimeVar is RuntimeVariableDefinition (agent_config.py). A runtime
+// variable has no default and no required flag, and its name may not collide
+// with a template variable, which the two loops in buildSlng keep apart by
+// construction. Type is left out when it is str, and Confirm when no task
+// confirms the value, the two defaults SLNG drops when it stores one.
 type slngRuntimeVar struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	Type        string `json:"type,omitempty"`
+	Confirm     string `json:"confirm,omitempty"`
 }
 
 // slngStrings and slngOptions are named map types so a nil map still encodes as
@@ -145,6 +156,9 @@ type slngRef struct {
 	// ToolConfigOverrides is a seven-member union with no code member, so a code
 	// tool cannot be tuned per agent through config at all.
 	Config map[string]any `json:"config_overrides,omitempty"`
+	// Visible is false for a tool only a task lists, and absent otherwise,
+	// which SLNG reads as true (shared_tool_contract.py visible_to_agent).
+	Visible *bool `json:"visible_to_agent,omitempty"`
 
 	// origin is the package tool this reference was built from, and it is not
 	// always Tool: a hosted reference emits the name the organisation holds,
@@ -213,6 +227,8 @@ type slngMCP struct {
 	Server     string `json:"server"`
 	Tool       string `json:"tool_name"`
 	Invocation string `json:"invocation,omitempty"`
+	// Visible is slngRef.Visible, for an MCP tool only a task lists.
+	Visible *bool `json:"visible_to_agent,omitempty"`
 	// ServerID and SchemaHash are the resolved half, filled only by
 	// SlngResolvedBody for the same reason and under the same omitempty rule as
 	// slngRef's two above.
@@ -263,6 +279,9 @@ func buildSlng(agent *ir.Agent, tgt ir.Target) (slngArtifacts, error) {
 		RuntimeVars: []slngRuntimeVar{},
 		Defaults:    slngStrings{},
 		Variables:   slngOptions{},
+		Shapes:      []slngShape{},
+		Tasks:       []slngTask{},
+		TaskGroups:  []slngGroup{},
 	}}
 	if agent.Conversation != nil && agent.Conversation.Greeting != nil {
 		built.Body.Greeting = agent.Conversation.Greeting.Text
@@ -292,7 +311,7 @@ func buildSlng(agent *ir.Agent, tgt ir.Target) (slngArtifacts, error) {
 	built.Body.Models = slngModelsFor(agent, tgt, entry)
 	built.Body.Language = slngLanguage(tgt)
 
-	refs, mcp, err := slngTools(agent, tgt, entry)
+	refs, mcp, toolNames, err := slngTools(agent, tgt, entry)
 	if err != nil {
 		return slngArtifacts{}, err
 	}
@@ -303,19 +322,27 @@ func buildSlng(agent *ir.Agent, tgt ir.Target) (slngArtifacts, error) {
 	// declared set from the union of the two maps' keys, so a variable missing
 	// from template_variable_options would be rejected at dispatch even with a
 	// default present.
+	runtime := ir.SlngRuntimeVariables(agent)
 	for _, name := range slices.Sorted(maps.Keys(agent.Variables)) {
 		variable := agent.Variables[name]
-		// A value the model records is a runtime variable, and SLNG refuses a
-		// name that is both a runtime and a template variable, so it goes in one
-		// list and not the other.
-		if variable.Source == ir.VariableSourceConversation {
+		// A value saved during the call is a runtime variable, and SLNG refuses
+		// a name that is both a runtime and a template variable, so it goes in
+		// one list and not the other.
+		if runtime[name] {
 			built.Body.RuntimeVars = append(built.Body.RuntimeVars, slngRuntimeVar{Name: name, Description: variable.Description})
 			continue
 		}
-		built.Body.Variables[name] = slngVariableOption{Required: true}
+		// A call fact (call_id, from_number, ...) is filled by the phone adapter
+		// on the code targets. SLNG fills none of them, and an inbound call
+		// carries no arguments, so a required one refuses every inbound call
+		// that names it. Optional, it renders empty.
+		built.Body.Variables[name] = slngVariableOption{Required: !ir.IsSystemSource(variable.Source)}
 		if text, ok := variable.Default.(string); ok {
 			built.Body.Defaults[name] = text
 		}
+	}
+	if err := slngTaskBody(agent, &built.Body, toolNames); err != nil {
+		return slngArtifacts{}, err
 	}
 	// Before the runbook, which renders half of it. Deriving it here rather than
 	// inside slngRunbookFor keeps the runbook a renderer: what a package needs
@@ -379,16 +406,16 @@ func slngModelsFor(agent *ir.Agent, tgt ir.Target, entry ir.AgentDef) slngModels
 	}
 	if listen := tgt.Models.Listen; listen != nil {
 		models.STT = slngModelName(*listen)
-		models.STTKwargs = slngKwargs(listen.Params)
+		models.STTKwargs = slngModelKwargs(listen.Params)
 	}
 	if reason := tgt.Models.Reason[entry.Model]; reason.Model != "" {
 		models.LLM = slngModelName(reason)
-		models.LLMKwargs = slngKwargs(reason.Params)
+		models.LLMKwargs = slngModelKwargs(reason.Params)
 	}
 	if speak, ok := tgt.Models.Speak[entry.Voice]; ok {
 		models.TTS = slngModelName(speak)
 		models.TTSVoice = firstNonEmpty(speak.VoiceID, speak.Voice)
-		models.TTSKwargs = slngKwargs(speak.Params)
+		models.TTSKwargs = slngModelKwargs(speak.Params)
 	}
 	models.Fallbacks = slngFallbacksFor(agent, tgt, entry)
 	return models
@@ -433,6 +460,15 @@ func slngModelName(binding ir.Binding) string {
 	return binding.Provider + "/" + binding.Model
 }
 
+// slngModelKwargs is slngKwargs minus the world part keys, for all three models.
+// On the code targets world_part picks the speech gateway, and on a think model
+// it (or the older world_part_override) builds the Context Router base URL. On
+// SLNG the agent's region does both, and SLNG refuses world_part as a model
+// kwarg. Same reason the LiveKit driver drops it.
+func slngModelKwargs(params map[string]any) map[string]any {
+	return slngKwargs(withoutParams(params, []string{"world_part", "world_part_override"}))
+}
+
 // slngKwargs forwards a binding's params as written. It exists to turn a nil map
 // into an empty one, because the reference export carries {} for all three and an
 // absent key is a different statement from an empty object.
@@ -444,24 +480,39 @@ func slngKwargs(params map[string]any) map[string]any {
 }
 
 // slngTools walks the entry agent's tools in the order the package lists them,
-// so the emitted body's order follows the package rather than a map iteration.
-func slngTools(agent *ir.Agent, tgt ir.Target, entry ir.AgentDef) ([]slngRef, []slngMCP, error) {
+// then each task's, so the emitted body's order follows the package rather
+// than a map iteration. A tool only a task lists is attached hidden from the
+// main agent, which is how SLNG keeps it in the task. It also returns the
+// names each package tool is attached under, which is how a task names it.
+func slngTools(agent *ir.Agent, tgt ir.Target, entry ir.AgentDef) ([]slngRef, []slngMCP, map[string][]string, error) {
 	refs := []slngRef{}
 	mcpRefs := []slngMCP{}
-	for _, name := range entry.Tools {
+	names := map[string][]string{}
+	walk := slices.Clone(entry.Tools)
+	for _, task := range slices.Sorted(maps.Keys(agent.Tasks)) {
+		walk = append(walk, agent.Tasks[task].Tools...)
+	}
+	hidden := new(bool) // false, shared: one pointer reads the same everywhere
+	for i, name := range walk {
 		tool, ok := agent.Tools[name]
-		if !ok {
-			// A control, not a tool. Controls reach SLNG as curated capabilities
-			// attached in the dashboard, which the capability table already says.
+		if !ok || names[name] != nil {
+			// A control, not a tool, or a tool already attached. Controls reach
+			// SLNG as curated capabilities attached in the dashboard, which the
+			// capability table already says.
 			continue
+		}
+		var visible *bool
+		if i >= len(entry.Tools) {
+			visible = hidden
 		}
 		if tool.Execution == ir.ToolMCP {
 			for _, exposed := range tool.MCPTools {
 				mcpRefs = append(mcpRefs, slngMCP{
 					Server: mcpServerName(name, tool), Tool: exposed,
-					Invocation: slngInvocation, origin: name,
+					Invocation: slngInvocation, Visible: visible, origin: name,
 				})
 			}
+			names[name] = tool.MCPTools
 			continue
 		}
 		// The emitted name is the hosted one for a `slng:` reference and the
@@ -477,9 +528,11 @@ func slngTools(agent *ir.Agent, tgt ir.Target, entry ir.AgentDef) ([]slngRef, []
 			Tool:        emitted,
 			Description: tool.Description,
 			Invocation:  slngInvocation,
+			Visible:     visible,
 			origin:      name,
 			hosted:      hosted,
 		}
+		names[name] = []string{emitted}
 		// An attachment description is an override, so only an authored one is
 		// written. A hosted tool with no `description:` inherits the published
 		// one, and removing the field restores that inheritance rather than
@@ -490,15 +543,20 @@ func slngTools(agent *ir.Agent, tgt ir.Target, entry ir.AgentDef) ([]slngRef, []
 		// One line, always: the attachment carries exactly one pre-action
 		// message, which is why ir.Validate refuses alternatives on this target
 		// rather than silently speaking the first of them.
-		if len(tool.Announce) > 0 {
+		//
+		// Not on end_call. SLNG's end_call speaks its own goodbye after the
+		// pre-action ("Thanks for calling. Goodbye!", strict_tool_runtime.py),
+		// so an announce there made the caller hear two. slngPrebuiltConfig
+		// writes it as that goodbye instead.
+		if len(tool.Announce) > 0 && !slngEndCall(tool) {
 			ref.Policy = &slngPolicy{PreActionMessage: &slngPreAction{
 				Enabled: true,
 				Text:    slngSegments{Segments: []slngSegment{{Type: "literal", Value: tool.Announce[0]}}},
 				// A tool that ends the conversation is the one case where the
-				// agent must finish speaking first: end_call hangs up the moment
-				// it runs, so a goodbye spoken alongside it is cut off mid-word.
-				// Every other announce covers a wait, and waiting for it would
-				// add the silence it exists to fill.
+				// agent must finish speaking first: a hangup cuts off a goodbye
+				// spoken alongside it mid-word. Every other announce covers a
+				// wait, and waiting for it would add the silence it exists to
+				// fill.
 				Wait: tool.Effect == ir.ToolEndsConversation,
 			}}
 		}
@@ -510,14 +568,16 @@ func slngTools(agent *ir.Agent, tgt ir.Target, entry ir.AgentDef) ([]slngRef, []
 		// argument for at all. Either way the arguments stay empty, because a
 		// curated capability publishes no argument schema to put one in.
 		if tool.Execution == ir.ToolBuiltin {
-			if prebuilt, known := targetcap.LookupPrebuilt(tool.Builtin); known && len(prebuilt.Config) > 0 {
+			if prebuilt, known := targetcap.LookupPrebuilt(tool.Builtin); known {
 				ref.Config = slngPrebuiltConfig(prebuilt, tool)
-				ref.Arguments = slngArguments{}
+				if len(prebuilt.Config) > 0 {
+					ref.Arguments = slngArguments{}
+				}
 			}
 		}
 		refs = append(refs, ref)
 	}
-	return refs, mcpRefs, nil
+	return refs, mcpRefs, names, nil
 }
 
 // slngPrebuiltConfig is one member of ToolConfigOverrides
@@ -539,6 +599,15 @@ func slngPrebuiltConfig(prebuilt targetcap.Prebuilt, tool ir.Tool) map[string]an
 			config[key] = value
 		}
 	}
+	// end_call's goodbye comes from `announce:`, not `inject:`: it is the one
+	// sentence spoken before the tool ends the call, which is what announce
+	// already means everywhere else. Plain maps rather than slngSegments, so
+	// the deploy preview compares it with the live value as JSON.
+	if slngEndCall(tool) && len(tool.Announce) > 0 {
+		config["goodbye_message"] = map[string]any{"segments": []any{
+			map[string]any{"type": "literal", "value": tool.Announce[0]},
+		}}
+	}
 	if len(config) == 1 {
 		// Nothing was pinned, so the package is making no claim about this
 		// capability's settings and an override saying only its own type would
@@ -546,6 +615,12 @@ func slngPrebuiltConfig(prebuilt targetcap.Prebuilt, tool ir.Tool) map[string]an
 		return nil
 	}
 	return config
+}
+
+// slngEndCall reports a `builtin: end_call`, whose `announce:` is SLNG's
+// goodbye and not a pre-action message.
+func slngEndCall(tool ir.Tool) bool {
+	return tool.Execution == ir.ToolBuiltin && tool.Builtin == "end_call"
 }
 
 // mcpServerName is the platform's name for the server a tool reads.

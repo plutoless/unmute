@@ -30,13 +30,13 @@ import os
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import agent as agent_module  # noqa: E402
+agent_module = _project("agent")
 
 from livekit.agents import Agent  # noqa: E402
 
 classes = sorted(
     (name for name, obj in vars(agent_module).items()
-     if inspect.isclass(obj) and issubclass(obj, Agent) and obj.__module__ == "agent"),
+     if inspect.isclass(obj) and issubclass(obj, Agent) and obj.__module__ == "agents"),
 )
 assert classes, "no Agent classes found in agent.py"
 
@@ -57,7 +57,7 @@ import os
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import agent  # noqa: F401, E402
+_project("agent")
 from livekit.plugins import slng  # noqa: E402
 
 stt = slng.STT(
@@ -103,10 +103,12 @@ assert version("livekit-agents") == _report["version"], (version("livekit-agents
 for name in _report["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-subprocess.run(["ruff", "check", "."], check=True)
-subprocess.run(["ty", "check", "agent.py"], check=True)
+# The project, not this script: the emitted pyproject's rules are for
+# generated code, and smoke_check.py is the harness.
+subprocess.run(["ruff", "check", "--extend-exclude", "smoke_check.py", "."], check=True)
+subprocess.run(["ty", "check", "--exclude", "smoke_check.py", "."], check=True)
 
-import agent  # noqa: E402
+agent = _project("agent")
 from livekit.agents import (  # noqa: E402
     DEFAULT_API_CONNECT_OPTIONS,
     AgentSession,
@@ -246,8 +248,9 @@ class ProbeLLM(llm.LLM):
             finish_tool = next(
                 tool for tool in tools if getattr(tool.info, "name", "") == "finish"
             )
-            finish_schema = llm.utils.build_legacy_openai_schema(finish_tool)
-            finish_params = finish_schema["function"]["parameters"]
+            # The step's own result model sends one raw schema, so the SDK does
+            # not build it from a signature.
+            finish_params = finish_tool.info.raw_schema["parameters"]
             assert set(finish_params["properties"]) == {"unserved_request"}
             # The reserved escape field stays optional through the SDK's own
             # schema builder: a required one would have the model invent a
@@ -322,7 +325,7 @@ class FailingSession:
 async def main():
     transfer_session = BlockingSession()
     transfer_ctx = SimpleNamespace(
-        userdata=SimpleNamespace(caller_phone="+15551234567"),
+        userdata=agent.CallState(),
         session=transfer_session,
         function_call=SimpleNamespace(call_id="transfer-finish"),
     )
@@ -331,7 +334,7 @@ async def main():
         transfer_first.back_to_greeter(transfer_ctx)
     )
     await transfer_session.started.wait()
-    await transfer_first.finish(transfer_ctx)
+    await transfer_first.finish({}, transfer_ctx)
     assert not transfer_first.completions
     transfer_session.release.set()
     await pending_transfer
@@ -340,18 +343,18 @@ async def main():
 
     finish_session = BlockingSession()
     finish_ctx = SimpleNamespace(
-        userdata=SimpleNamespace(caller_phone="+15551234567"),
+        userdata=agent.CallState(),
         session=finish_session,
         function_call=SimpleNamespace(call_id="first-finish"),
     )
     finish_first = RecordingFindSlot()
-    await finish_first.finish(finish_ctx)
+    await finish_first.finish({}, finish_ctx)
     await finish_first.back_to_greeter(finish_ctx)
     assert finish_first.completions == [{"unserved_request": ""}]
     assert finish_session.announcements == 0
 
     failed_ctx = SimpleNamespace(
-        userdata=SimpleNamespace(caller_phone="+15551234567"),
+        userdata=agent.CallState(),
         session=FailingSession(),
         function_call=SimpleNamespace(call_id="failed-transfer-finish"),
     )
@@ -362,7 +365,7 @@ async def main():
         assert str(error) == "announcement failed"
     else:
         raise AssertionError("failed announcement did not escape")
-    await failed_transfer.finish(failed_ctx)
+    await failed_transfer.finish({}, failed_ctx)
     assert failed_transfer.completions == [{"unserved_request": ""}]
 
     observed = []
@@ -410,7 +413,7 @@ async def main():
     probe_llm = ProbeLLM()
     try:
         async with AgentSession(
-            userdata=agent.Userdata(),
+            userdata=agent.CallState(),
             llm=probe_llm,
             turn_handling={"turn_detection": "manual"},
         ) as session:
@@ -518,10 +521,12 @@ assert version("livekit-agents") == _report["version"], (version("livekit-agents
 for name in _report["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-subprocess.run(["ruff", "check", "."], check=True)
-subprocess.run(["ty", "check", "agent.py"], check=True)
+# The project, not this script: the emitted pyproject's rules are for
+# generated code, and smoke_check.py is the harness.
+subprocess.run(["ruff", "check", "--extend-exclude", "smoke_check.py", "."], check=True)
+subprocess.run(["ty", "check", "--exclude", "smoke_check.py", "."], check=True)
 
-import agent  # noqa: E402
+agent = _project("agent")
 from livekit.agents import (  # noqa: E402
     DEFAULT_API_CONNECT_OPTIONS,
     Agent,
@@ -744,7 +749,7 @@ async def run_case(case):
     task = ProbeFindSlot(chat_ctx=prepared_context())
 
     async with AgentSession(
-        userdata=agent.Userdata(),
+        userdata=agent.CallState(),
         llm=probe_llm,
         turn_handling={"turn_detection": "manual"},
     ) as session:
@@ -1017,10 +1022,12 @@ asyncio.run(main())
 const livekitRequestTracingSmokeScript = `"""Smoke check: a real agent session traces STT, LLM, and TTS."""
 import asyncio
 import json
+import os
 import time
+import types
 
-import agent
-import tracing
+agent = _project("agent")
+from utils import tracing
 from livekit import rtc
 from livekit.agents import (
     Agent,
@@ -1202,13 +1209,28 @@ async def main() -> None:
     memory = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(memory))
-    # What setup_langfuse does, minus the parts that want credentials and a
+    # What setup_tracing does, minus the parts that want credentials and a
     # JobContext. Without this the turn hook is never installed and the whole
     # call arrives as one trace, which is the shape this test exists to refuse.
-    call = tracing.CallTrace(
-        provider.get_tracer("unmute"),
-        {"langfuse.session.id": "probe-room", "langfuse.trace.name": "probe-agent"},
+    # The backend is the one this build names, only for its attribute names
+    # and span shaping: its exporter is never built, so nothing leaves this
+    # process. Both credential sets are placeholders, so either backend builds.
+    from utils import telemetry as emitted_telemetry
+
+    os.environ.update(
+        LANGFUSE_PUBLIC_KEY="pk-smoke",
+        LANGFUSE_SECRET_KEY="sk-smoke",
+        LANGFUSE_BASE_URL="http://127.0.0.1:9",
+        LOGFIRE_TOKEN="pylf_v1_eu_smoke",
     )
+    backend = emitted_telemetry.BACKEND.from_env()
+    telemetry = types.SimpleNamespace(
+        backend=backend, tracer=lambda name="unmute": provider.get_tracer(name)
+    )
+    correlating = backend.call_attributes("probe-room")
+    call = tracing.CallTrace(provider.get_tracer("unmute"), correlating, backend)
+    input_key = next(iter(backend.observation(input_value="x")))
+    output_key = next(iter(backend.observation(output_value="x")))
     provider.add_span_processor(call)
     tracing.install_turn_spans(provider, call)
     set_tracer_provider(provider)
@@ -1253,7 +1275,7 @@ async def main() -> None:
                 call.said("user", text)
                 if pending_stt_metrics:
                     tracing.trace_speech_metrics(
-                        provider,
+                        telemetry,
                         pending_stt_metrics,
                         input_value="audio",
                         output_value=text,
@@ -1265,7 +1287,7 @@ async def main() -> None:
                 call.said("assistant", text)
                 if pending_tts_metrics:
                     tracing.trace_speech_metrics(
-                        provider,
+                        telemetry,
                         pending_tts_metrics,
                         input_value=text,
                         output_value="audio",
@@ -1310,10 +1332,10 @@ async def main() -> None:
     assert by_name["stt"].attributes["metrics.audio_duration"] > 0
     assert by_name["tts"].attributes["metrics.audio_duration"] > 0
     assert by_name["tts"].attributes["metrics.ttfb"] >= 0
-    assert by_name["stt"].attributes["langfuse.observation.input"] == "audio"
-    assert by_name["stt"].attributes["langfuse.observation.output"] == "trace this request"
-    assert by_name["tts"].attributes["langfuse.observation.input"] == "traced"
-    assert by_name["tts"].attributes["langfuse.observation.output"] == "audio"
+    assert by_name["stt"].attributes[input_key] == "audio"
+    assert by_name["stt"].attributes[output_key] == "trace this request"
+    assert by_name["tts"].attributes[input_key] == "traced"
+    assert by_name["tts"].attributes[output_key] == "audio"
     # The whole call is one trace, and this is the level that proves livekit
     # itself routes its turn spans through the patched provider. The
     # exec-the-emitted-module harness cannot: it stubs livekit out.
@@ -1336,8 +1358,21 @@ async def main() -> None:
     # beside the turn rather than inside it if the hook had not replaced that.
     for name in ("stt", "tts", "agent_turn"):
         assert by_id[by_name[name].parent.span_id].name == "turn", name
-    assert turn.attributes["langfuse.observation.input"] == "trace this request"
-    assert turn.attributes["langfuse.observation.output"] == "traced"
+    assert turn.attributes[input_key] == "trace this request"
+    assert turn.attributes[output_key] == "traced"
+    # livekit opens its wrapper spans (required above), and none is exported.
+    # Their children start one level up, so the model call sits right under the
+    # agent's turn, where Logfire looks for it, and nothing exported points at a
+    # parent the filter refused. (A turn this harness leaves open is never
+    # exported either, so "every parent was exported" is not the claim.)
+    exported = [span for span in call_spans if tracing._export_call_spans(span)]
+    refused = {span.context.span_id for span in call_spans} - {span.context.span_id for span in exported}
+    leaked = sorted({span.name for span in exported} & tracing.WRAPPER_SPANS)
+    assert not leaked, leaked
+    orphans = sorted(span.name for span in exported if span.parent and span.parent.span_id in refused)
+    assert not orphans, orphans
+    llm_parent = by_id[by_name["llm_request"].parent.span_id].name
+    assert llm_parent == "agent_turn", llm_parent
     # Lifecycle hangs off the session directly, not off a turn.
     for name in ("start_agent_activity",):
         assert by_id[by_name[name].parent.span_id].name == "agent_session", name
@@ -1352,19 +1387,20 @@ async def main() -> None:
     # ["user", "assistant"] literal failed the bump while the emitted tracing was
     # recording exactly what it was told. What this test owns is that every line
     # reaches the root, in order, with the reply on the output.
-    transcript = json.loads(session.attributes["langfuse.observation.input"])
+    transcript = json.loads(session.attributes[input_key])
     roles = [m["role"] for m in transcript]
     assert roles[0] == "user", transcript
     assert "assistant" in roles, transcript
     assert [m["content"] for m in transcript if m["role"] == "assistant"] == ["traced"], transcript
     assert {m["content"] for m in transcript if m["role"] == "user"} == {"trace this request"}, transcript
-    assert session.attributes["langfuse.observation.output"] == "traced"
+    assert session.attributes[output_key] == "traced"
     # The correlating attributes reach every span, generations included, or the
     # call drops out of its own session in every view that groups by one.
     for span in spans:
-        assert span.attributes.get("langfuse.session.id") == "probe-room", span.name
-        assert span.attributes.get("langfuse.trace.name") == "probe-agent", span.name
-    print("livekit speech tracing smoke ok")
+        for key in ("langfuse.session.id", "session.id"):
+            if key in correlating:
+                assert span.attributes.get(key) == "probe-room", (span.name, key)
+    print(f"livekit speech tracing smoke ok on {type(backend).__name__}")
 
 
 asyncio.run(main())
@@ -1468,6 +1504,13 @@ func TestSmokeV22LiveKitSpeechTracing(t *testing.T) {
 	runLiveKitSmokeScript(t, "simple-prompt", nil, nil, livekitRequestTracingSmokeScript)
 }
 
+// The same session on Logfire, where the model call has to land right under
+// the agent's turn for Logfire to count it toward the run. Both runs prove the
+// wrapper spans are dropped without orphaning a child.
+func TestSmokeLiveKitLogfireDropsWrapperSpans(t *testing.T) {
+	runLiveKitSmokeScript(t, "simple-prompt", nil, enableLogfire, livekitRequestTracingSmokeScript)
+}
+
 func TestSmokeV26LiveKitExamplesStaticCheck(t *testing.T) {
 	if _, err := exec.LookPath("uv"); err != nil {
 		t.Skip("uv not available")
@@ -1477,9 +1520,9 @@ func TestSmokeV26LiveKitExamplesStaticCheck(t *testing.T) {
 		toolFree bool
 		tracing  bool
 	}{
+		// The examples and remy run in TestSmokeEmittedProjectsPassTheirOwnGate.
+		// These are the shapes no shipped package has.
 		{name: "simple-prompt"},
-		{name: "salon-concierge"},
-		{name: "remy"},
 		{name: "simple-prompt-tool-free-unconfigured", toolFree: true},
 		{name: "simple-prompt-tool-free-tracing", toolFree: true, tracing: true},
 	}
@@ -1493,7 +1536,7 @@ func TestSmokeV26LiveKitExamplesStaticCheck(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			agent, err := ir.Build(pkg)
+			agent, err := buildWithState(t, pkg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1624,7 +1667,7 @@ func runLiveKitSmokeScript(t *testing.T, example string, mutate func(*ir.Target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1698,7 +1741,7 @@ import os
 for name in json.load(open("compile-report.json"))["required_env"]:
     os.environ.setdefault(name, "smoke-placeholder")
 
-import agent  # noqa: E402
+agent = _project("agent")
 from livekit.agents import DEFAULT_API_CONNECT_OPTIONS, AgentSession, llm  # noqa: E402
 
 
@@ -1791,7 +1834,7 @@ async def main():
     agent.slng.TTS = lambda **kwargs: None
     probe = ProbeLLM()
     async with AgentSession(
-        userdata=agent.Userdata(), llm=probe, turn_handling={"turn_detection": "manual"}
+        userdata=agent.CallState(), llm=probe, turn_handling={"turn_detection": "manual"}
     ) as session:
         await session.start(ProbeReservations())
         session.generate_reply(user_input="A table for two tonight, please.")
@@ -1820,7 +1863,7 @@ func TestSmokeLiveKitHarnessRecoversAGroupStepHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1852,7 +1895,7 @@ func TestSmokeLiveKitHarnessRecoversAGroupStepHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := withKnowledgeStub(livekitHarnessGroupHandoffSmokeScript)
-	if err := os.WriteFile(filepath.Join(dir, "smoke_check.py"), []byte(script), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "smoke_check.py"), []byte(withKnowledgeStub(script)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1923,7 +1966,7 @@ import text_run_livekit as harness  # noqa: E402
 sys.path.insert(0, BUILD)
 os.chdir(BUILD)
 
-import agent as generated  # noqa: E402
+generated = _project("agent")
 from livekit.agents import DEFAULT_API_CONNECT_OPTIONS, llm  # noqa: E402
 from livekit.plugins import openai  # noqa: E402
 

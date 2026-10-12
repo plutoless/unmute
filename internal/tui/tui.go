@@ -525,6 +525,7 @@ func createTargetOptions() []menuChoice {
 		string(targetcap.Pipecat): "Pipecat  ·  generated code project",
 		string(targetcap.LiveKit): "LiveKit  ·  generated code project",
 		string(targetcap.Slng):    "SLNG  ·  hosted, deployment body only",
+		string(targetcap.Twilio):  "Twilio  ·  ConversationRelay app you host, phone only",
 	})
 }
 
@@ -537,6 +538,7 @@ func maintainTargetOptions(current string) []menuChoice {
 		string(targetcap.Pipecat): "Pipecat",
 		string(targetcap.LiveKit): "LiveKit",
 		string(targetcap.Slng):    "SLNG",
+		string(targetcap.Twilio):  "Twilio",
 	})
 }
 
@@ -564,6 +566,8 @@ func targetLabel(provider string) string {
 		return "Pipecat"
 	case targetcap.Slng:
 		return "SLNG"
+	case targetcap.Twilio:
+		return "Twilio"
 	}
 	return provider
 }
@@ -730,10 +734,17 @@ func editBindingFor(runner *fieldRunner, target string, role targetcap.Role, bin
 			if err != nil {
 				return err
 			}
-			if !back {
+			// Picking the brand already bound keeps the binding as written,
+			// including an alias such as gemini and the chosen distributor.
+			if !back && selected != brand {
 				routes := catalog.Distributors(framework, role, selected)
 				if len(routes) > 0 {
 					binding.Provider = routes[0]
+				}
+				// A twilio think binding forwards its model and params to one
+				// vendor's request, so the other vendor's would fail on a call.
+				if framework == targetcap.Twilio && role == targetcap.Reason && len(routes) > 0 {
+					*binding = scaffold.TwilioReasonStarter(routes[0])
 				}
 			}
 		case "distributor":
@@ -838,6 +849,12 @@ func providerOptions(framework targetcap.Provider, role targetcap.Role) []menuCh
 }
 
 func editVariables(runner *fieldRunner, data *scaffold.Data) error {
+	if data.State != nil {
+		// The types are Python the author wrote, which the console cannot edit
+		// without rewriting their file.
+		return showNotice(runner, "Variables live in state.py",
+			"This package declares its call state in state.py. Edit that file to add or change a value.")
+	}
 	for {
 		options := make([]menuChoice, 0, len(data.Variables)+2)
 		for _, variable := range data.Variables {
@@ -2922,7 +2939,12 @@ func advancedTargetFields(data *scaffold.Data, regions *string) []advancedField 
 	region := advancedField{"Deployment region (optional)", "Where the platform deploys the agent; forwarded as declared. One region, or several separated by commas for one deployment per region (LiveKit only).", regions, validateBasic, func(value string) {
 		data.DeploymentRegions = parsePhrases(value)
 	}}
-	if !targetcap.EmitsProject(targetcap.Provider(data.Target)) {
+	// Twilio emits a project on no framework, so it takes no version, no pins
+	// and no region; the SDK language is the one setting it reads.
+	if targetcap.Provider(data.Target) == targetcap.Twilio {
+		return []advancedField{{"SDK language (optional)", "python is the only language the twilio target emits.", &data.SDKLanguage, validateBasic, nil}}
+	}
+	if !targetcap.IsCode(targetcap.Provider(data.Target)) {
 		return []advancedField{region}
 	}
 	return []advancedField{

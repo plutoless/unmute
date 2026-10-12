@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/slng-ai/unmute/internal/ir"
 	"github.com/slng-ai/unmute/internal/spec"
+	"github.com/slng-ai/unmute/internal/stateschema"
 	"github.com/slng-ai/unmute/internal/target"
 )
 
@@ -25,7 +27,7 @@ func TestSalonConciergeTargetsResolveAndGenerate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +44,7 @@ func TestSalonConciergeTargetsResolveAndGenerate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("target %q does not generate: %v", name, err)
 			}
-			if name == "livekit" && !strings.Contains(artifactFile(t, artifact, "agent.py"), `model="gemini-3.1-flash-lite"`) {
+			if name == "livekit" && !strings.Contains(artifactFile(t, artifact, agentSource), `model="gemini-3.1-flash-lite"`) {
 				t.Error("salon-concierge must reason on gemini-3.1-flash-lite")
 			}
 		})
@@ -73,11 +75,38 @@ func loadExample(t *testing.T, name string) *ir.Agent {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := ir.Build(pkg)
+	resolved, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return resolved
+}
+
+// The salon packages are read side by side, and a token or latency figure from
+// one is compared with the others. That comparison only measures structure
+// while each target resolves the same think model and the same turn binding in
+// all of them, at pace snappy. They drifted apart once (OpenAI on one, Gemini
+// and balanced on the other, 2026-10-07), and a 39% token gap read as an
+// architecture result was partly a model difference.
+func TestSalonPackagesShareModelAndTurnTaking(t *testing.T) {
+	steps := loadExample(t, "salon-concierge")
+	for _, name := range []string{"salon-concierge-single-prompt", "salon-concierge-unoptimized"} {
+		other := loadExample(t, name)
+		for _, provider := range []ir.Provider{ir.ProviderLiveKit, ir.ProviderPipecat} {
+			a, b := targetByProvider(t, steps, provider), targetByProvider(t, other, provider)
+			if !reflect.DeepEqual(a.Models.Reason["reasoning"], b.Models.Reason["reasoning"]) {
+				t.Errorf("%s think binding differs:\nsalon-concierge %#v\n%s %#v", provider, a.Models.Reason["reasoning"], name, b.Models.Reason["reasoning"])
+			}
+			if !reflect.DeepEqual(a.Models.Turn, b.Models.Turn) {
+				t.Errorf("%s turn binding differs:\nsalon-concierge %#v\n%s %#v", provider, a.Models.Turn, name, b.Models.Turn)
+			}
+		}
+	}
+	for _, provider := range []ir.Provider{ir.ProviderLiveKit, ir.ProviderPipecat} {
+		if turn := targetByProvider(t, steps, provider).Models.Turn; turn == nil || turn.Pace != ir.PaceSnappy {
+			t.Errorf("%s turn pace = %#v, want snappy on every salon package", provider, turn)
+		}
+	}
 }
 
 func TestSalonConciergeFeatureContract(t *testing.T) {
@@ -445,12 +474,12 @@ func TestSalonConciergeFeatureContract(t *testing.T) {
 	// confirmed as "3:00 PM" off the caller's earlier words "the same time".
 	// The tool composes it now, so a package that drops this field puts the
 	// agent back to composing one.
-	var hasSpoken bool
-	for _, field := range resolved.Shapes["Appointment"].Fields {
-		hasSpoken = hasSpoken || field.Name == "spoken"
+	appointment := modelNamed(resolved, "Appointment")
+	if appointment == nil {
+		t.Fatal("state.py declares no Appointment, so nothing in the tree exercises it")
 	}
-	if !hasSpoken {
-		t.Error("the Appointment shape has no spoken phrase, so the agent composes the day and time itself")
+	if _, ok := appointment.Field("spoken"); !ok {
+		t.Error("the Appointment model has no spoken phrase, so the agent composes the day and time itself")
 	}
 	if !strings.Contains(resolved.Agents["concierge"].Instructions, "`spoken` phrase, word for word") {
 		t.Error("the concierge is not told to read the saved phrase word for word")
@@ -869,8 +898,8 @@ func TestSalonConciergeV2ScopesEveryStep(t *testing.T) {
 	if def := resolved.Variables["customer"].Default; def != nil {
 		t.Errorf("customer declares default %#v; the conversation info would then show a caller nobody verified", def)
 	}
-	if shape := resolved.Variables["customer"].Shape; shape == nil || shape.String() != "Customer | None" {
-		t.Errorf("customer resolves to %q, want Customer | None: absent until the verification step fills it", shape.String())
+	if schema := resolved.Variables["customer"].Schema; schema.String() != "Customer | None" {
+		t.Errorf("customer resolves to %q, want Customer | None: absent until the verification step fills it", schema.String())
 	}
 
 	// The declared shapes, and the four values they back. This package is what
@@ -886,31 +915,28 @@ func TestSalonConciergeV2ScopesEveryStep(t *testing.T) {
 	// Literal, and that pair is asserted rather than the count.
 	floors := map[string]int{"Customer": 2, "Appointment": 3, "Complaint": 3}
 	for _, name := range []string{"Customer", "Appointment", "Complaint"} {
-		shape, declared := resolved.Shapes[name]
-		if !declared {
-			t.Errorf("shape %q is no longer declared, so nothing in the tree exercises it", name)
+		shape := modelNamed(resolved, name)
+		if shape == nil {
+			t.Errorf("model %q is no longer declared in state.py, so nothing in the tree exercises it", name)
 			continue
 		}
 		if len(shape.Fields) < floors[name] {
-			t.Errorf("shape %q declares %d fields, want at least %d; it is the verification package's own shape and it is meant to be a group",
+			t.Errorf("model %q declares %d fields, want at least %d; it is the verification package's own shape and it is meant to be a group",
 				name, len(shape.Fields), floors[name])
-		}
-		if shape.Description == "" {
-			t.Errorf("shape %q has no description, so the model is never told what the class is for", name)
 		}
 	}
 	// What `Customer` is for, now that its floor is two: the shaped text and the
 	// Literal are the two kinds a step has to hand back correctly, and a live
 	// call refused both before they were right.
 	var shaped, literal bool
-	for _, field := range resolved.Shapes["Customer"].Fields {
+	for _, field := range modelNamed(resolved, "Customer").Fields {
 		if field.Type == nil {
 			continue
 		}
-		if field.Type.Shaped != "" {
+		if field.Type.Format != "" || field.Type.Pattern != "" {
 			shaped = true
 		}
-		if len(field.Type.Literal) > 0 {
+		if len(field.Type.Enum) > 0 {
 			literal = true
 		}
 	}
@@ -921,7 +947,7 @@ func TestSalonConciergeV2ScopesEveryStep(t *testing.T) {
 	// generated schema emits $defs and $ref for it, and whether the provider
 	// accepts that has to be proven on a real request. Keeping the nesting here
 	// is what keeps that request meaningful.
-	complaint := resolved.Shapes["Complaint"]
+	complaint := modelNamed(resolved, "Complaint")
 	nested := false
 	for _, field := range complaint.Fields {
 		nested = nested || field.Type.String() == "Appointment | None"
@@ -933,11 +959,11 @@ func TestSalonConciergeV2ScopesEveryStep(t *testing.T) {
 		"caller_reason":  `list[Literal["create_booking", "modify_booking", "cancel_booking", "request_informations", "complain"]]`,
 		"appointments":   "list[Appointment]",
 		"complaints":     "list[Complaint]",
-		"customer_phone": "Phone",
+		"customer_phone": "str (phone) | None",
 	} {
-		got := resolved.Variables[name].Shape
+		got := resolved.Variables[name].Schema
 		if got == nil {
-			t.Errorf("variable %q declares no shape, so this package stops exercising the type it exists to exercise", name)
+			t.Errorf("variable %q declares no type, so this package stops exercising the type it exists to exercise", name)
 			continue
 		}
 		if got.String() != want {
@@ -985,7 +1011,7 @@ func TestSalonConciergeV2ScopesEveryStep(t *testing.T) {
 	// required shaped id here was a field the model could only invent, its own
 	// prompt forbids inventing one, and the empty string it sent instead ended
 	// every call at the finish call.
-	for _, field := range resolved.Shapes["Customer"].Fields {
+	for _, field := range modelNamed(resolved, "Customer").Fields {
 		if strings.Contains(field.Name, "id") {
 			t.Errorf("Customer declares %q; nothing in the package supplies a customer id, so the model can only invent one or leave it empty", field.Name)
 		}
@@ -1094,7 +1120,7 @@ func TestPublicExamplesValidateAndGenerate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load: %v", err)
 			}
-			agent, err := ir.Build(pkg)
+			agent, err := buildWithState(t, pkg)
 			if err != nil {
 				t.Fatalf("build: %v", err)
 			}
@@ -1153,7 +1179,7 @@ func assertAnswersTwilioRoute(t *testing.T, name string, files []File) {
 	for _, file := range files {
 		contents[file.Path] = string(file.Content)
 	}
-	if !strings.Contains(contents["bot.py"], `"twilio": lambda: FastAPIWebsocketParams(`) {
+	if !strings.Contains(contents["call.py"], `"twilio": lambda: FastAPIWebsocketParams(`) {
 		t.Errorf("target %q: bot.py has no \"twilio\" entry in transport_params, so `bot.py -t twilio` cannot take a simulated call", name)
 	}
 	if !regexp.MustCompile(`pipecat-ai\[[^\]]*\bwebsocket\b`).MatchString(contents["pyproject.toml"]) {
@@ -1210,7 +1236,7 @@ func TestDailyRouteWorkDoesNotReachOtherTargets(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: load: %v", entry.Name(), err)
 		}
-		agent, err := ir.Build(pkg)
+		agent, err := buildWithState(t, pkg)
 		if err != nil {
 			t.Fatalf("%s: build: %v", entry.Name(), err)
 		}
@@ -1239,7 +1265,7 @@ func TestDailyRouteWorkDoesNotReachOtherTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dailyAgent, err := ir.Build(dailyPkg)
+	dailyAgent, err := buildWithState(t, dailyPkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1277,40 +1303,36 @@ func TestDailyRouteWorkDoesNotReachOtherTargets(t *testing.T) {
 func TestCustomerIntakeCoversEveryDeclaredType(t *testing.T) {
 	agent := loadExample(t, "customer-intake")
 
-	shaped := map[ir.ShapedText]string{}
-	var literal, list, declared, supplied string
-	for name, variable := range agent.Variables {
-		if variable.Shape == nil {
-			continue
+	formats := map[string]bool{}
+	var literal, list, model, pattern bool
+	walkTypes(agent, func(typ *stateschema.Type) {
+		if typ.Format != "" {
+			formats[typ.Format] = true
 		}
-		switch reference := variable.Shape; {
-		case reference.Shaped != "":
-			shaped[reference.Shaped] = name
-		case len(reference.Literal) != 0:
-			literal = name
-		case reference.List != nil:
-			list = name
-		case reference.Shape != "":
-			if agent.Shapes[reference.Shape].Builtin {
-				supplied = name
-			} else {
-				declared = name
-			}
-		}
-	}
+		pattern = pattern || typ.Pattern != ""
+		literal = literal || len(typ.Enum) > 0
+		list = list || typ.IsList()
+		model = model || (typ.Model != "" && typ.Kind == stateschema.KindObject)
+	})
 
-	for _, kind := range ir.ShapedTextOrder() {
-		if shaped[kind] == "" {
-			t.Errorf("no customer-intake variable declares %s, so the example no longer shows it", kind)
+	for _, format := range []string{"email", "date", "time"} {
+		if !formats[format] {
+			t.Errorf("no customer-intake type is a %s, so the example no longer shows it", format)
 		}
 	}
-	for _, missing := range []struct{ what, got string }{
+	if len(formats) < 4 {
+		t.Errorf("customer-intake shows formats %v; it needs the phone type beside email, date and time", formats)
+	}
+	for _, missing := range []struct {
+		what string
+		has  bool
+	}{
 		{`a Literal[...]`, literal},
 		{`a list[...]`, list},
-		{"a shape declared under shapes:", declared},
-		{"a shape the compiler supplies, such as NameEmail", supplied},
+		{"a pattern-checked text type", pattern},
+		{"a BaseModel declared in state.py", model},
 	} {
-		if missing.got == "" {
+		if !missing.has {
 			t.Errorf("no customer-intake variable declares %s", missing.what)
 		}
 	}
@@ -1374,8 +1396,9 @@ func TestPublicExamplePackages(t *testing.T) {
 	//
 	// salon-concierge-single-prompt is the third, added 2026-09-01, and it is the
 	// one exception to the rule that a shipped example is something to copy. It is
-	// salon-concierge with the structural optimizations removed: one prompt, no
-	// variables, no prefetch, framework-default turn taking, no router. It exists
+	// salon-concierge with the structure removed: one prompt, no tasks, no
+	// handoffs, no confirmed variables. Model, turn taking, tools and prefetch are
+	// held identical (TestSalonPackagesShareModelAndTurnTaking). It exists
 	// so the optimized package can be read against something, and it is held to
 	// every gate the others are, because a baseline that did not validate, compile
 	// and run would prove nothing about the package it is compared with.
@@ -1421,7 +1444,11 @@ func TestPublicExamplePackages(t *testing.T) {
 		"pharmacy-refills",
 		"salon-concierge",
 		"salon-concierge-single-prompt",
+		"salon-concierge-unoptimized",
 		"takeaway-orders",
+		// The one twilio target example: a ConversationRelay app the reader
+		// hosts, on a phone number and nothing else.
+		"twilio",
 	}
 	if !slices.Equal(directories, want) {
 		t.Fatalf("public example directories = %v, want %v", directories, want)
@@ -1489,7 +1516,7 @@ func TestVoiceAgentTestPackagesValidateAndGenerate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load: %v", err)
 			}
-			agent, err := ir.Build(pkg)
+			agent, err := buildWithState(t, pkg)
 			if err != nil {
 				t.Fatalf("build: %v", err)
 			}
@@ -1540,7 +1567,7 @@ func TestFixturePackagesValidate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load: %v", err)
 			}
-			agent, err := ir.Build(pkg)
+			agent, err := buildWithState(t, pkg)
 			if err != nil {
 				t.Fatalf("build: %v", err)
 			}
@@ -1595,7 +1622,7 @@ func TestSalonConciergeTransferEnvironmentContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := ir.Build(pkg)
+	agent, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1638,7 +1665,7 @@ func TestBrowserPathStartupCheckAsksForNoRouteEnvironment(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			agent, err := ir.Build(pkg)
+			agent, err := buildWithState(t, pkg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1651,9 +1678,9 @@ func TestBrowserPathStartupCheckAsksForNoRouteEnvironment(t *testing.T) {
 				if err != nil {
 					t.Fatalf("%s: %v", provider, err)
 				}
-				entry := "bot.py"
+				entry := agentSource
 				if provider == ir.ProviderLiveKit {
-					entry = "agent.py"
+					entry = agentSource
 				}
 				source := artifactFile(t, artifact, entry)
 				start := strings.Index(source, "REQUIRED_ENV = [")
@@ -1804,8 +1831,8 @@ func TestRouterScopeSurfacesDoNotContradictTheCompiler(t *testing.T) {
 		// module-level comment, and leaving it out of this list is how that one
 		// survived the first pass of the rewrite: a reader in the code sees it
 		// long before they open a runbook.
-		filepath.Join("internal", "generate", "templates", "livekit_v1", "agent.py.tmpl"),
-		filepath.Join("internal", "generate", "templates", "pipecat_v1", "bot.py.tmpl"),
+		filepath.Join("internal", "generate", "templates", "livekit_v1", "utils_router.py.tmpl"),
+		filepath.Join("internal", "generate", "templates", "pipecat_v1", "utils_router.py.tmpl"),
 		filepath.Join("examples", "salon-concierge", "README.md"),
 		filepath.Join("docs-site", "optimization", "context-router.mdx"),
 		filepath.Join("internal", "skill", "assets", "references", "models.md"),
@@ -1888,7 +1915,7 @@ func TestSalonConciergePlaceholdersAgreeWithItsVariables(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := ir.Build(pkg)
+	resolved, err := buildWithState(t, pkg)
 	if err != nil {
 		t.Fatal(err)
 	}

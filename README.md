@@ -157,17 +157,23 @@ runtime cannot run a model as defined, it overrides that single entry by name,
 the way LiveKit does with the turn detector above. The agent itself does not
 change.
 
-## Three targets
+## Five targets
 
 | Target | Kind | What you get |
 |---|---|---|
 | [LiveKit Agents](https://unmute.ai/targets/livekit) | code | `build/livekit/agent.py`, a Python project you host and run |
 | [Pipecat](https://unmute.ai/targets/pipecat) | code | `build/pipecat/bot.py`, plus a `pcc-deploy.toml` for Pipecat Cloud |
 | [SLNG](https://unmute.ai/targets/slng) | hosted | `unmute deploy` pushes a deployment body and SLNG runs the agent |
+| [Twilio](https://unmute.ai/targets/twilio) | phone app | `build/<target>/app.py`, a small app Twilio ConversationRelay calls; you host it |
+| [Agora](https://unmute.ai/targets/agora) | hosted conversation | `build/<target>/server.py`, a local Python session service and RTC browser example |
 
-`pipecat`, `livekit` and `slng` are the only values `provider` accepts. A code
-target gives you something to host. The hosted target has nothing to host, and
-no `unmute dev`.
+`livekit`, `pipecat`, `slng`, `twilio` and `agora` are the only values `provider`
+accepts. A code target gives you something to host. The hosted target has
+nothing to host, and no `unmute dev`. The Twilio target answers inbound phone
+calls only, and has no `unmute dev` either. Agora supports a single browser
+agent within its [supported surface](https://unmute.ai/targets/agora); copy
+its example and follow the runbook, without `unmute init`, `unmute dev` or
+`unmute deploy`.
 
 ## What compile writes
 
@@ -196,55 +202,57 @@ inside `build/` is overwritten on the next compile.
 ## What else the file holds
 
 The agent at the top of this page is the floor. Everything below is written in
-the same `agent.yaml`, next to what you have already read, and every piece of it
+the same package, next to what you have already read, and every piece of it
 is checked before a call happens rather than during one. The snippets are from
 [`customer-intake`](examples/customer-intake/) and
 [`salon-concierge`](examples/salon-concierge/).
 
 ### Values with a type
 
-A variable says what it holds. The model is told the format, and the value is
-checked where it enters, not where it is used.
+You write what a call can hold as a Pydantic class in `state.py`, next to
+`agent.yaml`. The model is told the format, and the value is checked where it
+enters, not where it is used.
 
-```yaml
-shapes:
-  - name: CustomerRecord
-    description: The record the intake desk opened for this caller.
-    fields:
-      - record_id: Id
-      - opened_on: Date
-      - enquiry: Literal["new_customer", "existing_customer", "complaint", "other"]
+```python
+# state.py
+from datetime import time
+from typing import Literal
 
-variables:
-  contact:
-    type: NameEmail
-    description: >-
-      Who the caller is and where their confirmation goes, the name and the
-      email address held as two separate parts.
+from pydantic import BaseModel, EmailStr, Field
 
-  caller_email:
-    type: EmailStr
-    default: ""
-    description: The caller's email address on its own, with no name around it.
 
-  callback_time:
-    type: Time | None
-    description: >-
-      A good time of day to ring the caller back, on the 24 hour clock. Leave it
-      out when the caller has not named one.
+class Contact(BaseModel):
+    name: str
+    email: EmailStr
 
-  notes:
-    type: list[str]
-    description: >-
-      Anything the caller added that no other field holds, one short entry per
-      thing they said.
+
+class CustomerRecord(BaseModel):
+    record_id: str
+    enquiry: Literal["new_customer", "existing_customer", "complaint", "other"]
+
+
+class State(BaseModel):
+    contact: Contact | None = Field(
+        None,
+        description="Who the caller is and where their confirmation goes, the name and the email address held as two separate parts.",
+    )
+    callback_time: time | None = Field(
+        None,
+        description="A good time of day to ring the caller back, on the 24 hour clock. Leave it out when the caller has not named one.",
+    )
+    notes: list[str] = []
+    record: CustomerRecord | None = None
 ```
 
-`Phone`, `Date`, `Time`, `Id` and `EmailStr` are text with a checked shape.
-`NameEmail` holds a name and an address as two separate parts, so a prompt can
-use the name without reading the address out loud. You also have `str`, `int`,
-`float`, `bool`, `Literal[...]`, `list[...]`, `| None`, and any shape you
-declare yourself.
+`agent.yaml` lists a value only when it needs a `source:` or a `confirm:`. A
+prompt reads a value by name, as `{{state.contact.name}}`.
+
+Core Pydantic types are open to you, with `date`, `time`, `EmailStr`, `Literal`,
+lists, your own models and `| None`. So are phone numbers, currencies and
+languages from `pydantic-extra-types`. A two-field model such as `Contact` holds
+a name and an address as separate parts, so a prompt can use the name without
+reading the address out loud. `unmute validate` reads `state.py` through `uv`, so `uv` has to be on your
+`PATH` for a package that has one.
 
 An address the model misheard is refused with the format, inside the same turn,
 so the model fixes it rather than saving something wrong. The email check never
@@ -350,16 +358,16 @@ input:
     - summary
 
 inject:
-  - phone: "{{caller_phone}}"
-  - email: "{{caller_email}}"
-  - name: "{{contact.name}}"
+  - phone: "{{state.caller_phone}}"
+  - email: "{{state.caller_email}}"
+  - name: "{{state.contact.name}}"
 ```
 
 The model fills one argument. The other three come straight out of saved state
 and are hidden from it, so a digit cannot change between the turn it was agreed
 on and the turn it was written down.
 
-A variable can also carry `confirm: verify_contact`. Until that step hears a
+A value can also carry `confirm: verify_contact` in `variables:`. Until that step hears a
 yes, the value renders in no prompt but that step's own, and any tool injecting
 it refuses itself and names the step to run first.
 
@@ -383,11 +391,12 @@ models:
 ```
 
 `world_part` picks one of 13 SLNG speech gateways, on each `listen` and `speak`
-model separately. It becomes the host `eu-north.api.slng.ai` in the generated
-project: `slng_base_url=` on LiveKit, `base_url=` on Pipecat.
+model separately. On Pipecat it is passed as `world_part="eu-north"`. On
+LiveKit it becomes the host `slng_base_url="eu-north.api.slng.ai"`.
 
 The 13 are `us-east`, `us-west`, `br`, `eu-west`, `eu-north`, `gb`, `za`, `il`,
-`jp`, `sg`, `id`, `in` and `au`. Leave `world_part` out and the existing default
+`jp`, `sg`, `id`, `in` and `au`. Pipecat requires `world_part`, because its SLNG
+plugin has no default gateway. On LiveKit, leave it out and the existing default
 URL stands. Reasoning through the SLNG Context Router reads the same key and the
 same 13 values, so one word covers listening, thinking and speaking. Where the
 worker itself runs is a separate choice, `deployment_region` in `targets.yaml`,
@@ -441,7 +450,7 @@ Each of these has a page in the guide.
 |---|---|
 | **Tools** that call a webhook, run local Python, reach an MCP server, use one the runtime already has, or search your own documents | [Tools](https://unmute.ai/build/tools/overview) |
 | **Tasks, task groups and handoffs**, for when one prompt stops being enough, and the steps that end on their own tool | [Orchestration](https://unmute.ai/build/orchestration/overview) |
-| **Typed values**, declared once and checked where they enter: phone numbers, dates, email addresses, a closed set of words, lists, and shapes of your own | [Variables](https://unmute.ai/build/variables) |
+| **Typed values**, declared once and checked where they enter: phone numbers, dates, email addresses, a closed set of words, lists, and models of your own | [Variables](https://unmute.ai/build/variables) |
 | **Escalation to a person**, cold or warm depending on the phone route | [Transfers](https://unmute.ai/transfers/overview) |
 | **Phone calls**, inbound and outbound, through Twilio, SIP trunks or a carrier stream | [Phone calls](https://unmute.ai/telephony/overview) |
 | **Pre-fetch**, so a known fact is in the prompt before the caller finishes the first sentence | [Pre-fetch](https://unmute.ai/build/prefetch) |
@@ -521,7 +530,7 @@ per feature of the compiler, held to every gate in this repository.
 
 ## Examples
 
-[`examples/`](examples/) holds four packages.
+[`examples/`](examples/) holds packages illustrating supported features.
 
 - [`customer-intake`](examples/customer-intake/) is the small one: one agent,
   three tasks, one local tool. It takes a caller's number, name, email address,
@@ -534,9 +543,13 @@ per feature of the compiler, held to every gate in this repository.
   cold manager transfer, tracing, and inbound phone on both code targets. Every
   tool is local Python, so nothing remote has to be up before the greeting.
 - [`salon-concierge-single-prompt`](examples/salon-concierge-single-prompt/) is
-  the same salon with the structural features taken back out, so the one above
-  can be read against something. Model, transport and turn taking are held
-  identical, so a difference you hear is a difference the structure made.
+  the same salon in one prompt, with no tasks and no handoffs, so the one above
+  can be read against something. Tools, pre-fetch, model, transport and turn
+  taking are held identical, so a difference you hear is a difference the
+  structure made.
+- [`salon-concierge-unoptimized`](examples/salon-concierge-unoptimized/) is the
+  same one prompt with the pre-fetch taken out as well, so it has none of the
+  optimizations: the starting point to measure them against.
 - [`hotel-concierge`](examples/hotel-concierge/) is the hosted target's
   showcase: a concierge line whose tools are all references SLNG already holds,
   with template variables, an injected argument, a tool announcement, named MCP
@@ -562,7 +575,7 @@ published SLNG conformance fixtures and needs network.
 ## Contributing
 
 Contributions are welcome, from anyone. Unmute is MIT licensed and every part of
-it is open: the compiler, the four targets, the examples, the skill and the
+it is open: the compiler, the five targets, the examples, the skill and the
 docs site.
 
 A pull request needs five things:

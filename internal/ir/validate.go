@@ -84,7 +84,6 @@ func Validate(agent *Agent, targets []Target, caps targetcap.Table) (ValidateRep
 	contractErrors, contractWarnings := ValidateManifest(agent)
 	global = append(global, contractErrors...)
 	globalWarnings = append(globalWarnings, contractWarnings...)
-	global = append(global, validateConfiguredTargets(agent, caps)...)
 	global = append(global, slngOneAgentIDPerPackage(agent)...)
 	global = append(global, slngScopeErrors(agent)...)
 	global = append(global, knowledgeErrors(agent)...)
@@ -171,6 +170,11 @@ func sizing(agent *Agent, resolved Target) []Sizing {
 	if targetcap.IsCode(targetcap.Provider(resolved.Provider)) {
 		workers = agent.Capacity.MaxSessions
 	}
+	// The twilio app is one process serving max_sessions call slots, so it has
+	// one worker however many calls it takes.
+	if resolved.Provider == ProviderTwilio {
+		workers = 1
+	}
 	local := resolvedHasLocal(resolved)
 	gpus := 0
 	if local && targetcap.IsCode(targetcap.Provider(resolved.Provider)) {
@@ -184,6 +188,12 @@ func sizing(agent *Agent, resolved Target) []Sizing {
 	result := []Sizing{
 		{Target: resolved.Name, Metric: "workers", Value: fmt.Sprint(workers), Status: "unbenchmarked", Basis: basis},
 		{Target: resolved.Name, Metric: "gpus", Value: fmt.Sprint(gpus), Status: "unbenchmarked", Basis: basis},
+	}
+	if resolved.Provider == ProviderTwilio {
+		result = append(result, Sizing{
+			Target: resolved.Name, Metric: "call_slots", Value: fmt.Sprint(agent.Capacity.MaxSessions),
+			Status: "enforced", Basis: "max_sessions; the app refuses a call past this count",
+		})
 	}
 	average, averageErr := time.ParseDuration(string(agent.Capacity.AvgSessionDuration))
 	for _, kind := range slices.Sorted(maps.Keys(channelKinds)) {
@@ -231,32 +241,6 @@ func resolvedHasLocal(resolved Target) bool {
 		}
 	}
 	return false
-}
-
-func validateConfiguredTargets(agent *Agent, caps targetcap.Table) []string {
-	hasNestedResult := false
-	for _, task := range agent.Tasks {
-		for _, field := range task.Result {
-			hasNestedResult = hasNestedResult || field.Schema != nil
-		}
-	}
-	if !hasNestedResult {
-		return nil
-	}
-	var errors []string
-	for _, name := range slices.Sorted(maps.Keys(agent.Targets)) {
-		resolved := agent.Targets[name]
-		provider := targetcap.Provider(resolved.Provider)
-		if !slices.Contains(targetcap.Providers, provider) {
-			errors = add(errors, fmt.Sprintf("configured target %q has unknown provider %q", name, resolved.Provider))
-			continue
-		}
-		capability := caps.Capability(targetcap.FieldTaskNestedResult, provider)
-		if capability.Tag == targetcap.Gated || capability.Tag == targetcap.Provisional {
-			errors = add(errors, fmt.Sprintf("configured target %q: %s", name, capability.Note))
-		}
-	}
-	return errors
 }
 
 // validateStructure returns target-independent errors plus target-independent
@@ -307,9 +291,6 @@ func validateStructure(agent *Agent) (errors, warnings []string) {
 		}
 	}
 	for name, variable := range agent.Variables {
-		if !validPrimitive(variable.Type) {
-			errors = add(errors, fmt.Sprintf("variable %q has invalid type %q", name, variable.Type))
-		}
 		if variable.Source != "" && !validVariableSource(variable.Source) {
 			errors = add(errors, fmt.Sprintf("variable %q has invalid source %q", name, variable.Source))
 		}
@@ -318,17 +299,10 @@ func validateStructure(agent *Agent) (errors, warnings []string) {
 			// model reads the description to know what to record: SLNG requires
 			// one on every runtime variable.
 			if variable.Default != nil {
-				errors = add(errors, fmt.Sprintf("variable %q is recorded by the model during the call and takes no default: remove default:, or drop source: conversation and let the dispatch supply it", name))
+				errors = add(errors, fmt.Sprintf("variable %q is recorded by the model during the call and takes no default: give it `= None` in state.py, or drop source: conversation and let the dispatch supply it", name))
 			}
 			if strings.TrimSpace(variable.Description) == "" {
-				errors = add(errors, fmt.Sprintf("variable %q is recorded by the model during the call, so it needs a description: the model reads it to know what to record and when", name))
-			}
-		}
-		if variable.Default != nil && !defaultMatches(variable.Type, variable.Default) {
-			if variable.Shape != nil {
-				errors = add(errors, fmt.Sprintf("variable %q is %s, which starts empty and takes no default: remove default:", name, variable.Shape.String()))
-			} else {
-				errors = add(errors, fmt.Sprintf("variable %q default does not match type %q", name, variable.Type))
+				errors = add(errors, fmt.Sprintf("variable %q is recorded by the model during the call, so it needs a description: give it Field(description=...) in state.py; the model reads it to know what to record and when", name))
 			}
 		}
 	}
@@ -337,22 +311,10 @@ func validateStructure(agent *Agent) (errors, warnings []string) {
 		// had one mixed list that could hold any kind. A task now has `tools:` and
 		// `handoffs:` and no other key, so the illegal thing has nowhere to be
 		// written and the rule is structure rather than a check.
-		for fieldName, field := range task.Result {
+		for fieldName := range task.Result {
 			if fieldName == UnservedResultField {
 				errors = add(errors, fmt.Sprintf("task %q result %q is reserved: every generated task finish already takes %s for a request the step cannot serve", name, fieldName, UnservedResultField))
 			}
-			if field.Schema == nil && !validPrimitive(field.Type) {
-				errors = add(errors, fmt.Sprintf("task %q result %q has invalid type %q", name, fieldName, field.Type))
-			}
-			if field.Enum != nil && len(field.Enum) == 0 {
-				errors = add(errors, fmt.Sprintf("task %q result %q enum must not be empty", name, fieldName))
-			}
-			// A nested result field carries a raw schema (build.go stashes any
-			// unrecognised map as ResultField.Schema), which the Pipecat driver
-			// serialises through resultProperties/pyLiteral exactly the way it
-			// serialises tool properties. Same unvalidated surface, so the same
-			// walk applies.
-			validateSchemaKeys(fmt.Sprintf("task %q result %q", name, fieldName), "schema", field.Schema, &schemas)
 		}
 		errors = append(errors, validateContextShape(name, task.Context)...)
 	}
@@ -846,10 +808,6 @@ const (
 
 func validateTarget(agent *Agent, resolved Target, caps targetcap.Table, row *TargetValidation) {
 	provider := targetcap.Provider(resolved.Provider)
-	if provider == targetcap.Agora {
-		validateAgoraTarget(agent, resolved, row)
-		return
-	}
 	if !slices.Contains(targetcap.Providers, provider) {
 		// A retired provider used to work, so "unknown" is true and useless.
 		// Say what happened and what the supported values are (Principle II).
@@ -870,13 +828,26 @@ func validateTarget(agent *Agent, resolved Target, caps targetcap.Table, row *Ta
 		row.Errors = add(row.Errors, fmt.Sprintf("%s code target requires version", resolved.Provider))
 	}
 	validateDriverValues(agent, resolved, provider, row)
+	for _, warning := range turnParamsWarning(agent, provider) {
+		row.Warnings = add(row.Warnings, warning)
+	}
 	validateVaultTokens(agent, provider, row)
 	prefetchSkipWarnings(agent, resolved, row)
 	if provider == targetcap.Slng {
 		validateSlngTarget(agent, resolved, row)
 	}
+	if provider == targetcap.Agora {
+		validateAgoraTarget(agent, resolved, row)
+	}
+	if provider == targetcap.Twilio {
+		validateTwilioTarget(agent, resolved, row)
+	} else if resolved.Logic != nil {
+		row.Errors = add(row.Errors, fmt.Sprintf(
+			"logic: is read by the twilio target only, whose app hands each turn to your own respond(); %s generates its own agent turn: remove logic, or compile to twilio",
+			resolved.Provider))
+	}
 	if agent.Tracing != nil {
-		applyCapability(caps, tracingCapability(agent.Tracing.Provider), provider, row)
+		applyCapability(caps, TracingCapability(agent.Tracing.Provider), provider, row)
 	}
 	row.Errors = append(row.Errors, validateRegions(resolved.DeploymentRegions)...)
 	if provider == targetcap.LiveKit {
@@ -1459,7 +1430,7 @@ func validateBindings(agent *Agent, resolved Target, caps targetcap.Table, row *
 		if err := catalog.CheckVendor(provider, role, binding.Provider, binding.EndpointEnv != ""); err != nil {
 			row.Errors = add(row.Errors, err.Error())
 		}
-		if (provider == targetcap.LiveKit || provider == targetcap.Pipecat) && role == targetcap.Reason &&
+		if targetcap.EmitsProject(provider) && role == targetcap.Reason &&
 			(binding.Provider == "google" || binding.Provider == "gemini") {
 			if err := targetcap.CheckGoogleParams(binding.Params); err != nil {
 				row.Errors = add(row.Errors, fmt.Sprintf("%s think model %q: %v", provider, binding.Model, err))
@@ -1467,7 +1438,7 @@ func validateBindings(agent *Agent, resolved Target, caps targetcap.Table, row *
 		}
 		if (provider == targetcap.LiveKit || provider == targetcap.Pipecat) &&
 			binding.Provider == "slng" && (role == targetcap.Listen || role == targetcap.Speak) {
-			if _, err := targetcap.SlngSpeechBaseURL(binding.Params); err != nil {
+			if _, err := targetcap.ParseSlngSpeechGateway(provider, binding.Params); err != nil {
 				row.Errors = add(row.Errors, fmt.Sprintf("%s %s model %q: %v", provider, role, binding.Model, err))
 			}
 		}
@@ -2309,27 +2280,16 @@ func validateVariables(agent *Agent, provider targetcap.Provider, caps targetcap
 			break
 		}
 	}
-	// A declared shape and a text type with a validated shape are gated apart,
-	// because they are refused for the same reason but fixed differently: one
-	// asks the author to flatten a group of fields, the other to give up a
-	// check. Reported through the capability table like every other per-target
-	// difference, so one target's refusal cannot drift from its row.
-	declaresShape, declaresShaped := len(agent.Shapes) > 0, false
+	// A value more than one plain scalar needs the typed state runtime: a
+	// model, a list, a closed set, or a checked text type. A plain value that
+	// may be None does not: None is only "no value yet". Reported through the
+	// capability table like every other per-target difference, so one target's
+	// refusal cannot drift from its row.
 	for _, name := range sortedKeys(agent.Variables) {
-		shape := agent.Variables[name].Shape
-		if shape == nil {
-			continue
+		if schema := agent.Variables[name].Schema; schema != nil && !schema.Plain() {
+			applyCapability(caps, targetcap.FieldTypedState, provider, row)
+			break
 		}
-		declaresShaped = declaresShaped || reaches(shape, func(ref *TypeRef) bool { return ref.Shaped != "" })
-		declaresShape = declaresShape || reaches(shape, func(ref *TypeRef) bool {
-			return ref.Shape != "" || len(ref.Literal) > 0 || ref.List != nil || ref.Optional
-		})
-	}
-	if declaresShape {
-		applyCapability(caps, targetcap.FieldTypedState, provider, row)
-	}
-	if declaresShaped {
-		applyCapability(caps, targetcap.FieldShapedText, provider, row)
 	}
 	if len(agent.Prefetch) > 0 {
 		applyCapability(caps, targetcap.FieldPrefetch, provider, row)
@@ -2830,7 +2790,7 @@ func hasWarmTransfer(agent *Agent) bool {
 
 func validateChannels(agent *Agent, resolved Target, provider targetcap.Provider, caps targetcap.Table, row *TargetValidation) {
 	for channelName, channel := range agent.Channels {
-		if channel.Kind == ChannelTelephony && (provider == targetcap.LiveKit || provider == targetcap.Pipecat) && resolved.Telephony == nil {
+		if channel.Kind == ChannelTelephony && targetcap.EmitsProject(provider) && resolved.Telephony == nil {
 			row.Errors = add(row.Errors, "telephony channel requires a resolved Connection plan")
 			continue
 		}
@@ -2886,7 +2846,13 @@ func validateTelephonyPlan(plan *TelephonyPlan, row *TargetValidation) {
 	if plan == nil {
 		return
 	}
-	if plan.Coordination != "shared" {
+	// The twilio target keeps its calls in one process, so its coordination is
+	// in-process and nothing else's is.
+	isTwilioRelay := plan.Key.Provider == ProviderTwilio
+	switch {
+	case isTwilioRelay && plan.Coordination != "in_process":
+		row.Errors = add(row.Errors, "the twilio target runs one process, so its telephony coordination must be in_process")
+	case !isTwilioRelay && plan.Coordination != "shared":
 		row.Errors = add(row.Errors, "telephony coordination must be shared")
 	}
 	// One route runs nothing of the operator's, so an empty process list is the
@@ -2951,7 +2917,7 @@ func validateTelephonyPlan(plan *TelephonyPlan, row *TargetValidation) {
 	allowedServices := map[string]bool{"application": true}
 	requiredServices := []string{"application"}
 	switch {
-	case isPipecatDailyCarrier, hostsNothing:
+	case isPipecatDailyCarrier, hostsNothing, isTwilioRelay:
 		// application only, already in both sets. On the cloud-websocket route the
 		// application is the deployed agent: the platform hosts it, and dev runs the
 		// same one locally, which is why an empty process list and one application
@@ -3203,17 +3169,14 @@ func promptSuffixErrors(name string, model ModelDef) []string {
 // behaviour either way. Each message names what to use instead, because "this
 // does nothing" tells an author they are wrong and not what to write.
 //
-// If turn params ever do get forwarded, the `params` line here is what to delete.
+// Turn params left this package-wide pass when the twilio target started
+// forwarding them: they are dead on some targets and not others, so
+// turnParamsWarning says so per target.
 func turnDeadFieldWarnings(name string, model ModelDef) []string {
 	if model.Kind != KindTurn {
 		return nil
 	}
 	var warnings []string
-	if len(model.Params) > 0 {
-		warnings = add(warnings, fmt.Sprintf(
-			"model %q is a turn model and sets params (%s), which no target reads: turn params are not forwarded to either framework. Use pace for the turn window and endpointing_delay for the silence window; there is no way to reach an individual framework parameter from a package today",
-			name, strings.Join(sortedKeys(model.Params), ", ")))
-	}
 	if model.AgentID != "" {
 		warnings = add(warnings, fmt.Sprintf(
 			"model %q is a turn model and sets agent_id, which no target reads: agent_id scopes the SLNG Context Router's cache and belongs on the think binding that names the router",
@@ -3223,6 +3186,26 @@ func turnDeadFieldWarnings(name string, model ModelDef) []string {
 		warnings = add(warnings, fmt.Sprintf(
 			"model %q is a turn model and sets fallback, which no target reads: fallback is a think and listen field. A turn detector has no fallback chain on either code target",
 			name))
+	}
+	return warnings
+}
+
+// turnParamsWarning names turn params on a target that does not read them. Every
+// target except twilio drops them; twilio forwards them to ConversationRelay and
+// checks each one in validateTwilioTarget.
+func turnParamsWarning(agent *Agent, provider targetcap.Provider) []string {
+	if provider == targetcap.Twilio {
+		return nil
+	}
+	var warnings []string
+	for _, name := range sortedKeys(agent.Models) {
+		model := agent.Models[name]
+		if model.Kind != KindTurn || len(model.Params) == 0 {
+			continue
+		}
+		warnings = add(warnings, fmt.Sprintf(
+			"model %q is a turn model and sets params (%s), which the %s target does not read: turn params are not forwarded to either framework. Use pace for the turn window and endpointing_delay for the silence window; there is no way to reach an individual framework parameter from a package today",
+			name, strings.Join(sortedKeys(model.Params), ", "), provider))
 	}
 	return warnings
 }
@@ -3795,10 +3778,6 @@ func validVariableSource(value VariableSource) bool {
 	}
 }
 
-func validPrimitive(value PrimitiveType) bool {
-	return value == PrimitiveString || value == PrimitiveNumber || value == PrimitiveBoolean || value == PrimitiveInteger
-}
-
 func validRequiredControl(value string) bool {
 	switch value {
 	case "cold_transfer", "warm_transfer", "dtmf_send", "dtmf_receive", "hold", "hangup", "voicemail_detection", "ivr_navigation":
@@ -3806,28 +3785,6 @@ func validRequiredControl(value string) bool {
 	default:
 		return false
 	}
-}
-
-func defaultMatches(kind PrimitiveType, value any) bool {
-	switch kind {
-	case PrimitiveString:
-		_, ok := value.(string)
-		return ok
-	case PrimitiveBoolean:
-		_, ok := value.(bool)
-		return ok
-	case PrimitiveInteger:
-		switch value.(type) {
-		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-			return true
-		}
-	case PrimitiveNumber:
-		switch value.(type) {
-		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
-			return true
-		}
-	}
-	return false
 }
 
 func add(values []string, value string) []string {

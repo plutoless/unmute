@@ -8,9 +8,8 @@ input:
     customer_phone:
       type: string
       description: >-
-        The caller's confirmed phone number, exactly as find_or_create_customer
-        returned it. The model retypes it here on every call, because nothing in
-        this package holds it.
+        The caller's number exactly as find_or_create_customer returned it, in
+        E.164: a plus sign then digits, with no spaces. Copy it, never retype it.
     summary:
       type: string
       description: Short factual summary of the complaint
@@ -33,6 +32,18 @@ output:
         - recorded
         - invalid
         - customer_not_found
+    complaint:
+      type: object
+      description: >-
+        The saved complaint, present and complete on success and absent
+        otherwise. The tool writes it, so take it as it is.
+      properties:
+        complaint_id:
+          type: string
+        summary:
+          type: string
+        requested_resolution:
+          type: string
   required:
     - complaint_id
     - status
@@ -42,3 +53,5 @@ local:
 
 interruption: provider_default
 effect: returns_data
+
+announce: Let me get that written down.

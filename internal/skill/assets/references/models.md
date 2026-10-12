@@ -238,10 +238,10 @@ it cannot carry in this version, because each is refused at validate:
   starts, so nothing may change them mid-call;
 - no `listen`, `speak` or `turn` sections, and no `conversation.interruption`:
   the model listens, speaks and decides the turn itself;
-- no `variables` and no `prefetch`: the live shape carries no call state yet;
-- no `tracing`: the live shape has no traced worker yet;
+- no `variables` and no `prefetch`: the live shape carries no call state;
+- no `tracing`: the live shape has no traced worker;
 - no `mcp` tool: nothing in the live shape can start and close a server
-  connection yet;
+  connection;
 - no telephony connection: a live model compiles for the browser route in this
   version;
 - no `temperature`, `language`, `speed`, `params`, `pace` or `endpoint_env` on
@@ -543,13 +543,13 @@ decision the author is making rather than an implementation detail.
   that every repeat is fast.
 - Tool turns always take the model path, both the request turn and the result
   turn.
-- A router-bound system prompt keeps its `{{name}}` placeholders and the values
+- A router-bound system prompt keeps its `{{state.name}}` placeholders and the values
   travel beside it, which is what makes a personalised prompt cacheable.
   Greetings, tool arguments, injected values and webhook paths keep rendering
   locally.
 - **Write a per-call value the agent speaks as a placeholder, not into the prompt
   text.** A caller's name, the company name, an appointment detail read back: put
-  `{{customer_name}}` in the prompt, declare the variable, and let the router
+  `{{state.customer_name}}` in the prompt, declare the variable, and let the router
   substitute. The stored answer then holds the placeholder rather than the name,
   so it can be cached at all and it is shared across callers, each hearing their
   own value. Measured 2026-08-24: an answer stored as "Absolutely, Rajesh" came
@@ -595,8 +595,8 @@ decision the author is making rather than an implementation detail.
   count of them.
 
 Full page: [Context Router](https://docs.slng.ai/context-router/). No shipped
-example binds to it today: `salon-concierge` reaches Google Vertex directly and
-`salon-concierge-single-prompt` reaches OpenAI directly, so an author who wants
+example binds to it today: both salon packages reach Google Vertex directly, so
+an author who wants
 to see what the router is worth compiles one of them twice, once as it ships
 and once with the think binding pointed at the router.
 
@@ -616,9 +616,10 @@ LiveKit's compute names come from its
 [agent region list](https://docs.livekit.io/deploy/admin/regions/endpoints/#agent-deployment-regions).
 
 <ParamField path="listen/speak.params.world_part" type="string">
-  Accepts the speech gateway values in the table. Omit to use the plugin's
-  default endpoint. An empty or unknown value is refused. Do not combine it
-  with `params.base_url` or `params.slng_base_url`.
+  Accepts the speech gateway values in the table. Required on Pipecat, where
+  omission is refused. On LiveKit, omit it to use the plugin's default
+  endpoint. An empty or unknown value is refused. Do not combine it with
+  `params.base_url` or `params.slng_base_url`.
 </ParamField>
 
 <ParamField path="think.params.world_part" type="string" required>
@@ -660,12 +661,15 @@ models:
 ```
 
 The accepted values are `us-east`, `us-west`, `br`, `eu-west`, `eu-north`, `gb`,
-`za`, `il`, `jp`, `sg`, `id`, `in`, and `au`. Unmute consumes the key and emits
-the host `{world_part}.api.slng.ai`: `slng_base_url="eu-north.api.slng.ai"` on
-LiveKit and `base_url="eu-north.api.slng.ai"` on Pipecat. It sends no scheme or
-path and does not forward `world_part` to the plugin.
+`za`, `il`, `jp`, `sg`, `id`, `in`, and `au`. Each one is served at the host
+`{world_part}.api.slng.ai`. On Pipecat, Unmute passes the key through as
+`world_part="eu-north"`, because `pipecat-slng` 0.6.0 takes the world part
+itself and builds the host. On LiveKit, Unmute consumes the key and emits
+`slng_base_url="eu-north.api.slng.ai"`, with no scheme or path.
 
-Omitting `world_part` keeps the existing default URL. An empty,
+Pipecat requires `world_part` on every SLNG listen and speak model: the plugin
+has no default gateway, so validate refuses the model without one. On LiveKit,
+omitting `world_part` keeps the existing default URL. An empty,
 non-string, or unknown value is refused. The old speech values `na`, `eu`, and
 `ap` are refused too: choose one of the new values explicitly. There is no
 automatic mapping from the old broad areas. `params.base_url` and
@@ -710,7 +714,7 @@ repeat `provider`, `model` and `reasoning_effort` verbatim to keep them, and a
 duplicated binding is one somebody edits on one side only. Pipecat drops both
 and builds `OpenAILLMService` either way; `unmute validate` warns per param,
 naming the target, so the drop is reported rather than silent.
-`salon-concierge-single-prompt` shows this binding.
+No shipped example uses this binding.
 
 `use_websocket: true` keeps a WebSocket connection for Responses requests.
 HTTP clients can also reuse connections. Compare several calls with the same

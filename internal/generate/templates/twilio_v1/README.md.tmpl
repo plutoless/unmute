@@ -1,0 +1,177 @@
+# {{.Target}}
+
+A FastAPI application for inbound Twilio ConversationRelay calls. Change the
+source package and run `unmute compile` to rebuild it.
+
+Twilio handles speech. This app keeps the conversation, runs your tools, and
+streams replies as text. You choose where to host it. Start with the
+[Twilio setup guide](https://unmute.ai/telephony/twilio-conversation-relay)
+if you need an account, a number, or your first deployment.
+{{if .Router}}
+This build uses **SLNG Context Router** before the upstream LLM. It reuses
+answers it judges cacheable and calls the upstream for other turns. Set
+`{{.ModelKeyEnv}}` and the upstream credentials listed in `.env.example`.
+The upstream credentials are sent to SLNG on each model request. Change the
+source binding's `agent_id` when prompt changes should invalidate cached
+answers. SLNG hosts the router; you still host this app.
+{{end}}
+## Run it
+
+Compile creates this project locally. To publish it, upload its contents
+(excluding `.env`) to a Python host, connect a deployment repository to a
+container host, or push a built image to your host's registry. The
+[hosting walkthrough](https://unmute.ai/telephony/twilio-conversation-relay#4-host-the-application)
+includes a Render example and a VM alternative. Running the commands below on
+your laptop starts only a local app; a tunnel is needed for Twilio to reach it.
+
+1. Copy `.env.example` to `.env` and fill in the values. Keep secrets out of Git.
+   Set `{{.Env.PublicURL}}` to the exact public HTTPS origin, with no path.
+{{- if ne .Region "us1"}}
+   This package's calls are handled in the Twilio Region `{{.Region}}`
+   ([Twilio Regions]({{.Docs.Regions}})). `{{.Env.AuthToken}}` must be that
+   region's Auth Token, not the US1 one: Twilio signs the region's requests
+   with it ([regional credentials]({{.Docs.RegionalTokens}})). The number's
+   routing region must also be `{{.Region}}`
+   ([inbound processing region]({{.Docs.InboundRouting}})).
+{{- end}}
+2. From this folder, run Python {{.Python}} on your host:
+
+   ```sh
+   uv run --env-file .env python app.py
+   ```
+
+   Or build and run the included image:
+
+   ```sh
+   docker build -t {{.Project}} .
+   docker run --env-file .env -e PORT=8080 -p 8080:8080 --stop-timeout 35 {{.Project}}
+   ```
+
+3. Configure your host's TLS endpoint to forward HTTP and WebSockets to the
+   app. Check `GET /healthz` through that public endpoint.
+4. From the source package directory, connect your number:
+
+   ```sh
+   unmute deploy --target {{.Target}} --dry-run
+   unmute deploy --target {{.Target}}
+   ```
+
+   Deploy reads the Twilio values from your shell or the source package's
+   `.env`, not this build folder's `.env`. Supply the same account, token and
+   public origin, plus the number SID listed below. The command sets the
+   number's webhook to `https://<host>/voice` with HTTP POST. The app generates
+   the `wss://<host>/conversation` URL from `{{.Env.PublicURL}}`; do not put
+   the WebSocket URL in the number's webhook field.
+5. Call the number. Check the greeting, a reply, interruption, and `end_call`.
+   Read the app's log and Twilio's call inspector if a step fails.
+
+### Hosting requirements
+
+Twilio requires a reachable `wss://` server
+([ConversationRelay]({{.Docs.ConversationRelay}})); it does not host this app.
+Use any container or Python host that provides:
+
+- A public HTTPS origin with TLS and long-lived WebSocket connections.
+- Access to `/voice`, `/conversation`, and `/connect-action` on that origin.
+- Environment values from `.env.example`, supplied as secrets.
+- One process and one instance. Call state and capacity are held in memory.
+- Port forwarding to `0.0.0.0:$PORT` (default 8080).
+- A `/healthz` health check and about 35 seconds from SIGTERM to SIGKILL.
+- Availability when calls arrive; a sleeping service can miss a call.
+
+On SIGTERM the app stops accepting calls, allows running calls up to 20 seconds,
+and then ends them. `/healthz` reports 503 while draining or when abandoned
+handlers occupy every slot. Otherwise it reports 200 with `artifact_id`;
+a healthy process can still be at call capacity.
+
+For a laptop trial, start `cloudflared tunnel --url http://localhost:8080`, set
+`{{.Env.PublicURL}}` to its HTTPS origin, then start the app. If the origin
+changes, update it, restart the app, and route the number again. There is no
+`unmute dev` loop for this target.
+
+## Connect the number
+
+`unmute deploy` with `--target {{.Target}}` configures an existing number's
+voice webhook. It does not upload this app, buy a number, or place a call.
+
+| Environment name | Purpose |
+|---|---|
+| `{{.Env.AccountSID}}` | Account that owns the number; also required by the app. |
+| `{{.Env.AuthToken}}` | Account Auth Token; must match the app. |
+| `{{.Env.PublicURL}}` | Public HTTPS origin; must match the app. |
+{{- range .DeployEnv}}
+| `{{.}}` | Number SID, `PN` followed by 32 characters; deploy only. |
+{{- end}}
+
+Deploy checks the number's voice capability, routing region, and conflicting
+TwiML App, SIP trunk, or fallback settings. It verifies the hosted build's
+`artifact_id` and signed `/voice` response. A dry run stops before writing.
+A normal run saves the previous route in a private rollback file, updates only
+`VoiceUrl` and `VoiceMethod`, and checks them again. Inspect the Console if a
+write's outcome is `unknown`; do not assume it failed. Run one deploy at a time
+per number. The model keys are needed by the app, not by deploy.
+
+For manual setup ([Twilio onboarding]({{.Docs.Onboarding}})):
+{{range .ManualSteps}}
+- {{.}}
+{{- end}}
+
+A call reaches `POST /voice`, which returns generated TwiML pointing to
+`wss://<host>/conversation`. Twilio opens the signed WebSocket and exchanges
+text with the app. `/connect-action` returns hangup when the session ends,
+{{- if .Logic}} unless your `next_twiml()` supplies another action.
+{{- else}} after `end_call`.
+{{- end}}
+Only a real call verifies the WebSocket, speech, model, and hangup together.
+
+### Update or restore
+
+Edit the source package, compile, upload the new build to your chosen host,
+and run `unmute deploy --target {{.Target}}` again. Deploy refuses a host
+running a different build. Updating the app can end active calls during drain.
+
+Compile replaces this folder, preserving only `.env`. Keep host-specific files
+in the source package's `hosting/{{.Target}}/` folder; compile copies them here.
+
+To restore the old number route, open the private snapshot printed by deploy.
+First check the number still uses its `new_voice_url` with POST and has no
+TwiML App, trunk, or fallback URL. If it differs, resolve the intervening
+change before restoring. Otherwise set its webhook back to the snapshot's
+`voice_url` and `voice_method`. This restores routing, not the hosted build.
+
+## Runtime behavior
+
+- **Security:** the app validates `X-Twilio-Signature` for HTTP requests and
+  the WebSocket handshake against the configured public origin
+  ([webhook security]({{.Docs.Security}})).
+- **Speech:** Twilio handles listening and speaking. DTMF detection is off.
+- **Streaming:** replies arrive incrementally, with `last: true` on the final
+  fragment. That marks text completion, not playback completion
+  ([WebSocket messages]({{.Docs.Messages}})).
+- **Interruptions:** the app stops the reply and retains the text reported as
+  heard. It cannot recall tokens already sent to Twilio.
+- **Capacity:** at most {{.MaxSessions}} calls. A full app returns `<Hangup/>`.
+- **Tools:** arguments and results are validated. Handlers run to completion;
+  after {{.ToolDeadline}} seconds the model receives an unknown outcome.
+  Bound tool network timeouts: a running handler retains its call slot.
+  There are at most {{.MaxRounds}} tool rounds per turn.
+- **Hangup:** `end_call` ends the session. A goodbye in the same turn may be cut
+  off. The app sends `end` and lets Twilio close the WebSocket, waiting up to
+  five seconds before closing it itself.
+- **Failures:** model failures use a fixed spoken response; three consecutive
+  failures end the call. Logs contain event names, call/session IDs and error
+  classes, not transcripts, prompts, tool arguments, or secrets.
+{{if .Logic}}
+## Custom logic
+
+This build calls `logic/respond(session)` for each caller turn. Edit
+`{{.Logic.Path}}` in the source package. The app manages signatures,
+interruptions, capacity, and shutdown.
+
+`session.end(reason, **data)` ends the session after the reply. An optional
+`next_twiml(handoff)` in `logic/__init__.py` returns TwiML for the next action.
+`handoff.resume(note, greeting="...")` resumes the saved conversation within
+10 minutes, in this process only. `session.twilio` is the account's Twilio REST
+client. See the [custom logic reference](https://unmute.ai/targets/twilio#bring-your-own-agent-logic)
+for the complete interface.
+{{end}}

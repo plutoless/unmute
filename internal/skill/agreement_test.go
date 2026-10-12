@@ -495,8 +495,8 @@ func TestLiveSurfacesAgree(t *testing.T) {
 		"serves one agent", "no `tasks`", "`handoffs`", "`escalations`",
 		"listens, speaks and decides the turn itself",
 		"`conversation.interruption`",
-		"carries no call state yet", "no traced worker yet",
-		"start and close a server connection yet",
+		"carries no call state", "no traced worker",
+		"start and close a server connection",
 		"browser route in this version", "must be at OpenAI",
 		// Named as the architecture rather than as a binding, because that is
 		// what the refusals themselves now say and what the author edits.
@@ -626,8 +626,10 @@ func TestRegionalGuidanceStaysExplicit(t *testing.T) {
 			"world_part",
 			"{world_part}.api.slng.ai",
 			`slng_base_url="eu-north.api.slng.ai"`,
-			`base_url="eu-north.api.slng.ai"`,
-			"Omitting `world_part` keeps the existing default URL.",
+			// pipecat-slng 0.6.0 takes the world part itself and has no default.
+			`world_part="eu-north"`,
+			"Required on Pipecat, where omission is refused.",
+			"On LiveKit, omitting `world_part` keeps the existing default URL.",
 			"`params.slng_base_url` cannot be combined with `params.world_part`",
 			"`na`, `eu`, and `ap` are refused",
 		} {
@@ -1591,7 +1593,9 @@ func TestRouterSurfacesSayOnlyWhatWasMeasured(t *testing.T) {
 		// short. "caches repeated turns" is an over-claim in a one-line pointer
 		// just as much as in a page, and the shorter true version is no longer:
 		// "caches the turns it judges repeatable".
-		if strings.Contains(strings.ToLower(content), "cache") {
+		// __pycache__ is Python's bytecode folder, named in a command, not a
+		// claim about the router.
+		if strings.Contains(strings.ReplaceAll(strings.ToLower(content), "__pycache__", ""), "cache") {
 			qualified := false
 			for _, marker := range []string{
 				"judges", "a fault", "never cache", "some repeats", "decides which",

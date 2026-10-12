@@ -510,6 +510,15 @@ func TestBuildRejectsUnknownOrInvalidConnection(t *testing.T) { // telephony V1-
 			want: "environment variable name",
 		},
 		{
+			name: "region off a relay route",
+			mutate: func(pkg *packagespec.Package) {
+				connection := pkg.Connections["primary_phone"]
+				connection.Region = "ie1"
+				pkg.Connections["primary_phone"] = connection
+			},
+			want: "only a twilio conversation-relay route has a Twilio Region",
+		},
+		{
 			name: "missing route environment key",
 			mutate: func(pkg *packagespec.Package) {
 				enableTelephony(pkg)
@@ -661,7 +670,7 @@ func patchSafeCore(t *testing.T, from, to string) error {
 	if err := os.WriteFile(path, []byte(patched), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err = packagespec.Load(dir)
+	_, err = loadRecorded(dir)
 	return err
 }
 
@@ -1173,7 +1182,7 @@ func TestDelegateAnnounceIsAFieldOfItsOwn(t *testing.T) {
 
 func loadSafeCore(t *testing.T) *packagespec.Package {
 	t.Helper()
-	pkg, err := packagespec.Load(filepath.Join("..", "testdata", "safe_core"))
+	pkg, err := loadRecorded(filepath.Join("..", "testdata", "safe_core"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1722,7 +1731,7 @@ func TestBuildAssignRefusalNamesTheVariablesBlock(t *testing.T) {
 		t.Fatal("an assign to an undeclared variable must fail at compile")
 	}
 	for _, want := range []string{
-		"customer_status", "not declared under the variables: block", "agent.yaml",
+		"customer_status", "State in state.py does not declare", "agent.yaml",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal is missing %q:\n%v", want, err)

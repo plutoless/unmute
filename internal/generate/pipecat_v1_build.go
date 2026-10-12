@@ -132,6 +132,9 @@ func buildPipecatData(agent *ir.Agent, target ir.Target) (pipecatData, error) {
 		}
 		data.Agents = append(data.Agents, built)
 	}
+	if data.Prompts, err = pipecatPrompts(data.Agents); err != nil {
+		return pipecatData{}, err
+	}
 
 	data.NeedsLanguage = serviceUsesLanguage(data.STT)
 	for _, a := range data.Agents {
@@ -159,16 +162,15 @@ func buildPipecatData(agent *ir.Agent, target ir.Target) (pipecatData, error) {
 
 	for _, name := range sortedVarNames(agent) {
 		v := agent.Variables[name]
-		pt, def := stateField(v, false)
 		data.Variables = append(data.Variables, pipecatVariable{
-			Name: name, PyType: pt, Default: def, Source: string(v.Source), Description: oneLine(v.Description),
+			Name: name, PyType: pyType(v.Type), Source: string(v.Source), Description: oneLine(v.Description),
 		})
 		// Dispatched input variables hydrate before the greeting on every
 		// channel, not just telephony: the web and console dev paths read the
 		// same payload out of UNMUTE_CALL_START (I.dispatch).
 		if v.Source == ir.VariableSourceCallStart || v.Source == "" {
 			data.CallStartVars = append(data.CallStartVars, pipecatCallStartVar{
-				Name: name, Type: string(v.Type), Required: v.Default == nil && v.Source == ir.VariableSourceCallStart,
+				Name: name, Type: authoredType(v), Required: v.Default == nil && v.Source == ir.VariableSourceCallStart,
 			})
 		}
 		// A fact the call itself carries, lifted into call_context by whichever
@@ -248,23 +250,16 @@ func buildPipecatData(agent *ir.Agent, target ir.Target) (pipecatData, error) {
 	}
 	setImportNeeds(&data)
 	data.NeedsRender = renderNeeds(agent)
-	typed, err := TypedState(agent)
+	typed, err := TypedState(agent, "")
 	if err != nil {
 		return pipecatData{}, err
 	}
 	if typed.Source != "" {
 		data.TypedState = &typed
-		var typingNames []string
-		if typed.NeedsAnnotated {
-			typingNames = append(typingNames, "Annotated")
-		}
-		if typed.NeedsLiteral {
-			typingNames = append(typingNames, "Literal")
-		}
-		data.TypingImports = strings.Join(typingNames, ", ")
+		data.TypingImports = strings.Join(callStateTypingNames, ", ")
 	}
 	data.PydanticImports = PydanticImports(false, data.TypedState)
-	data.NeedsDataclassField = StateNeedsDataclassField(agent) || PrefetchUnconfirmed(agent)
+	data.StateSource = agent.StateSource
 	data.NeedsPrefetchUnconfirmed = PrefetchUnconfirmed(agent)
 	if block, needed := Prefetch(agent, prefetchStateExpr, func(entry ir.Prefetch) PrefetchRequest {
 		return prefetchRequestFor(agent, entry)
@@ -273,6 +268,7 @@ func buildPipecatData(agent *ir.Agent, target ir.Target) (pipecatData, error) {
 		data.NeedsPrefetchClock, data.NeedsPrefetchAsync = block.NeedsClock, block.NeedsAsync
 		data.NeedsPrefetchLocal, data.NeedsPrefetchSeed = block.NeedsLocal, block.NeedsSeed
 		data.NeedsHTTPX = data.NeedsHTTPX || prefetchNeedsHTTPX(agent)
+		data.UsesHTTPX = data.UsesHTTPX || prefetchNeedsHTTPX(agent)
 		data.NeedsInspect = data.NeedsInspect || block.NeedsLocal
 		data.PrefetchRunbook, _ = PrefetchRunbook(agent, target)
 		// A pre-fetched tool reaches no agent's tools: list by design (FR-003),
@@ -357,9 +353,7 @@ func buildPipecatData(agent *ir.Agent, target ir.Target) (pipecatData, error) {
 	// name, and the cap keeps a major release from changing what an address
 	// means. Declared here rather than in the template so the two targets ask
 	// for the same version from one place.
-	if data.TypedState != nil && data.TypedState.NeedsEmailValidator {
-		data.Deps = append(data.Deps, "email-validator>=2.2,<3")
-	}
+	data.Deps = append(data.Deps, data.TypedState.Deps()...)
 	slices.Sort(data.Deps)
 	data.RequiredEnv = env.sorted()
 	var supplied []string
@@ -700,8 +694,8 @@ func setImportNeeds(data *pipecatData) {
 			// never used, failed the emitted project's own ruff gate, and declared
 			// no httpx in pyproject.toml to back it up. livekit reads URLEnv here
 			// and always did.
-			if t.URLEnv != "" {
-				data.NeedsHTTPX = true // webhook tool POSTs with httpx
+			if t.URLEnv != "" || t.HostedRequest {
+				data.NeedsHTTPX, data.UsesHTTPX = true, true // webhook tool POSTs with httpx
 			}
 			if t.Auth != nil {
 				data.AuthKinds.add(t.Auth.Kind) // one helper per scheme in use (V8)
@@ -741,8 +735,8 @@ func setImportNeeds(data *pipecatData) {
 					if t.Local {
 						data.NeedsInspect = true
 					}
-					if t.URLEnv != "" {
-						data.NeedsHTTPX = true // flows tool handlers POST with httpx
+					if t.URLEnv != "" || t.HostedRequest {
+						data.NeedsHTTPX, data.UsesHTTPX = true, true // flows tool handlers POST with httpx
 					}
 					if t.Auth != nil {
 						data.AuthKinds.add(t.Auth.Kind)
@@ -1319,7 +1313,14 @@ func buildDelegate(agent *ir.Agent, tgt ir.Target, ref string, c *ir.Delegate, e
 		}
 	}
 	for i, step := range steps {
-		task, err := buildTask(agent, tgt, step, agent.Tasks[step], env, "finish_"+ref+"_"+step)
+		// A step's prompt names its delegate's own finish function, so it is one
+		// prompt per delegate and step, named for the step alone when the
+		// delegate is the task itself.
+		promptName := ref + "_" + step
+		if ref == step {
+			promptName = step
+		}
+		task, err := buildTask(agent, tgt, step, agent.Tasks[step], env, "finish_"+ref+"_"+step, promptName)
 		if err != nil {
 			return pipecatDelegate{}, err
 		}
@@ -1362,7 +1363,7 @@ func buildDelegate(agent *ir.Agent, tgt ir.Target, ref string, c *ir.Delegate, e
 // buildTask lowers a task to a Flow-node model: instructions, tools, and the
 // finish-function schema derived from the typed result (V1). The node runs on
 // the owning agent's LLM; per-task model is gated (no LLMSwitcher, B7).
-func buildTask(agent *ir.Agent, tgt ir.Target, name string, task ir.Task, env *envSet, finishName string) (pipecatTask, error) {
+func buildTask(agent *ir.Agent, tgt ir.Target, name string, task ir.Task, env *envSet, finishName, promptName string) (pipecatTask, error) {
 	if strings.TrimSpace(task.Instructions) == "" {
 		return pipecatTask{}, fmt.Errorf("task %q instructions must not be empty", name)
 	}
@@ -1371,8 +1372,9 @@ func buildTask(agent *ir.Agent, tgt ir.Target, name string, task ir.Task, env *e
 	// per-step here, so the prompt has to name it (livekitTaskPrompt does the
 	// same for a plain `finish`).
 	prompt := task.Instructions + taskFinishContractFor(finishName, sortedResultNames(task.Result), task.EndsOnTools())
+	promptConst := strings.ToUpper(promptName) + "_TASK_PROMPT"
 	built := pipecatTask{
-		Name: name, FinishName: finishName, Prompt: prompt,
+		Name: name, FinishName: finishName, Prompt: prompt, PromptConst: promptConst, PromptFile: "tasks/" + promptName,
 		// The node is built when the step is entered, not at session start, so a
 		// prompt naming a variable an earlier task assigned renders with that
 		// value. Left as a literal, the model would read "{{customer_id}}" and
@@ -1380,8 +1382,8 @@ func buildTask(agent *ir.Agent, tgt ir.Target, name string, task ir.Task, env *e
 		// A router-bound task ships its placeholders intact like any other router
 		// prompt site: the flow node's role_message goes to the router as the
 		// system message, through the owning agent's LLM.
-		PromptExpr:     promptExpr(pyQuote(prompt), prompt, "self.state", taskRouter, "task:"+name),
-		ResultProps:    resultPropsExpr(name, task.Result),
+		PromptExpr:     promptExpr(promptConst, prompt, "self.state", taskRouter, "task:"+name),
+		ResultProps:    resultPropsExpr(name),
 		Typed:          true,
 		ResultRequired: "[]",
 		// A task's prompt is not its owner's, so its cache scope is not its
@@ -1464,54 +1466,13 @@ func pipecatStepTransfers(transfers []pipecatTransfer) string {
 	return "{" + strings.Join(names, ", ") + "}"
 }
 
-// resultProperties builds the finish function's JSON-schema properties from a
-// task's typed result. Forwarded verbatim for nested schemas (C11).
-//
-// The reserved unserved-request property rides along, optional (it is absent
-// from ResultRequired), so a step can hand back a request it cannot serve
-// instead of refusing in place. ir.Validate rejects a task result that claims
-// the name.
-func resultProperties(result map[string]ir.ResultField) map[string]any {
-	properties := map[string]any{
-		ir.UnservedResultField: map[string]any{
-			"type":        "string",
-			"description": ir.UnservedResultDescription,
-		},
-	}
-	for _, name := range sortedResultNames(result) {
-		field := result[name]
-		switch {
-		case field.Schema != nil:
-			properties[name] = field.Schema
-		case len(field.Enum) > 0:
-			enum := make([]any, len(field.Enum))
-			for i, value := range field.Enum {
-				enum[i] = value
-			}
-			properties[name] = map[string]any{"type": "string", "enum": enum}
-		default:
-			properties[name] = map[string]any{"type": jsonType(field.Type)}
-		}
-	}
-	return properties
-}
-
-// resultPropsExpr is the Python expression for one step's finish properties.
-//
-// A declared shape's entry is the generated class's own schema, read through
-// the TypeAdapter the finish table already holds, rather than a second copy
-// rendered here in Go. One owner for the shape: the class, its validator and
-// the schema the model is sent cannot drift, because there is only one of each.
-//
-// A step declaring no shape gets the literal it always got, byte for byte.
-func resultPropsExpr(task string, result map[string]ir.ResultField) string {
-	entries := []string{pyQuote(ir.UnservedResultField) + ": " + pyLiteral(resultProperties(nil)[ir.UnservedResultField])}
-	for _, name := range sortedResultNames(result) {
-		field := result[name]
-		anno := pyAnno(nullableType(pyAnno(resultPyType(field), field.Enum, "")), nil, field.Description)
-		entries = append(entries, fmt.Sprintf("%s: _schema(TypeAdapter(%s))", pyQuote(name), anno))
-	}
-	return "{" + strings.Join(entries, ", ") + "}"
+// resultPropsExpr is the Python expression for one step's finish properties:
+// StepResult's own, built at import from State's annotations, so the schema the
+// model is sent and the check its answer meets are one model and cannot drift.
+// The reserved unserved-request property is among them, optional like every
+// other, so a step can hand back a request it cannot serve.
+func resultPropsExpr(task string) string {
+	return "STEP_RESULTS[" + pyQuote(task) + "].tool_parameters()[\"properties\"]"
 }
 
 // anyStrings widens a string slice for pyLiteral rendering.

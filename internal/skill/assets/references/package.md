@@ -10,6 +10,7 @@ What an author writes, file by file. This is the surface you work in.
 | `manifest.yaml` | when linked | the company rules copied into this package; see [manifests](manifests.md) |
 | an instructions file | yes | the prompt, in Markdown, named by each agent |
 | `targets.yaml` | yes | where it runs, and the framework version pinned |
+| `state.py` | no | the call's `State` class: every variable's type, default and description. Needs `uv` to read |
 | `tools/<name>.yaml` | no | one file per tool |
 | `tools/<name>.py` | no | a Python handler, beside its tool file |
 | `connections/<name>.yaml` | phone agents only | one phone route |
@@ -95,7 +96,7 @@ That is the shape `unmute init <name>` scaffolds, and it runs in a browser.
 | `models` | yes | the model palette, grouped by kind |
 | `listen` | when `models.listen` has two or more entries | which listen entry to use |
 | `turn` | when `models.turn` has two or more entries | which turn entry to use |
-| `variables` | no | per call values |
+| `variables` | no | a list of `source:` and `confirm:` entries for fields on `State` in `state.py`, the file that holds the types |
 | `secrets` | no | environment names the generated project reads |
 | `destinations` | when an escalation is used | symbol to the environment variable holding a number |
 | `agents` | yes | one or more agents, with their nested tasks |
@@ -321,7 +322,7 @@ yet. `peak_sessions` and `max_sessions` must also be positive,
 `peak_sessions` cannot exceed `max_sessions`, and `avg_session_duration` must
 be a positive Go duration such as `5m`.
 
-`provider` takes one of two values, `langfuse` or `coval`. Tracing works on the
+`provider` takes one of three values: `langfuse`, `logfire` or `coval`. Tracing works on the
 `pipecat` and `livekit` targets only. The `slng` target refuses it: unmute
 instruments no process there, so it can install no exporter. Read those traces
 in SLNG's own dashboard.
@@ -329,17 +330,25 @@ in SLNG's own dashboard.
 | provider | secrets it needs | use it for |
 |---|---|---|
 | `langfuse` | `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | reading one live conversation |
+| `logfire` | `LOGFIRE_TOKEN` | reading live calls in Pydantic Logfire, and querying them with SQL |
 | `coval` | `COVAL_API_KEY` | scoring simulated calls in Coval |
 
 Those names go in `secrets:` like any others.
 
-LiveKit uses the room name as the Langfuse session ID. Pipecat uses the runner
-session ID as both its conversation ID and the Langfuse session ID. Either way
+LiveKit uses the room name as the session ID. Pipecat uses the runner session ID
+as both its conversation ID and the session ID. Langfuse reads it as
+`langfuse.session.id`, Logfire as `session.id`. Either way
 one call is one trace, its root observation holds the whole conversation, and
 each exchange inside it is a `turn` span holding what the caller said and what
 the agent replied, which is the pair an evaluator reads. The session ID and
 trace name are on every observation, because Langfuse v4 filters and adds up
 over observations rather than over traces.
+Every backend is plain OpenTelemetry over HTTP from the emitted
+`utils/telemetry.py`, so no provider SDK is installed and Logfire needs no
+`logfire.configure()`. A Logfire token like `pylf_v1_eu_...` picks the EU region
+on its own. On Logfire a call shows on the Agents page as one run per agent
+turn, with its model calls and tools inside it; on Pipecat each run is named
+after the package, not the agent that answered.
 Pipecat tracing owns the process OpenTelemetry provider and startup fails if another SDK provider is installed first.
 
 With `coval`, each trace is attached to the Coval simulation that placed the
@@ -405,13 +414,13 @@ provider with different settings, for example `pipecat_twilio` and
 
 | Field | What it is |
 |---|---|
-| `provider` | `livekit`, `pipecat`, `slng`, or `agora` |
-| `version` | required exact `x.y.z` framework version for code targets; refused on `slng` |
-| `pins` | LiveKit-only known package pins, name to semantic version; refused on `slng` |
+| `provider` | `livekit`, `pipecat`, `slng`, `twilio`, or `agora` |
+| `version` | required exact `x.y.z` framework version for LiveKit, Pipecat and Agora; refused on `slng` and `twilio` |
+| `pins` | LiveKit-only known package pins, name to semantic version; refused on `slng`, `twilio` and `agora` |
 | `sdk_language` | `python` when written; refused on `slng` |
-| `connection` | required for LiveKit or Pipecat telephony; illegal with no phone use; refused on `slng` |
-| `deployment_region` | LiveKit: `us-east`, `eu-central`, or `ap-south`, one or a duplicate-free list; Pipecat: one non-empty region; on `slng` exactly one of `us-east`, `us-west`, `br`, `eu-west`, `eu-north`, `gb`, `za`, `il`, `jp`, `sg`, `id`, `in`, `au` |
-| `warm_instances` | instances the platform holds ready; zero or more; **Pipecat only**, refused on `livekit` and `slng` |
+| `connection` | required for LiveKit, Pipecat or Twilio telephony; illegal with no phone use; refused on `slng` and `agora` |
+| `deployment_region` | LiveKit: `us-east`, `eu-central`, or `ap-south`, one or a duplicate-free list; Pipecat: one non-empty region; on `slng` exactly one of `us-east`, `us-west`, `br`, `eu-west`, `eu-north`, `gb`, `za`, `il`, `jp`, `sg`, `id`, `in`, `au`; refused on `twilio` and `agora` |
+| `warm_instances` | instances the platform holds ready; zero or more; **Pipecat only**, refused on `livekit`, `slng`, `twilio` and `agora` |
 | `models` | per target overrides of named `models` entries |
 
 That is the whole list. A `models` override is keyed by the entry name from
@@ -467,8 +476,9 @@ provider keeps its own endpoint and location settings. Set those on the model
 using fields the selected target's plugin supports.
 
 SLNG listen and speak entries choose their API gateway with
-`params.world_part`, which emits `{world_part}.api.slng.ai` on LiveKit
-and Pipecat. `models.md` has the accepted world parts and model YAML. A gateway
+`params.world_part`. LiveKit gets the host `{world_part}.api.slng.ai` as
+`slng_base_url`, and Pipecat gets `world_part` itself. Pipecat requires it on
+every SLNG speech model. `models.md` has the accepted world parts and model YAML. A gateway
 choice does not set the worker region or guarantee where a provider processes
 speech.
 
@@ -490,13 +500,17 @@ every field that entry needs.
 | `pipecat` | yes | yes |
 | `livekit` | yes | yes |
 | `slng` | yes | no |
+| `twilio` | yes | yes |
 | `agora` | yes | yes |
 
-Those are the four supported targets. A provider earns a place here by having a driver that
+Those are the five supported targets. A provider earns a place here by having a driver that
 owns its whole output, so validate and compile agree about what exists.
 
 `pipecat` and `livekit` generate a runnable Python project you host and run.
-`agora` generates a local Python session service with a browser RTC example.
+`twilio` generates a small Python web app that Twilio ConversationRelay calls;
+see "The twilio target" below.
+`agora` generates a local Python session service with a browser RTC example;
+see [Agora authoring](agora.md) for its supported surface and launch commands.
 `slng` generates a deployment body for a platform that runs the agent for you,
 so there is nothing to run locally and `unmute dev` does not apply to it. See
 "The slng target" below.
@@ -507,7 +521,7 @@ retired on 2026-08-24. Naming either as a target is refused. Note that
 are unaffected. A target and a model vendor are different things that can share
 a word.
 
-LiveKit and Pipecat versions are exact three-part versions in this release's
+LiveKit, Pipecat and Agora versions are exact three-part versions in this release's
 supported window. Unmute never widens the pin. `pins` accepts only packages the
 LiveKit driver knows; other providers do not consume it. A target's `models`
 map is keyed by an existing model entry name and takes the same model fields.
@@ -571,12 +585,24 @@ them when it writes the body; a model name that already carries a slash is
 passed through whole. SLNG owns its model list, so no vendor or model name is
 checked on this target.
 
+Tasks and task groups compile to SLNG's own tasks: `when:`, `tools`,
+`assign:` (with `+`), one `announce:`, `opening: listen`, a history of
+`messages`, `full`, `last_n` or `reset`, `skip_when_confirmed`,
+`context_scope`, and `confirm:` on a value whose confirming task has its own
+`when:`. A task names its tools by name and the push writes the attachment
+ids. A tool only a task lists is attached hidden from the agent. Every value a
+task saves is a runtime variable and needs `Field(description=...)`.
+
 **Do not write a package for slng that uses any of these.** Each is refused at
 validate, by name, with what to do instead:
 
 | Feature | Why |
 |---|---|
-| tasks, task groups, agent transfers | the create body carries one prompt and one greeting |
+| agent transfers | the create body carries one agent |
+| a task's `think:`, `finish:`, `history: summary` or `include_tool_calls: false` | one model per agent, no summary, and no `output:` for a success rule to read |
+| a second `announce:` line, an optional `result.x?`, a group `then:` other than `return` | SLNG speaks one line, saves every assigned value, and returns to the agent |
+| a task that lists another task or a handoff | a SLNG task cannot start another one |
+| a typed `state.py` value the dispatch fills; `datetime`, `dict`, a pattern other than `Id` | SLNG checks types only on values a task saves, in a grammar without those words |
 | a `turn:` section, `semantic_endpointing`, `endpointing_delay` | SLNG owns its own turn taking |
 | `placement: local` on any model | SLNG runs the pipeline |
 | `conversation.inactivity` | SLNG's idle nudges need three spoken texts a package does not carry |
@@ -645,11 +671,181 @@ either is refused when the agent is pushed, and unmute refuses it at validation
 on every target.
 
 Do not write one into a prompt, a greeting or a tool field. For a value that
-varies per call, declare a package variable and write `{{name}}`. For a
+varies per call, declare a package variable and write `{{state.name}}`. For a
 credential, name the Vault entry on the tool that reads it, as a bare name in
 its `auth:` block with no braces and no dollar.
 
+## The twilio target
+
+`provider: twilio` writes a small Python web app that Twilio ConversationRelay
+calls. ConversationRelay listens and speaks on Twilio's side. The app answers
+the number's webhook, holds the ConversationRelay WebSocket, thinks with one
+model and runs the package's local tools. You host the app yourself.
+
+```yaml
+# targets.yaml
+targets:
+  twilio:
+    provider: twilio
+    sdk_language: python
+    connection: twilio
+
+# connections/twilio.yaml
+transport: conversation-relay
+carrier: twilio
+environment:
+  account_sid: TWILIO_ACCOUNT_SID
+  auth_token: TWILIO_AUTH_TOKEN
+  phone_number_sid: TWILIO_PHONE_NUMBER_SID
+  public_url: TWILIO_PUBLIC_URL
+```
+
+The connection may also name `region: us1` (United States, the default),
+`ie1` (Ireland) or `au1` (Australia), the Twilio Region that handles the calls.
+This is independent of the app host's region and SLNG's `world_part`. Outside `us1`, `auth_token` must name
+that region's own Auth Token, and the number's routing region must match.
+
+`unmute init <name> --target twilio` writes this starter with no questions:
+SLNG Context Router with OpenAI upstream (`provider: slng`,
+`upstream: {provider: openai}`, `world_part: eu-west`, `agent_id: <name>-v1`,
+declaring `SLNG_API_KEY` and `OPENAI_API_KEY`), Deepgram and ElevenLabs, one
+inbound phone channel, `end_call`, and the connection with the four
+`TWILIO_*` names.
+
+What a twilio package may carry, and nothing else:
+
+- one cascade agent, and exactly one channel: `kind: telephony`,
+  `inbound: true`, `outbound: false`;
+- think: `provider: slng` (the SLNG
+  Context Router over Chat Completions, any upstream except `vertex`; declare
+  `SLNG_API_KEY` and the upstream's key. SLNG hosts the router, so nothing is
+  deployed for it, and the upstream key is sent to SLNG inline on every
+  request. It is a model endpoint only: the user still hosts `app.py`, which
+  is the agent. An agent with nothing to host is the `slng` target),
+  `provider: openai` (Chat Completions), or `provider: google`
+  (`gemini` also accepted; native `generateContent`). Params are forwarded to
+  the request as written. `vertexai: true` with a `location` uses Vertex AI
+  with the same `GOOGLE_API_KEY`; without them it is the Gemini Developer API.
+  To switch provider, replace model and params together: the other vendor's
+  params are refused, and its model id would fail on a call. The console does
+  this for you when the provider changes;
+- listen: `provider: deepgram` with a model such as `nova-3-general`, an
+  optional `language`, and optional `params` named after the ConversationRelay
+  attribute: `hints` (a list of phrases, none holding a comma) and
+  `deepgramSmartFormat` (`true` or `false`);
+- speak: `provider: elevenlabs` with `model` (for example `flash_v2_5`), a
+  bare voice id in `voice`, an optional `language`, and optional
+  `params.elevenlabsTextNormalization` (`on`, `auto`, `off`). The app builds
+  ConversationRelay's `voice` as `<voice id>-<model>`, so a voice that already
+  has the suffix is refused;
+- an optional turn entry with `params` only: `speechTimeout` (whole
+  milliseconds, 600 to 5000), `interruptSensitivity` (`high`, `medium`,
+  `low`), `ignoreBackchannel` (`true` or `false`), and `eotThreshold` (0.5 to
+  0.9, only when the listen model is `flux`). No provider or model;
+- a fixed `conversation.greeting.text` with `speaks_first: agent`, or
+  `speaks_first: user` with no text;
+- `conversation.interruption.enabled`, and `protect: [greeting]`;
+- local tools whose `input` and `output` are flat objects of `string`,
+  `integer`, `number` and `boolean` fields (optional `enum` and
+  `description`), plus the builtin `end_call` with no `instructions`.
+
+Everything else is refused before a file is written, with the reason:
+more agents, tasks, groups, handoffs, transfers, variables, `state.py`,
+prefetch, webhook, MCP, knowledge and hosted tools, tool announce and
+`interruption: cancel`, inactivity and duration timers, `pace` and the other
+turn fields, tracing, realtime and live, fallbacks, custom endpoints,
+`version`, `pins`, `deployment_region` and `warm_instances`.
+
+`unmute compile` writes `build/<target>/app.py` (the entry point, FastAPI on
+uvicorn) with `call.py`, `brain.py`, `handoff.py`, `tool_runner.py`,
+`settings.py` and `prompts/instructions.md` beside it,
+`conversation-relay.xml.tmpl`, `pyproject.toml`, `Dockerfile`,
+`.dockerignore`, `.env.example`, `README.md`, `compile-report.json` and
+`tools/`. It replaces the build folder, preserving only `.env`. Keep hosting
+configuration in the source package's `hosting/<target>/` folder; compile
+copies it and refuses files that collide with generated names.
+
+Start with `unmute init my-agent --target twilio`, edit `instructions.md` for
+phone conversations, then validate and compile. Twilio requires a public
+secure WebSocket server; FastAPI is Unmute's implementation choice. The user
+chooses a container or Python host with HTTPS/WSS, long-lived connections,
+`PORT` (default 8080), one process/instance, `/healthz`, and about 35 seconds
+of shutdown grace. It must be available when calls arrive. Run the emitted
+Dockerfile or `uv run --env-file ../../.env python app.py` from `build/<target>/`.
+For a laptop trial, put `cloudflared tunnel --url http://localhost:8080` in
+front of the app. Set `TWILIO_PUBLIC_URL` to the exact public HTTPS origin,
+without a path, before starting the app. Update it and reroute when it changes.
+
+The app reads the account SID, Auth Token and public origin plus model keys.
+The default SLNG binding needs both `SLNG_API_KEY` and `OPENAI_API_KEY`;
+`phone_number_sid` is deploy-only. SLNG reuses answers it judges cacheable and
+calls the upstream for other turns. Change `agent_id` after prompt changes
+that should invalidate cached answers. Twilio handles speech; the router
+optimizes LLM requests and does not replace the hosted app. Keep SLNG first
+when presenting optimization choices.
+
+The user creates their Twilio account, gets a voice-capable number, and accepts
+Twilio's AI/ML addendum to enable ConversationRelay. The app answers the
+number's signed `POST /voice` with TwiML directing Twilio to
+`wss://<host>/conversation`. Twilio then exchanges text with the agent.
+There is no `unmute dev` loop for this target. Link the
+[first-call guide](https://unmute.ai/telephony/twilio-conversation-relay)
+for account setup and the complete sequence. An update is compile, upload the
+new build to the chosen host, then `unmute deploy --target <name>`.
+
+Once it is hosted, `unmute deploy --target <name>` points one existing number
+at `https://<origin>/voice`. Run it with `--dry-run` first. It reads
+`account_sid`, `auth_token`, `phone_number_sid` and `public_url` through the
+connection's environment names, and no model key. Before writing it checks the
+number (voice capable, no TwiML App, trunk or fallback URL), that the host's
+`/healthz` returns this build's `artifact_id`, and that a signed `POST /voice`
+returns this build's TwiML. It reads and writes the number in the connection's
+`region`, and refuses a number whose routing region differs; it never changes
+routing. It then saves the old route under the user config
+directory and sets only `VoiceUrl` and `VoiceMethod`. A missing or different
+`artifact_id` means recompile and rehost, and every package change, including a
+switch of think provider, changes it. One build runs at one origin: two builds
+need two origins and two numbers. It takes one twilio target per run,
+and refuses `--profile`, `--agent-id`, `--label`, `--run-samples` and `--call`.
+A dry run writes nothing, not even the report. The outcome is `routed` only when
+the readback shows `/voice` with `POST` and the number still passes the checks,
+`not_changed` only when Twilio refused the write, and `unknown` otherwise. The
+write is never retried. To put the old route back from the snapshot, first check
+the number still points at the snapshot's `new_voice_url` with `POST` and has no
+TwiML App, trunk or fallback URL. If not, somebody changed it since, so stop.
+It places no call, so a real call is still the only check of speech.
+
+To replace the agent turn with the author's own code, the target names a
+folder: `logic: logic/` in targets.yaml. Its `__init__.py` defines
+`async def respond(session)`, which yields the reply as strings, and an
+optional `requirements.txt` there is added to the app's pins. The app keeps the
+call (signatures, interrupts, slots, drain, the failure line) and calls
+`respond()` once per caller turn. `session.history` is what the caller said and
+heard, as `{"role", "content"}` dicts ending with the turn to answer.
+`session.call` has the Twilio ids and numbers, `session.instructions` the
+package's prompt, `session.model` the think binding (`model`, `base_url`,
+`api_key`, `params`, router `extra_body`/`extra_headers`), `session.state` a
+per-call dict, `session.twilio` a synchronous Twilio REST client on the
+account and region, and `session.end(reason, **data)` ends the session after
+the reply. Twilio then asks the app what comes next: an optional
+`next_twiml(handoff)` in the same `__init__.py` returns TwiML (any verb, such
+as `<Dial>` to a number from the host's env), `None` to hang up, or
+`handoff.resume(note, before="", greeting="")` to hand the caller back to the
+agent with the history kept (ConversationRelay speaks `greeting`; the model is
+not asked to speak, and the note is in
+`session.call["custom_parameters"]["resume"]`). A Pydantic AI `respond()` must
+stream with `run_stream_events()`, not `run_stream()`, and stop after
+`end_call` once text was said, or the goodbye never ends the call. The
+instructions should say the call only ends when the model calls `end_call`,
+in the same reply as its goodbye. `handoff` has `reason`, `data`, `call`, `status` and
+`twilio`. Never build TwiML from a model-chosen number or unescaped text, and
+never put a secret in `end()` data. A turn has 30 seconds. Compile copies the folder as written, never formatted, and it
+counts in `artifact_id`. Every other target refuses `logic:`. See the [custom agent logic reference](https://unmute.ai/targets/twilio#bring-your-own-agent-logic)
+for the `respond(session)` interface.
+
 ## The agora target
 
-`agora` emits a Python session service and browser client. See [Agora authoring](agora.md)
-for its deliberately small supported surface and launch commands.
+`agora` emits a Python session service and browser client. Pin `version: "2.11.0"`.
+See [Agora authoring](agora.md) for its deliberately small supported surface and
+launch commands. Copy `examples/agora-voice` to start; `unmute init`,
+`unmute dev` and `unmute deploy` do not support this target.
